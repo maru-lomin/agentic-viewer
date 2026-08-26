@@ -595,21 +595,38 @@ function renderMsgFlowItem(m, idx) {
   </div>`;
 }
 
+function requestMessagesDelta(steps, idx) {
+  /** New messages in this turn's request vs previous turn (append-only history). */
+  const msgs = steps[idx].request_messages || [];
+  if (idx <= 0) {
+    return { msgs, omitted: 0, total: msgs.length };
+  }
+  const prevLen = (steps[idx - 1].request_messages || []).length;
+  const omitted = Math.min(prevLen, msgs.length);
+  return { msgs: msgs.slice(omitted), omitted, total: msgs.length };
+}
+
 function renderStepsViz() {
   const steps = state.stepsDetail || [];
   if (!steps.length) {
     return `<div class="empty">No agent steps found for this run.</div>`;
   }
   let html = `<p class="hint">
-    Each card = one LLM completion. Flow: <b>request → assistant → tool results</b>.
+    Each card = one LLM completion. Flow: <b>new request msgs → assistant → tool results</b>.
+    Prior-turn messages are omitted (history is append-only; see Chat tab for the full transcript).
     Nested JSON strings are unescaped for reading. <code>messages_after</code> is omitted (redundant).
   </p><div class="viz-list">`;
 
-  for (const step of steps) {
+  for (let si = 0; si < steps.length; si++) {
+    const step = steps[si];
     const nTools = (step.assistant && step.assistant.tool_calls || []).length;
     const nResults = (step.tool_results || []).length;
     const open = step.step === 1 ? " open" : "";
     const names = (step.tool_names || []).filter(Boolean);
+    const delta = requestMessagesDelta(steps, si);
+    const reqHeading = delta.omitted
+      ? `1. New request messages (+${delta.omitted} prior omitted · ${delta.total} total sent)`
+      : "1. Request messages (sent to LLM)";
     html += `<details class="viz-card"${open}>
       <summary>
         <span class="title">Turn ${esc(step.step)}</span>
@@ -631,9 +648,9 @@ function renderStepsViz() {
         </div>
 
         <div class="viz-section">
-          <h3>1. Request messages (sent to LLM)</h3>
+          <h3>${esc(reqHeading)}</h3>
           <div class="flow">
-            ${(step.request_messages || []).map((m, i) => renderMsgFlowItem(m, i)).join("") || "<div class='empty'>none</div>"}
+            ${delta.msgs.map((m, i) => renderMsgFlowItem(m, delta.omitted + i)).join("") || "<div class='empty'>none</div>"}
           </div>
         </div>
 
