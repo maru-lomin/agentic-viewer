@@ -596,9 +596,9 @@ function timingBadge(timing, kind="") {
   const wall = timing.wall_seconds ?? timing.llm_seconds;
   if (wall == null) return "";
   const pct = timing.pct != null ? ` · ${timing.pct}%` : "";
-  const llm = timing.llm_seconds != null && timing.wall_seconds != null
-    ? ` · llm ${fmtSec(timing.llm_seconds)}` : "";
-  return `<span class="tree-badge ${kind}">${fmtSec(wall)}${llm}${pct}</span>`;
+  const model = timing.llm_seconds != null && timing.wall_seconds != null
+    ? ` · model ${fmtSec(timing.llm_seconds)}` : "";
+  return `<span class="tree-badge ${kind}">${fmtSec(wall)}${model}${pct}</span>`;
 }
 
 function tokenLabel(node) {
@@ -646,9 +646,10 @@ function renderSearchTurn(turn) {
     `<span class="pill">${esc(tc.name)}</span>`
   ).join("");
   const submit = turn.submit_output;
+  const finishTool = (submit && submit.tool) || "submit_pages";
   const submitHtml = submit ? `
     <div class="viz-section" style="margin-top:8px">
-      <h3 style="margin:0 0 4px">Output (submit_pages)</h3>
+      <h3 style="margin:0 0 4px">Output (${esc(finishTool)})</h3>
       <pre class="pretty">${esc(pretty(submit, 3500))}</pre>
     </div>` : "";
   const assistantHtml = turn.assistant_content ? `
@@ -683,7 +684,7 @@ function renderSearchSession(session, opts = {}) {
   const err = session.error ? `<span class="tree-badge err">error</span>` : "";
   const status = session.status || "";
   const statusCls = status === "complete" ? "ok"
-    : (String(status).startsWith("handoff") ? "warn" : "");
+    : (status === "not_found" || String(status).startsWith("handoff") ? "warn" : "");
   const pages = session.pages || [];
   const hasIn = session.prior_context_in != null;
   // Single-session searches already expose progress via turns; hide redundant
@@ -723,20 +724,31 @@ function renderSearchSession(session, opts = {}) {
   </details>`;
 }
 
+function renderPageReasonsTable(reasons, title = "page_reasons") {
+  if (!reasons || typeof reasons !== "object") return "";
+  const entries = Object.entries(reasons);
+  if (!entries.length) return "";
+  const reasonRows = entries.map(([page, reason]) =>
+    `<tr><td>${esc(page)}</td><td>${esc(reason)}</td></tr>`
+  ).join("");
+  return `<div class="viz-section" style="margin-top:6px">
+    <h3 style="margin:0 0 4px">${esc(title)}</h3>
+    <table class="kv-table">
+      <thead><tr><th>Page</th><th>Reason</th></tr></thead>
+      <tbody>${reasonRows}</tbody>
+    </table>
+  </div>`;
+}
+
 function renderSearchOutput(output) {
   if (!output) return "";
   const pages = output.pages || [];
   const reasons = output.page_reasons || {};
-  const reasonRows = Object.entries(reasons).map(([page, reason]) =>
-    `<tr><td>${esc(page)}</td><td>${esc(reason)}</td></tr>`
-  ).join("");
   return `<div class="viz-section" style="margin:8px 0">
     <h3 style="margin:0 0 6px">SearchAgent output</h3>
     <div class="tree-kv">status=${esc(output.status || "?")} · pages=${pages.length ? esc(pages.join(", ")) : "∅"}</div>
-    ${reasonRows ? `<table class="kv-table" style="margin-top:8px">
-      <thead><tr><th>Page</th><th>Reason</th></tr></thead>
-      <tbody>${reasonRows}</tbody>
-    </table>` : (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 1200))}</pre>` : `<div class="tree-kv">No pages returned.</div>`)}
+    ${output.reason ? `<div class="tree-kv">reason=${esc(output.reason)}</div>` : ""}
+    ${renderPageReasonsTable(reasons) || (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 1200))}</pre>` : `<div class="tree-kv">No pages returned.</div>`)}
   </div>`;
 }
 
@@ -749,7 +761,8 @@ function renderSearchAgent(node) {
   };
   const pages = output.pages || res.pages || [];
   const status = output.status || res.status || (pages.length ? "complete" : "unknown");
-  const statusCls = status === "complete" ? "ok" : (String(status).startsWith("handoff") ? "warn" : "");
+  const statusCls = status === "complete" ? "ok"
+    : (status === "not_found" || String(status).startsWith("handoff") ? "warn" : "");
   const sessions = node.sessions || [];
   return `<details class="tree-node search">
     <summary>
@@ -766,7 +779,8 @@ function renderSearchAgent(node) {
       </div>
       ${node.note ? `<div class="tree-kv">${esc(node.note)}</div>` : ""}
       <p class="hint" style="margin:4px 0 8px">
-        Turn-by-turn tool calls below. Final <code>submit_pages</code> output is shown on the last turn.
+        Turn-by-turn tool calls below. Final <code>submit_pages</code> /
+        <code>no_relevant_pages</code> output is shown on the last turn.
       </p>
       ${sessions.length ? sessions.map(s => renderSearchSession(s, { nSessions: sessions.length })).join("") :
         `<div class="tree-kv">Search turn dumps not linked (legacy run).</div>`}
@@ -798,6 +812,7 @@ function renderExtractKvVlm(tool) {
   const pages = args.pages || result.pages || [];
   const keys = args.keys || result.keys || [];
   const hints = args.hints;
+  const pageReasons = args.page_reasons || result.page_reasons || {};
   const parsed = result.result || {};
   const extractions = Array.isArray(parsed.extractions) ? parsed.extractions : [];
   const covered = result.all_keys_covered;
@@ -817,14 +832,17 @@ function renderExtractKvVlm(tool) {
       <h3 style="margin:0 0 4px">Hints</h3>
       <pre class="pretty" style="max-height:160px;margin:0">${esc(String(hints))}</pre>
     </div>` : "";
+  const nReasons = Object.keys(pageReasons || {}).length;
   return `
     <div class="tree-kv">
       pages=${esc(JSON.stringify(pages))} · keys=${esc(JSON.stringify(keys))}
+      ${nReasons ? ` · page_reasons=${esc(nReasons)}` : ""}
       ${result.input_tokens != null || result.output_tokens != null
         ? ` · VLM in=${esc(result.input_tokens ?? "—")} out=${esc(result.output_tokens ?? "—")}` : ""}
       ${covered === true ? `<span class="tree-badge ok">all_keys_covered</span>` : ""}
       ${covered === false ? `<span class="tree-badge warn">partial</span>` : ""}
     </div>
+    ${renderPageReasonsTable(pageReasons)}
     ${hintsHtml}
     ${rows ? `<table class="kv-table" style="margin-top:8px">
       <thead><tr><th>Key</th><th>Value</th><th>Evidence</th></tr></thead>
@@ -887,8 +905,8 @@ function renderTiming() {
       SearchAgent = nested LLM calls inside each <code>search_pages</code>.
     </p>
     <div class="tree-kv">
-      total ${fmtSec(total)} · master LLM ${fmtSec(summary.master_llm_seconds)}
-      · search LLM ${fmtSec(summary.search_llm_seconds)}
+      total ${fmtSec(total)} · master model ${fmtSec(summary.master_llm_seconds)}
+      · search model ${fmtSec(summary.search_llm_seconds)}
       · ${esc(summary.search_page_calls || 0)} search_pages
     </div>
     <h3 style="margin:8px 0 6px">Pipeline stages</h3>
@@ -897,11 +915,11 @@ function renderTiming() {
     ${(timing.master_turns || []).map(mt => `
       <div>
         ${renderTimingBar(`Turn ${mt.step}`, mt.wall_seconds, mt.pct, "master")}
-        <div class="timing-sub tree-kv">LLM ${fmtSec(mt.llm_seconds)} · tools/overhead ${fmtSec(mt.tool_seconds)}${tokenLabel(mt) ? ` · ${esc(tokenLabel(mt))}` : ""}</div>
+        <div class="timing-sub tree-kv">model ${fmtSec(mt.llm_seconds)} · tools/overhead ${fmtSec(mt.tool_seconds)}${tokenLabel(mt) ? ` · ${esc(tokenLabel(mt))}` : ""}</div>
       </div>`).join("") || `<div class="empty">No master turns</div>`}
     <h3 style="margin:16px 0 6px">SearchAgent calls</h3>
     <table class="timing-table">
-      <thead><tr><th>Master step</th><th>Key</th><th>Wall</th><th>LLM</th><th>Overhead</th><th>Tokens</th></tr></thead>
+      <thead><tr><th>Master step</th><th>Key</th><th>Wall</th><th>Model</th><th>Overhead</th><th>Tokens</th></tr></thead>
       <tbody>
         ${(timing.search_calls || []).map(sc => `
           <tr>

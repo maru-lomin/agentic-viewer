@@ -43,26 +43,35 @@ def _parse_search_label(label: str) -> Tuple[str, int, int, int]:
 
 
 def _extract_submit_output(tool_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return submit_pages tool output when this turn finalized search."""
+    """Return submit_pages / no_relevant_pages output when this turn finalized search."""
     for tr in tool_results:
-        if tr.get("name") != "submit_pages":
+        name = tr.get("name")
+        if name not in {"submit_pages", "no_relevant_pages"}:
             continue
         preview = tr.get("result_preview")
+        parsed: Optional[Dict[str, Any]] = None
         if isinstance(preview, dict):
-            return preview
-        if isinstance(preview, str):
+            parsed = dict(preview)
+        elif isinstance(preview, str):
             try:
-                parsed = json.loads(preview)
-                if isinstance(parsed, dict):
-                    return parsed
+                loaded = json.loads(preview)
+                if isinstance(loaded, dict):
+                    parsed = loaded
             except json.JSONDecodeError:
                 pass
-        args = tr.get("arguments")
-        if isinstance(args, dict) and args.get("pages") is not None:
-            return {
-                "pages": args.get("pages") or [],
-                "page_reasons": args.get("page_reasons") or {},
-            }
+        if parsed is None:
+            args = tr.get("arguments")
+            if isinstance(args, dict) and (
+                args.get("pages") is not None or name == "no_relevant_pages"
+            ):
+                parsed = {
+                    "pages": args.get("pages") or [],
+                    "page_reasons": args.get("page_reasons") or {},
+                    "reason": args.get("reason") or "",
+                }
+        if parsed is not None:
+            parsed.setdefault("tool", name)
+            return parsed
     return None
 
 
@@ -788,6 +797,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
             "pages": call["result"].get("pages") or [],
             "page_reasons": page_reasons,
             "status": call["result"].get("status"),
+            "reason": call["result"].get("reason") or "",
         }
         calls_by_master.setdefault(call["master_step"], []).append(call)
 
@@ -857,6 +867,8 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                             "reasons": output.get("page_reasons"),
                             "status": output.get("status")
                             or call["result"].get("status"),
+                            "reason": output.get("reason")
+                            or call["result"].get("reason"),
                             "n_search_steps": len(call.get("search_steps") or [])
                             or call["result"].get("n_search_steps"),
                             "n_search_sessions": call["result"].get(
