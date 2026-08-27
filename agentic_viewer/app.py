@@ -10,7 +10,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from agentic_viewer.hierarchy import build_agent_tree
 from agentic_viewer.image_tokens import replace_base64_images
+from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
 
 def default_runs_root() -> Path:
     """Prefer sibling inference-pipeline outputs, else ./runs."""
@@ -33,7 +35,7 @@ def default_runs_root() -> Path:
 
 RUNS_ROOT = default_runs_root()
 
-app = FastAPI(title="Agentic Run Trace Viewer", version="0.2.0")
+app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0")
 
 
 def _run_dir(run_id: str) -> Path:
@@ -122,6 +124,7 @@ def list_steps_detail(run_id: str) -> List[Dict[str, Any]]:
         # Drop redundant full-history snapshot.
         data.pop("messages_after", None)
         data.pop("messages", None)  # legacy
+        data["filename"] = path.name
         # Soften huge tool schemas for the UI list (full tools still available in file).
         tools = data.get("tools") or []
         data["tool_names"] = [
@@ -131,6 +134,21 @@ def list_steps_detail(run_id: str) -> List[Dict[str, Any]]:
         ]
         rows.append(data)
     return rows
+
+
+@app.get("/api/runs/{run_id}/agent-tree")
+def get_agent_tree(run_id: str) -> Dict[str, Any]:
+    """Hierarchical Master → search_pages → SearchAgent sessions tree."""
+    root = _run_dir(run_id)
+    tree = build_agent_tree(root)
+    timing = build_timing_report(root)
+    return attach_timing_to_tree(tree, timing)
+
+
+@app.get("/api/runs/{run_id}/timing")
+def get_timing(run_id: str) -> Dict[str, Any]:
+    """Agent / session / turn timing derived from timeline.jsonl."""
+    return build_timing_report(_run_dir(run_id))
 
 
 @app.get("/api/runs/{run_id}/file")
@@ -369,7 +387,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       text-align: left; vertical-align: top; padding: 6px 8px;
       border-bottom: 1px solid var(--line); font-family: var(--mono);
     }
-    .kv-table th { width: 140px; color: var(--muted); font-weight: 500; }
+    .kv-table th { color: var(--muted); font-weight: 500; }
+    .kv-table th:first-child { width: 180px; }
     .pill {
       display: inline-block; padding: 2px 8px; margin: 2px 4px 2px 0;
       border-radius: 999px; border: 1px solid var(--line); font-size: 11px;
@@ -396,6 +415,61 @@ INDEX_HTML = r"""<!DOCTYPE html>
       margin: 0;
     }
     .arrow { color: var(--muted); font-size: 12px; text-align: center; padding: 2px 0; }
+    .tree { display: flex; flex-direction: column; gap: 10px; max-width: 980px; }
+    .tree-node {
+      border: 1px solid var(--line); border-radius: 10px; background: #121820;
+      overflow: hidden;
+    }
+    .tree-node > summary {
+      cursor: pointer; list-style: none; padding: 10px 12px;
+      display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline;
+      background: var(--panel);
+    }
+    .tree-node > summary::-webkit-details-marker { display: none; }
+    .tree-node.master > summary { border-left: 4px solid var(--accent); }
+    .tree-node.search > summary { border-left: 4px solid #e0a45c; margin-left: 16px; }
+    .tree-node.session > summary { border-left: 4px solid #9b7bd4; margin-left: 32px; }
+    .tree-node.turn > summary { border-left: 4px solid #6b7c93; margin-left: 48px; }
+    .tree-node.output > summary { border-left: 4px solid #3ecf8e; }
+    .tree-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+    .tree-tool {
+      margin-left: 16px; padding: 8px 10px; border-radius: 8px;
+      border: 1px dashed var(--line); background: rgba(0,0,0,0.15);
+    }
+    .tree-tool .name { color: var(--ok); font-family: var(--mono); font-size: 12px; font-weight: 600; }
+    .tree-kv { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .tree-badge {
+      font-size: 10px; padding: 1px 6px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--muted); font-family: var(--mono);
+    }
+    .tree-badge.ok { color: var(--ok); border-color: #2a6b4f; }
+    .tree-badge.warn { color: #e0a45c; border-color: #6b5530; }
+    .tree-badge.err { color: var(--err); border-color: #7a3a3f; }
+    .timing-panel { display: flex; flex-direction: column; gap: 16px; max-width: 980px; }
+    .timing-row {
+      display: grid; grid-template-columns: 180px 1fr 72px 52px; gap: 10px;
+      align-items: center; font-size: 12px;
+    }
+    .timing-row .label { color: var(--muted); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .timing-bar-wrap {
+      height: 18px; background: #0f1419; border: 1px solid var(--line);
+      border-radius: 999px; overflow: hidden;
+    }
+    .timing-bar {
+      height: 100%; border-radius: 999px; min-width: 2px;
+      background: linear-gradient(90deg, #3d9cf0, #3ecf8e);
+    }
+    .timing-bar.search { background: linear-gradient(90deg, #e0a45c, #f0c060); }
+    .timing-bar.master { background: linear-gradient(90deg, #3d9cf0, #6eb6ff); }
+    .timing-bar.parse { background: linear-gradient(90deg, #6b7c93, #9aa8bc); }
+    .timing-bar.chunk { background: linear-gradient(90deg, #9b7bd4, #b89de8); }
+    .timing-sub { margin-left: 20px; border-left: 2px solid var(--line); padding-left: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .timing-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .timing-table th, .timing-table td {
+      text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+      font-family: var(--mono); vertical-align: top;
+    }
+    .timing-table th { color: var(--muted); font-weight: 500; }
   </style>
 </head>
 <body>
@@ -411,8 +485,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </main>
 <script>
 const state = {
-  runs: [], runId: null, tab: "chat",
-  conversation: [], steps: [], stepsDetail: [],
+  runs: [], runId: null, tab: "hierarchy",
+  pages: [], agentTree: null, info: null,
 };
 
 async function api(path) {
@@ -475,8 +549,9 @@ function renderRuns() {
 
 async function selectRun(runId) {
   state.runId = runId;
-  state.tab = "chat";
-  state.stepsDetail = [];
+  state.tab = "hierarchy";
+  state.agentTree = null;
+  state.pages = [];
   renderRuns();
   await renderDetail();
 }
@@ -488,203 +563,473 @@ async function renderDetail() {
     return;
   }
   detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
-  const [info, timeline, steps, pages, conversation, stepsDetail] = await Promise.all([
+  const [info, pages, agentTree] = await Promise.all([
     api(`/api/runs/${encodeURIComponent(state.runId)}`),
-    api(`/api/runs/${encodeURIComponent(state.runId)}/timeline`),
-    api(`/api/runs/${encodeURIComponent(state.runId)}/steps`),
     api(`/api/runs/${encodeURIComponent(state.runId)}/pages`),
-    api(`/api/runs/${encodeURIComponent(state.runId)}/conversation`),
-    api(`/api/runs/${encodeURIComponent(state.runId)}/steps/detail`),
+    api(`/api/runs/${encodeURIComponent(state.runId)}/agent-tree`),
   ]);
   state.info = info;
-  state.timeline = timeline;
-  state.steps = steps;
   state.pages = pages;
-  state.conversation = conversation;
-  state.stepsDetail = stepsDetail;
+  state.agentTree = agentTree;
   paintDetail();
 }
 
 function tabsHtml() {
   const tabs = [
-    ["chat", "Chat"],
-    ["stepsViz", "Agent steps (visualize)"],
-    ["timeline", "Timeline"],
-    ["turns", "LLM turns (raw)"],
+    ["hierarchy", "Agent hierarchy"],
+    ["timing", "Timing"],
     ["pages", "Pages"],
-    ["result", "Result"],
-    ["request", "Request"],
   ];
   return `<div class="tabs">${tabs.map(([id, label]) =>
     `<button class="tab ${state.tab===id?"active":""}" data-tab="${id}">${label}</button>`
   ).join("")}</div>`;
 }
 
-function renderChat() {
-  const msgs = state.conversation || [];
-  if (!msgs.length) {
-    return `<div class="empty">No conversation yet. Re-run inference after the chat-log update, or open Agent steps.</div>`;
-  }
-  const reconstructed = msgs.some(m => m.source === "reconstructed");
-  let html = `<p class="hint">
-    Chat = messages in order (system → user → assistant → tool → …).<br/>
-    An <b>LLM turn</b> is one completion call: assistant reply (text and/or tool_calls), then optional tool results go back in.<br/>
-    ${reconstructed ? "<i>Reconstructed from last step dump (older run).</i>" : "From <code>03_agent/conversation.jsonl</code>."}
-  </p><div class="chat">`;
-
-  let lastTurn = null;
-  for (const m of msgs) {
-    if (m.turn != null && m.turn !== 0 && m.turn !== lastTurn && m.role === "assistant") {
-      html += `<div class="turn-sep">LLM turn ${esc(m.turn)} starts (completion response)</div>`;
-      lastTurn = m.turn;
-    }
-    const role = m.role || "unknown";
-    const tMeta = [
-      m.t != null ? `t=${m.t}s` : null,
-      m.turn != null ? `turn=${m.turn}` : null,
-      m.kind && m.kind !== role ? m.kind : null,
-      m.name ? `tool=${m.name}` : null,
-      m.tool_call_id ? `id=${String(m.tool_call_id).slice(0, 18)}…` : null,
-    ].filter(Boolean).join(" · ");
-
-    let body = "";
-    if (role === "assistant" && (m.tool_calls || []).length) {
-      if (m.content) body += `<div class="body">${esc(pretty(m.content, 800))}</div>`;
-      else body += `<div class="body" style="color:var(--muted)">(no text content — tool call only)</div>`;
-      for (const tc of m.tool_calls) {
-        const fn = tc.function || {};
-        body += `<div class="tool-call"><div class="fn">→ call ${esc(fn.name || "?")}</div>
-          <div class="body" style="max-height:160px">${esc(pretty(fn.arguments, 800))}</div></div>`;
-      }
-    } else if (role === "tool") {
-      body += `<div class="body">${esc(pretty(m.content, 2000))}</div>`;
-    } else {
-      body += `<div class="body">${esc(pretty(m.content || "", 2000))}</div>`;
-    }
-
-    html += `<div class="bubble ${esc(role)}">
-      <div class="head">
-        <span class="role">${esc(role)}</span>
-        <span class="meta">#${esc(m.i)} ${esc(tMeta)}</span>
-      </div>
-      ${body}
-    </div>`;
-  }
-  html += `</div>`;
-  return html;
+function fmtSec(v) {
+  if (v == null || Number.isNaN(Number(v))) return "—";
+  const n = Number(v);
+  return n >= 100 ? `${n.toFixed(0)}s` : `${n.toFixed(1)}s`;
 }
 
-function renderMsgFlowItem(m, idx) {
-  const role = m.role || "unknown";
-  let inner = "";
-  if (role === "assistant") {
-    const tcs = m.tool_calls || [];
-    if (m.content) inner += `<pre class="pretty">${esc(pretty(m.content, 1500))}</pre>`;
-    else if (!tcs.length) inner += `<pre class="pretty" style="color:var(--muted)">(empty)</pre>`;
-    for (const tc of tcs) {
-      const fn = tc.function || {};
-      inner += `<div class="tool-call"><div class="fn">tool_call → ${esc(fn.name || "?")}</div>
-        <pre class="pretty" style="max-height:180px">${esc(pretty(fn.arguments, 1000))}</pre></div>`;
-    }
-  } else {
-    inner = `<pre class="pretty">${esc(pretty(m.content || "", 2000))}</pre>`;
+function timingBadge(timing, kind="") {
+  if (!timing) return "";
+  const wall = timing.wall_seconds ?? timing.llm_seconds;
+  if (wall == null) return "";
+  const pct = timing.pct != null ? ` · ${timing.pct}%` : "";
+  const llm = timing.llm_seconds != null && timing.wall_seconds != null
+    ? ` · llm ${fmtSec(timing.llm_seconds)}` : "";
+  return `<span class="tree-badge ${kind}">${fmtSec(wall)}${llm}${pct}</span>`;
+}
+
+function tokenLabel(node) {
+  if (!node) return "";
+  const inp = node.input_tokens;
+  const out = node.output_tokens;
+  if (inp != null || out != null) {
+    return `in=${inp ?? "—"} out=${out ?? "—"}`;
   }
-  return `<div class="flow-item ${esc(role)}">
-    <div class="label">${esc(role)} · msg[${esc(idx)}]</div>
-    ${inner}
+  if (node.prompt_est_tokens != null) {
+    return `in≈${node.prompt_est_tokens}`;
+  }
+  return "";
+}
+
+function tokenBadge(node, kind="") {
+  const label = tokenLabel(node);
+  if (!label) return "";
+  return `<span class="tree-badge ${kind}">${esc(label)}</span>`;
+}
+
+function renderTimingBar(label, seconds, pct, cls="") {
+  const width = Math.max(0.5, Math.min(100, Number(pct) || 0));
+  return `<div class="timing-row">
+    <div class="label" title="${esc(label)}">${esc(label)}</div>
+    <div class="timing-bar-wrap"><div class="timing-bar ${cls}" style="width:${width}%"></div></div>
+    <div>${fmtSec(seconds)}</div>
+    <div>${esc(pct ?? 0)}%</div>
   </div>`;
 }
 
-function requestMessagesDelta(steps, idx) {
-  /** New messages in this turn's request vs previous turn (append-only history). */
-  const msgs = steps[idx].request_messages || [];
-  if (idx <= 0) {
-    return { msgs, omitted: 0, total: msgs.length };
-  }
-  const prevLen = (steps[idx - 1].request_messages || []).length;
-  const omitted = Math.min(prevLen, msgs.length);
-  return { msgs: msgs.slice(omitted), omitted, total: msgs.length };
+function renderHandoffBox(title, payload) {
+  if (payload == null || payload === "") return "";
+  return `<div class="viz-section" style="margin-top:8px">
+    <h3 style="margin:0 0 4px">${esc(title)}</h3>
+    <pre class="pretty">${esc(pretty(payload, 3500))}</pre>
+  </div>`;
 }
 
-function renderStepsViz() {
-  const steps = state.stepsDetail || [];
-  if (!steps.length) {
-    return `<div class="empty">No agent steps found for this run.</div>`;
+function renderSearchTurn(turn) {
+  const err = turn.error ? `<span class="tree-badge err">error</span>` : "";
+  const tools = (turn.tool_results || []).map(tr =>
+    `<span class="pill">${esc(tr.name)}</span>`
+  ).join("") || (turn.tool_calls || []).map(tc =>
+    `<span class="pill">${esc(tc.name)}</span>`
+  ).join("");
+  const submit = turn.submit_output;
+  const submitHtml = submit ? `
+    <div class="viz-section" style="margin-top:8px">
+      <h3 style="margin:0 0 4px">Output (submit_pages)</h3>
+      <pre class="pretty">${esc(pretty(submit, 3500))}</pre>
+    </div>` : "";
+  const assistantHtml = turn.assistant_content ? `
+    <div class="viz-section" style="margin-top:8px">
+      <h3 style="margin:0 0 4px">Assistant</h3>
+      <pre class="pretty">${esc(turn.assistant_content)}</pre>
+    </div>` : "";
+  return `<details class="tree-node turn">
+    <summary>
+      <span class="title">Search turn ${esc(turn.search_turn || turn.step)}</span>
+      ${err}
+      ${submit ? `<span class="tree-badge ok">output</span>` : ""}
+      ${timingBadge(turn.timing)}
+      ${tokenBadge(turn.timing || turn)}
+      ${tools}
+    </summary>
+    <div class="tree-body">
+      ${submitHtml}
+      ${assistantHtml}
+      <pre class="pretty">${esc(pretty({
+        tool_calls: turn.tool_calls,
+        tool_results: turn.tool_results,
+        error: turn.error,
+      }, 3000))}</pre>
+      <a href="#" data-step="${esc(turn.filename)}">open step JSON</a>
+    </div>
+  </details>`;
+}
+
+function renderSearchSession(session, opts = {}) {
+  const turns = session.turns || [];
+  const err = session.error ? `<span class="tree-badge err">error</span>` : "";
+  const status = session.status || "";
+  const statusCls = status === "complete" ? "ok"
+    : (String(status).startsWith("handoff") ? "warn" : "");
+  const pages = session.pages || [];
+  const hasIn = session.prior_context_in != null;
+  // Single-session searches already expose progress via turns; hide redundant
+  // prior_context_out snapshot. Keep it only when a later session may consume it.
+  const nSessions = opts.nSessions || 1;
+  const isHandoff = String(status).startsWith("handoff");
+  const showPriorOut = nSessions > 1 || isHandoff;
+  const showHandoffSummary = showPriorOut && !!session.handoff_summary;
+  const showPriorOutBox = showPriorOut && session.prior_context_out != null;
+  const hasOut = showHandoffSummary || showPriorOutBox;
+  return `<details class="tree-node session">
+    <summary>
+      <span class="title">Search session ${esc(session.session_index)}</span>
+      ${status ? `<span class="tree-badge ${statusCls}">${esc(status)}</span>` : ""}
+      <span class="tree-badge">${esc(turns.length)} turn(s)</span>
+      ${timingBadge(session.timing)}
+      ${pages.length ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>` : ""}
+      ${hasIn ? `<span class="tree-badge">received prior</span>` : ""}
+      ${hasOut ? `<span class="tree-badge warn">handoff out</span>` : ""}
+      ${err}
+    </summary>
+    <div class="tree-body">
+      ${renderHandoffBox(
+        "Received from previous session (prior_context_in)",
+        session.prior_context_in
+      )}
+      ${showHandoffSummary ? renderHandoffBox(
+        "Produced for next session / master (handoff_summary)",
+        session.handoff_summary
+      ) : ""}
+      ${showPriorOutBox ? renderHandoffBox(
+        "Produced prior_context_out (structured handoff blob)",
+        session.prior_context_out
+      ) : ""}
+      ${turns.map(renderSearchTurn).join("") || `<div class="empty">No turns linked</div>`}
+    </div>
+  </details>`;
+}
+
+function renderSearchOutput(output) {
+  if (!output) return "";
+  const pages = output.pages || [];
+  const reasons = output.page_reasons || {};
+  const reasonRows = Object.entries(reasons).map(([page, reason]) =>
+    `<tr><td>${esc(page)}</td><td>${esc(reason)}</td></tr>`
+  ).join("");
+  return `<div class="viz-section" style="margin:8px 0">
+    <h3 style="margin:0 0 6px">SearchAgent output</h3>
+    <div class="tree-kv">status=${esc(output.status || "?")} · pages=${pages.length ? esc(pages.join(", ")) : "∅"}</div>
+    ${reasonRows ? `<table class="kv-table" style="margin-top:8px">
+      <thead><tr><th>Page</th><th>Reason</th></tr></thead>
+      <tbody>${reasonRows}</tbody>
+    </table>` : (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 1200))}</pre>` : `<div class="tree-kv">No pages returned.</div>`)}
+  </div>`;
+}
+
+function renderSearchAgent(node) {
+  const res = node.result || {};
+  const output = node.output || {
+    pages: res.pages || [],
+    page_reasons: res.page_reasons || res.reasons || {},
+    status: res.status,
+  };
+  const pages = output.pages || res.pages || [];
+  const status = output.status || res.status || (pages.length ? "complete" : "unknown");
+  const statusCls = status === "complete" ? "ok" : (String(status).startsWith("handoff") ? "warn" : "");
+  const sessions = node.sessions || [];
+  return `<details class="tree-node search">
+    <summary>
+      <span class="title">SearchAgent</span>
+      <span class="tree-badge ${statusCls}">${esc(status)}</span>
+      <span class="tree-kv">${esc(node.key)}</span>
+      ${timingBadge(node.timing, "warn")}
+      ${pages.length ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>` : `<span class="tree-badge warn">pages=∅</span>`}
+    </summary>
+    <div class="tree-body">
+      ${renderSearchOutput(output)}
+      <div class="tree-kv">
+        ${res.n_search_sessions ? `sessions=${esc(res.n_search_sessions)} · steps=${esc(res.n_search_steps)}` : ""}
+      </div>
+      ${node.note ? `<div class="tree-kv">${esc(node.note)}</div>` : ""}
+      <p class="hint" style="margin:4px 0 8px">
+        Turn-by-turn tool calls below. Final <code>submit_pages</code> output is shown on the last turn.
+      </p>
+      ${sessions.length ? sessions.map(s => renderSearchSession(s, { nSessions: sessions.length })).join("") :
+        `<div class="tree-kv">Search turn dumps not linked (legacy run).</div>`}
+    </div>
+  </details>`;
+}
+
+function renderLoadKvSchema(tool) {
+  const args = tool.arguments || {};
+  const result = tool.result || {};
+  const items = Array.isArray(result.items) ? result.items : [];
+  const keyFilter = args.key ? `key=${esc(args.key)}` : "all keys";
+  const rows = items.map(it =>
+    `<tr><td>${esc(it.key)}</td><td>${esc(it.description || "")}</td></tr>`
+  ).join("");
+  return `
+    <div class="tree-kv">${keyFilter} · count=${esc(result.count != null ? result.count : items.length)}</div>
+    ${rows ? `<table class="kv-table" style="margin-top:8px">
+      <thead><tr><th>Key</th><th>Description</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>` : `<pre class="pretty" style="margin-top:6px">${esc(pretty(Object.keys(result).length ? result : (tool.result_preview || args), 4000))}</pre>`}
+    ${tool.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>` : ""}
+  `;
+}
+
+function renderExtractKvVlm(tool) {
+  const args = tool.arguments || {};
+  const result = tool.result || {};
+  const pages = args.pages || result.pages || [];
+  const keys = args.keys || result.keys || [];
+  const parsed = result.result || {};
+  const extractions = Array.isArray(parsed.extractions) ? parsed.extractions : [];
+  const covered = result.all_keys_covered;
+  const rows = extractions.map(ex =>
+    `<tr>
+      <td>${esc(ex.key)}</td>
+      <td>${esc(ex.value)}</td>
+      <td>${esc(ex.evidence_quote || "")}</td>
+    </tr>`
+  ).join("");
+  const files = tool.extra_files || {};
+  const fileLinks = Object.entries(files).map(([label, rel]) =>
+    `<a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(rel)}" target="_blank">${esc(label)}</a>`
+  ).join(" · ");
+  return `
+    <div class="tree-kv">
+      pages=${esc(JSON.stringify(pages))} · keys=${esc(JSON.stringify(keys))}
+      ${result.input_tokens != null || result.output_tokens != null
+        ? ` · VLM in=${esc(result.input_tokens ?? "—")} out=${esc(result.output_tokens ?? "—")}` : ""}
+      ${covered === true ? `<span class="tree-badge ok">all_keys_covered</span>` : ""}
+      ${covered === false ? `<span class="tree-badge warn">partial</span>` : ""}
+    </div>
+    ${rows ? `<table class="kv-table" style="margin-top:8px">
+      <thead><tr><th>Key</th><th>Value</th><th>Evidence</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>` : ""}
+    ${!rows ? `<pre class="pretty" style="margin-top:6px">${esc(pretty(result.result || result || tool.result_preview || {}, 4000))}</pre>` : ""}
+    ${fileLinks ? `<div class="tree-kv" style="margin-top:6px">pages: ${fileLinks}</div>` : ""}
+    ${tool.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>` : ""}
+  `;
+}
+
+function renderGenericToolResult(tool) {
+  const args = tool.arguments || {};
+  const result = tool.result != null ? tool.result : tool.result_preview;
+  let html = "";
+  if (args && Object.keys(args).length) {
+    html += `<div class="viz-section" style="margin-top:6px">
+      <h3 style="margin:0 0 4px">Arguments</h3>
+      <pre class="pretty" style="max-height:120px">${esc(pretty(args, 1200))}</pre>
+    </div>`;
   }
-  let html = `<p class="hint">
-    Each card = one LLM completion. Flow: <b>new request msgs → assistant → tool results</b>.
-    Prior-turn messages are omitted (history is append-only; see Chat tab for the full transcript).
-    Nested JSON strings are unescaped for reading. <code>messages_after</code> is omitted (redundant).
-  </p><div class="viz-list">`;
+  if (result != null && result !== "") {
+    html += `<div class="viz-section" style="margin-top:6px">
+      <h3 style="margin:0 0 4px">Result</h3>
+      <pre class="pretty" style="max-height:280px">${esc(pretty(result, 4000))}</pre>
+    </div>`;
+  }
+  if (!html) {
+    html = `<div class="tree-kv">No arguments or result recorded.</div>`;
+  }
+  return html;
+}
 
-  for (let si = 0; si < steps.length; si++) {
-    const step = steps[si];
-    const nTools = (step.assistant && step.assistant.tool_calls || []).length;
-    const nResults = (step.tool_results || []).length;
-    const open = step.step === 1 ? " open" : "";
-    const names = (step.tool_names || []).filter(Boolean);
-    const delta = requestMessagesDelta(steps, si);
-    const reqHeading = delta.omitted
-      ? `1. New request messages (+${delta.omitted} prior omitted · ${delta.total} total sent)`
-      : "1. Request messages (sent to LLM)";
-    html += `<details class="viz-card"${open}>
+function renderMasterTool(tool) {
+  let inner = `<div class="name">${esc(tool.name)}</div>`;
+  if (tool.name === "search_pages") {
+    const args = tool.arguments || {};
+    const preview = tool.result || tool.result_preview || {};
+    inner += `<div class="tree-kv">key=${esc(args.key || preview.key || "?")}</div>`;
+    inner += (tool.children || []).map(renderSearchAgent).join("");
+  } else if (tool.name === "extract_kv_vlm") {
+    inner += renderExtractKvVlm(tool);
+  } else if (tool.name === "load_kv_schema") {
+    inner += renderLoadKvSchema(tool);
+  } else {
+    inner += renderGenericToolResult(tool);
+  }
+  return `<div class="tree-tool">${inner}</div>`;
+}
+
+function renderTiming() {
+  const timing = state.agentTree?.timing;
+  if (!timing) return `<div class="empty">No timing data for this run.</div>`;
+
+  const total = timing.total_seconds || 0;
+  const summary = timing.summary || {};
+  let html = `<div class="timing-panel">
+    <p class="hint">
+      Wall time from <code>timeline.jsonl</code>. Master turn = request → next request.
+      SearchAgent = nested LLM calls inside each <code>search_pages</code>.
+    </p>
+    <div class="tree-kv">
+      total ${fmtSec(total)} · master LLM ${fmtSec(summary.master_llm_seconds)}
+      · search LLM ${fmtSec(summary.search_llm_seconds)}
+      · ${esc(summary.search_page_calls || 0)} search_pages
+    </div>
+    <h3 style="margin:8px 0 6px">Pipeline stages</h3>
+    ${(timing.stages || []).map(s => renderTimingBar(s.stage, s.seconds, s.pct, s.stage)).join("")}
+    <h3 style="margin:16px 0 6px">Master turns</h3>
+    ${(timing.master_turns || []).map(mt => `
+      <div>
+        ${renderTimingBar(`Turn ${mt.step}`, mt.wall_seconds, mt.pct, "master")}
+        <div class="timing-sub tree-kv">LLM ${fmtSec(mt.llm_seconds)} · tools/overhead ${fmtSec(mt.tool_seconds)}${tokenLabel(mt) ? ` · ${esc(tokenLabel(mt))}` : ""}</div>
+      </div>`).join("") || `<div class="empty">No master turns</div>`}
+    <h3 style="margin:16px 0 6px">SearchAgent calls</h3>
+    <table class="timing-table">
+      <thead><tr><th>Master step</th><th>Key</th><th>Wall</th><th>LLM</th><th>Overhead</th><th>Tokens</th></tr></thead>
+      <tbody>
+        ${(timing.search_calls || []).map(sc => `
+          <tr>
+            <td>${esc(sc.master_step)}</td>
+            <td>${esc(sc.key)}</td>
+            <td>${fmtSec(sc.wall_seconds)}</td>
+            <td>${fmtSec(sc.llm_seconds)}</td>
+            <td>${fmtSec(sc.overhead_seconds)}</td>
+            <td>${esc(sc.n_turns)} turns</td>
+          </tr>
+          ${(sc.sessions || []).map(sess => (sess.turns || []).map(t => `
+            <tr>
+              <td></td>
+              <td style="padding-left:18px">session ${esc(sess.session_index)} · turn ${esc(t.search_turn || t.step)}</td>
+              <td></td>
+              <td>${fmtSec(t.llm_seconds)}</td>
+              <td></td>
+              <td>${esc(tokenLabel(t))}</td>
+            </tr>`).join("")).join("")}
+        `).join("")}
+      </tbody>
+    </table>
+  </div>`;
+  return html;
+}
+
+function renderMasterOutput() {
+  const output = state.agentTree?.output || state.info?.result || {};
+  const kv = Array.isArray(output.kv_results) ? output.kv_results : [];
+  const err = output.error || state.info?.error?.error || state.info?.error;
+  const nKv = output.n_kv != null ? output.n_kv : kv.length;
+
+  if (err && !kv.length) {
+    return `<details class="tree-node output" open>
       <summary>
-        <span class="title">Turn ${esc(step.step)}</span>
-        <span class="badge">${esc(nTools)} tool_call(s)</span>
-        <span class="badge">${esc(nResults)} result(s)</span>
-        <span class="meta" style="color:var(--muted);font-family:var(--mono);font-size:11px">
-          prompt≈${esc(step.prompt_est_tokens)} · max_tokens=${esc(step.max_tokens)}
-          ${step.error ? " · ERROR" : ""}
-        </span>
+        <span class="title">Output</span>
+        <span class="tree-badge err">error</span>
       </summary>
-      <div class="viz-body">
-        <div class="viz-section">
-          <h3>Meta</h3>
-          <table class="kv-table">
-            <tr><th>tool_choice</th><td>${esc(step.tool_choice)}</td></tr>
-            <tr><th>available tools</th><td>${names.map(n => `<span class="pill">${esc(n)}</span>`).join("") || "—"}</td></tr>
-            ${step.error ? `<tr><th>error</th><td style="color:var(--err)">${esc(step.error)}</td></tr>` : ""}
-          </table>
-        </div>
-
-        <div class="viz-section">
-          <h3>${esc(reqHeading)}</h3>
-          <div class="flow">
-            ${delta.msgs.map((m, i) => renderMsgFlowItem(m, delta.omitted + i)).join("") || "<div class='empty'>none</div>"}
-          </div>
-        </div>
-
-        <div class="arrow">▼ completion</div>
-
-        <div class="viz-section">
-          <h3>2. Assistant (LLM output)</h3>
-          <div class="flow">
-            ${step.assistant ? renderMsgFlowItem(step.assistant, "out") : "<div class='empty'>none</div>"}
-          </div>
-        </div>
-
-        ${(step.tool_results || []).length ? `
-        <div class="arrow">▼ execute tools</div>
-        <div class="viz-section">
-          <h3>3. Tool results</h3>
-          <div class="flow">
-            ${(step.tool_results || []).map((tr, i) => `
-              <div class="flow-item tool">
-                <div class="label">tool · ${esc(tr.name || "?")} · #${esc(i)}</div>
-                <table class="kv-table">
-                  <tr><th>arguments</th><td><pre class="pretty" style="max-height:140px">${esc(pretty(tr.arguments, 800))}</pre></td></tr>
-                  <tr><th>result</th><td><pre class="pretty">${esc(pretty(tr.result_preview != null ? tr.result_preview : tr.result, 2500))}</pre></td></tr>
-                </table>
-              </div>`).join("")}
-          </div>
-        </div>` : `
-        <div class="viz-section">
-          <h3>3. Tool results</h3>
-          <div class="meta" style="color:var(--muted);font-size:12px">none (final text response or error)</div>
-        </div>`}
+      <div class="tree-body">
+        <pre class="pretty">${esc(String(err))}</pre>
       </div>
     </details>`;
   }
+
+  if (!kv.length) {
+    return `<details class="tree-node output" open>
+      <summary>
+        <span class="title">Output</span>
+        <span class="tree-badge warn">empty</span>
+      </summary>
+      <div class="tree-body">
+        <div class="tree-kv">No kv_results in this run.</div>
+        ${err ? `<pre class="pretty">${esc(String(err))}</pre>` : ""}
+      </div>
+    </details>`;
+  }
+
+  const rows = kv.map(item => {
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+    const evidenceText = evidence.map(ev => {
+      const page = ev.page != null ? `p${ev.page}` : (ev.chunk_id || "");
+      const text = ev.text || ev.evidence_quote || "";
+      return page ? `[${page}] ${text}` : text;
+    }).filter(Boolean).join(" · ") || (item.evidence_quote || "");
+    const found = item.found;
+    const foundBadge = found === true
+      ? `<span class="tree-badge ok">found</span>`
+      : (found === false ? `<span class="tree-badge warn">not found</span>` : "");
+    return `<tr>
+      <td>${esc(item.key)}</td>
+      <td>${esc(item.value)} ${foundBadge}</td>
+      <td>${esc(evidenceText)}</td>
+    </tr>`;
+  }).join("");
+
+  return `<details class="tree-node output" open>
+    <summary>
+      <span class="title">Output</span>
+      <span class="tree-badge ok">${esc(nKv)} keys</span>
+    </summary>
+    <div class="tree-body">
+      <p class="hint" style="margin:0 0 8px">
+        Final <code>kv_results</code> assembled from MasterAgent run
+        (${esc(state.info?.meta?.status || "unknown")}).
+      </p>
+      <table class="kv-table">
+        <thead><tr><th>Key</th><th>Value</th><th>Evidence</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <details style="margin-top:10px">
+        <summary class="tree-kv" style="cursor:pointer">raw JSON</summary>
+        <pre class="pretty">${esc(pretty({ kv_results: kv }, 12000))}</pre>
+      </details>
+    </div>
+  </details>`;
+}
+
+function renderAgentHierarchy() {
+  const tree = state.agentTree;
+  if (!tree || !(tree.master_turns || []).length) {
+    return `<div class="empty">No master turns found for this run.</div>`;
+  }
+  let html = `<p class="hint">
+    <b>Agent hierarchy</b> = Master LLM turns → tools → nested SearchAgent sessions.<br/>
+    Each <code>search_pages</code> call expands into SearchAgent session(s) with their own turns.
+  </p><div class="tree">`;
+
+  for (const mt of tree.master_turns) {
+    const err = mt.error ? `<span class="tree-badge err">ERROR</span>` : "";
+    const toolNames = (mt.tools || []).map(t => t.name).filter(Boolean);
+    html += `<details class="tree-node master">
+      <summary>
+        <span class="title">Master turn ${esc(mt.step)}</span>
+        ${err}
+        ${timingBadge(mt.timing, "master")}
+        ${tokenBadge(mt, "master")}
+        ${toolNames.map(n => `<span class="pill">${esc(n)}</span>`).join("")}
+      </summary>
+      <div class="tree-body">
+        ${(mt.tools || []).map(renderMasterTool).join("") || `<div class="empty">No tools on this turn</div>`}
+      </div>
+    </details>`;
+  }
+
+  const unassigned = tree.unassigned_search_steps || {};
+  const keys = Object.keys(unassigned);
+  if (keys.length) {
+    html += `<details class="tree-node">
+      <summary><span class="title">Unassigned search steps</span>
+        <span class="tree-badge warn">${esc(keys.length)} group(s)</span></summary>
+      <div class="tree-body"><pre class="pretty">${esc(pretty(unassigned, 4000))}</pre></div>
+    </details>`;
+  }
+
+  html += renderMasterOutput();
   html += `</div>`;
   return html;
 }
@@ -692,21 +1037,10 @@ function renderStepsViz() {
 function paintDetail() {
   const detail = document.getElementById("detail");
   let body = "";
-  if (state.tab === "chat") {
-    body = renderChat();
-  } else if (state.tab === "stepsViz") {
-    body = renderStepsViz();
-  } else if (state.tab === "timeline") {
-    body = (state.timeline || []).map(ev => `
-      <div class="event">
-        <div class="t">t=${esc(ev.t)}s · ${esc(ev.stage)}/${esc(ev.event)}</div>
-        <div class="title">${esc(JSON.stringify(ev, null, 0).slice(0, 240))}</div>
-      </div>`).join("") || `<div class="empty">No timeline yet</div>`;
-  } else if (state.tab === "turns") {
-    body = `<p class="hint">Raw JSON dumps per LLM completion. Prefer <b>Agent steps (visualize)</b>.</p>
-      <div id="stepList">${(state.steps || []).map(name =>
-      `<div style="margin-bottom:8px"><a href="#" data-step="${esc(name)}">${esc(name)}</a></div>`
-    ).join("") || "No turns"}</div><div id="stepView"></div>`;
+  if (state.tab === "hierarchy") {
+    body = renderAgentHierarchy();
+  } else if (state.tab === "timing") {
+    body = renderTiming();
   } else if (state.tab === "pages") {
     body = `<div class="grid2">${(state.pages || []).map(p => `
       <div>
@@ -714,10 +1048,6 @@ function paintDetail() {
         <a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(p.md_path)}" target="_blank">open md</a>
         <pre class="code" data-md="${esc(p.md_path)}" style="max-height:220px"></pre>
       </div>`).join("") || `<div class="empty">No pages</div>`}</div>`;
-  } else if (state.tab === "result") {
-    body = `<pre>${esc(JSON.stringify(state.info.result || state.info.error, null, 2))}</pre>`;
-  } else if (state.tab === "request") {
-    body = `<pre>${esc(JSON.stringify({meta: state.info.meta, request: state.info.request, parse: state.info.parse_summary, chunk: state.info.chunk_summary}, null, 2))}</pre>`;
   }
   detail.innerHTML = `
     <div class="meta" style="margin-bottom:10px;color:var(--muted)">
@@ -730,30 +1060,23 @@ function paintDetail() {
   detail.querySelectorAll(".tab").forEach(btn => {
     btn.onclick = () => { state.tab = btn.dataset.tab; paintDetail(); };
   });
+  const openJsonDump = async (relPath) => {
+    const data = await api(`/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(relPath)}`);
+    const w = window.open("", "_blank");
+    if (!w) return;
+    w.document.write(`<pre style="white-space:pre-wrap;font-family:ui-monospace,monospace">${esc(pretty(data, 50000))}</pre>`);
+    w.document.close();
+  };
   detail.querySelectorAll("[data-step]").forEach(a => {
     a.onclick = async (e) => {
       e.preventDefault();
-      const name = a.dataset.step;
-      const data = await api(`/api/runs/${encodeURIComponent(state.runId)}/file?path=03_agent/${encodeURIComponent(name)}`);
-      const view = document.getElementById("stepView");
-      if (data && data.request_messages !== undefined) {
-        // Raw dump also hides messages_after — use visualize tab instead.
-        const sections = [
-          ["request_messages", data.request_messages],
-          ["tools / tool_choice", { tool_choice: data.tool_choice, tools: data.tools }],
-          ["assistant", data.assistant],
-          ["tool_results", data.tool_results],
-        ];
-        const meta = `turn=${esc(data.step)} · prompt_est=${esc(data.prompt_est_tokens)} · max_tokens=${esc(data.max_tokens)}` +
-          (data.error ? ` · ERROR: ${esc(data.error)}` : "");
-        view.innerHTML = `<div class="meta" style="margin:8px 0;color:var(--muted)">${meta}</div>` +
-          sections.map(([title, payload]) => `
-            <div style="margin:14px 0 6px;color:var(--accent);font-size:13px">${esc(title)}</div>
-            <pre>${esc(pretty(payload, 20000))}</pre>
-          `).join("");
-      } else {
-        view.innerHTML = `<pre>${esc(pretty(data, 20000))}</pre>`;
-      }
+      openJsonDump(`03_agent/${a.dataset.step}`);
+    };
+  });
+  detail.querySelectorAll("[data-tool-file]").forEach(a => {
+    a.onclick = async (e) => {
+      e.preventDefault();
+      openJsonDump(`03_agent/tools/${a.dataset.toolFile}`);
     };
   });
   detail.querySelectorAll("[data-md]").forEach(async pre => {
