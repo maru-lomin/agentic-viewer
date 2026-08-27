@@ -165,22 +165,25 @@ def _search_call_timings(
         return []
 
     rows: List[Dict[str, Any]] = []
-    prev_end = float(events[0].get("t") or 0) if events else 0.0
+    # Per-key lower bound so parallel SearchAgents (different keys) do not
+    # steal each other's LLM windows. Same-key follow-ups still stay sequential.
+    prev_end_by_key: Dict[str, float] = {}
     for spe in sp_events:
         end_t = float(spe.get("t") or 0)
         key = str(spe.get("key") or "")
         master_step = int(spe.get("step") or 0)
+        t_lo = float(prev_end_by_key.get(key, -1.0))
 
         window_pairs = [
             p
             for p in llm_pairs
             if p.get("agent") == "search"
             and p.get("key") == key
-            and prev_end < float(p.get("start_t") or 0) <= end_t
+            and t_lo < float(p.get("start_t") or 0) <= end_t
         ]
         window_pairs.sort(key=lambda p: float(p.get("start_t") or 0))
 
-        start_t = prev_end
+        start_t = end_t
         if window_pairs:
             start_t = min(float(p["start_t"]) for p in window_pairs)
 
@@ -190,14 +193,22 @@ def _search_call_timings(
             if ev.get("stage") != "agent" or ev.get("event") != "step":
                 continue
             t = float(ev.get("t") or 0)
-            if t < start_t or t > end_t:
+            if t <= t_lo or t > end_t:
                 continue
             label = str(ev.get("label") or "")
-            if label.startswith("search_"):
-                label_by_step[int(ev.get("step") or 0)] = label
+            if not _is_search_step_label(label):
+                continue
+            # Prefer labels that belong to this key when parallel agents interleave.
+            parsed = _parse_timing_search_label(label)
+            if parsed is not None:
+                _label_key_prefix, _sess, _turn, _mstep = parsed
+                # Soft filter: if master_step encoded, require match when present.
+                if _mstep and _mstep != master_step:
+                    continue
+            label_by_step[int(ev.get("step") or 0)] = label
 
         llm_total = sum(float(p.get("llm_seconds") or 0) for p in window_pairs)
-        wall = max(0.0, end_t - start_t)
+        wall = max(0.0, end_t - start_t) if window_pairs else 0.0
 
         turns: List[Dict[str, Any]] = []
         for p in window_pairs:
@@ -205,14 +216,18 @@ def _search_call_timings(
             label = label_by_step.get(turn_step, "")
             session_index = 1
             search_turn = turn_step
-            m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
-            if m:
-                session_index = int(m.group(2))
-                search_turn = int(m.group(3))
+            parsed = _parse_timing_search_label(label) if label else None
+            if parsed is not None:
+                _prefix, session_index, search_turn, _mstep = parsed
             else:
-                m = re.match(r"^search_(.+)_s(\d+)$", label)
+                m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
                 if m:
-                    search_turn = int(m.group(2))
+                    session_index = int(m.group(2))
+                    search_turn = int(m.group(3))
+                else:
+                    m = re.match(r"^search_(.+)_s(\d+)$", label)
+                    if m:
+                        search_turn = int(m.group(2))
 
             turns.append(
                 {
@@ -257,8 +272,35 @@ def _search_call_timings(
                 "turns": turns,
             }
         )
-        prev_end = end_t
+        prev_end_by_key[key] = end_t
     return rows
+
+
+def _is_search_step_label(label: str) -> bool:
+    if not label:
+        return False
+    return bool(re.search(r"(?:^|_)search_", label))
+
+
+def _parse_timing_search_label(
+    label: str,
+) -> Optional[Tuple[str, int, int, int]]:
+    """
+    Parse search step labels.
+
+    Returns (key_prefix, session_index, turn, master_step) or None.
+    master_step is 0 when the legacy search_* form has no master index.
+    """
+    m = re.match(r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)_s(\d+)$", label)
+    if m:
+        return m.group(2), int(m.group(3)), int(m.group(4)), int(m.group(1))
+    m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
+    if m:
+        return m.group(1), int(m.group(2)), int(m.group(3)), 0
+    m = re.match(r"^(?:m\d+(?:_t\d+_k\d+)?)?_?search_(.+)_s(\d+)$", label)
+    if m:
+        return m.group(1), 1, int(m.group(2)), 0
+    return None
 
 
 def attach_timing_to_tree(
@@ -284,9 +326,80 @@ def attach_timing_to_tree(
         for tool in mt.get("tools") or []:
             if tool.get("name") != "search_pages" or not call_queue:
                 continue
-            call_timing = call_queue.pop(0)
+            args_key = (tool.get("arguments") or {}).get("key")
+            batch_keys: List[str] = []
+            if isinstance(args_key, list):
+                batch_keys = [str(k) for k in args_key if str(k).strip()]
+            elif isinstance((tool.get("result") or {}).get("results"), list):
+                batch_keys = [
+                    str(x.get("key") or "")
+                    for x in (tool.get("result") or {}).get("results")
+                    if isinstance(x, dict) and x.get("key")
+                ]
+
             for child in tool.get("children") or []:
                 if child.get("type") != "search_agent":
+                    continue
+
+                if child.get("batch") and batch_keys:
+                    # One timing row per key → attach onto session_index 1..N.
+                    by_key: Dict[str, Dict[str, Any]] = {}
+                    wall_sum = 0.0
+                    llm_sum = 0.0
+                    for bk in batch_keys:
+                        matched = None
+                        for idx, cand in enumerate(call_queue):
+                            if str(cand.get("key") or "") == bk:
+                                matched = call_queue.pop(idx)
+                                break
+                        if matched is None:
+                            continue
+                        by_key[bk] = matched
+                        wall_sum = max(
+                            wall_sum, float(matched.get("wall_seconds") or 0)
+                        )
+                        llm_sum += float(matched.get("llm_seconds") or 0)
+                    child["timing"] = {
+                        "wall_seconds": _round_secs(wall_sum),
+                        "llm_seconds": _round_secs(llm_sum),
+                        "overhead_seconds": _round_secs(
+                            max(0.0, wall_sum - llm_sum)
+                        ),
+                        "pct": None,
+                    }
+                    for sess in child.get("sessions") or []:
+                        st = by_key.get(str(sess.get("key") or ""))
+                        if not st:
+                            continue
+                        sess["timing"] = {
+                            "wall_seconds": st.get("wall_seconds"),
+                            "llm_seconds": st.get("llm_seconds"),
+                            "n_turns": st.get("n_turns"),
+                        }
+                        # Flattened turns: match by order within the key's LLM pairs.
+                        src_turns = st.get("turns") or []
+                        for ti, turn in enumerate(sess.get("turns") or []):
+                            if ti < len(src_turns):
+                                tt = src_turns[ti]
+                                turn["timing"] = {
+                                    "llm_seconds": tt.get("llm_seconds"),
+                                    "input_tokens": tt.get("input_tokens"),
+                                    "output_tokens": tt.get("output_tokens"),
+                                    "prompt_est_tokens": tt.get("prompt_est_tokens"),
+                                }
+                    continue
+
+                # Single-key search_pages (legacy / one key).
+                tool_key = str(args_key or "") if not isinstance(args_key, list) else ""
+                call_timing = None
+                if tool_key:
+                    for idx, cand in enumerate(call_queue):
+                        if str(cand.get("key") or "") == tool_key:
+                            call_timing = call_queue.pop(idx)
+                            break
+                if call_timing is None and call_queue:
+                    call_timing = call_queue.pop(0)
+                if call_timing is None:
                     continue
                 child["timing"] = {
                     "wall_seconds": call_timing.get("wall_seconds"),

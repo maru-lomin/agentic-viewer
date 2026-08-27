@@ -23,14 +23,17 @@ def _parse_search_label(label: str) -> Tuple[str, int, int, int]:
     Parse search step label into (key_prefix, session, turn, master_step).
 
     Supports:
-      m{master}_search_{safe_key}_s{session}_s{turn}  (namespaced per master call)
-      search_{safe_key}_s{session}_s{turn}              (legacy multi-session handoff)
-      search_{safe_key}_s{turn}                         (legacy single session)
+      m{master}_t{tool}_k{keyidx}_search_{safe_key}_s{session}_s{turn}
+      m{master}_search_{safe_key}_s{session}_s{turn}
+      search_{safe_key}_s{session}_s{turn}
+      search_{safe_key}_s{turn}
 
     master_step is 0 when the label has no mNNN prefix (legacy runs).
     """
     label = str(label or "")
-    m = re.match(r"^m(\d+)_search_(.+)_s(\d+)_s(\d+)$", label)
+    m = re.match(
+        r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)_s(\d+)$", label
+    )
     if m:
         return m.group(2), int(m.group(3)), int(m.group(4)), int(m.group(1))
     m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
@@ -225,9 +228,10 @@ def _normalize_page_reasons(result: Dict[str, Any]) -> Dict[str, str]:
 
 def _load_timeline_search_links(run_dir: Path) -> List[Dict[str, Any]]:
     """
-    Map each search_pages completion to SearchAgent step labels using timeline order.
+    Map each search_pages completion to SearchAgent step labels.
 
-    SearchAgent step events occur before the matching search_pages event timestamp.
+    Uses a per-key time window so parallel SearchAgents (different keys) that
+    finish out of tool-call order still keep their own step labels.
     """
     path = run_dir / "timeline.jsonl"
     if not path.is_file():
@@ -250,27 +254,43 @@ def _load_timeline_search_links(run_dir: Path) -> List[Dict[str, Any]]:
             continue
         event = row.get("event")
         label = str(row.get("label") or "")
-        if event == "step" and label.startswith("search_"):
+        if event == "step" and (
+            label.startswith("search_") or re.search(r"(?:^|_)search_", label)
+        ):
             step_events.append(row)
         elif event == "search_pages":
             search_pages_events.append(row)
 
+    prev_end_by_key: Dict[str, float] = {}
     links: List[Dict[str, Any]] = []
-    for i, sp in enumerate(search_pages_events):
-        t_lo = float(search_pages_events[i - 1].get("t") or 0) if i > 0 else -1.0
+    for sp in search_pages_events:
+        key = str(sp.get("key") or "")
+        t_lo = float(prev_end_by_key.get(key, -1.0))
         t_hi = float(sp.get("t") or 0)
-        labels = [
-            str(e.get("label"))
-            for e in step_events
-            if t_lo < float(e.get("t") or 0) <= t_hi and e.get("label")
-        ]
+        master_step = int(sp.get("step") or 0)
+        labels = []
+        want_prefix = _safe_key(key)
+        for e in step_events:
+            t = float(e.get("t") or 0)
+            if not (t_lo < t <= t_hi and e.get("label")):
+                continue
+            label = str(e.get("label"))
+            parsed = _parse_search_label(label)
+            # parsed = (key_prefix, session, turn, master_step)
+            if parsed[3] and parsed[3] != master_step:
+                continue
+            # Must belong to this key — parallel keys share the same time window.
+            if want_prefix and parsed[0] != want_prefix:
+                continue
+            labels.append(label)
         links.append(
             {
-                "master_step": int(sp.get("step") or 0),
-                "key": str(sp.get("key") or ""),
+                "master_step": master_step,
+                "key": key,
                 "labels": labels,
             }
         )
+        prev_end_by_key[key] = t_hi
     return links
 
 
@@ -397,7 +417,7 @@ def _load_priors_from_conversation(
         master_step = 0
         prefix = ""
         sess = 0
-        m = re.match(r"^m(\d+)_search_(.+)_s(\d+)_user$", kind)
+        m = re.match(r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)_user$", kind)
         if m:
             master_step, prefix, sess = int(m.group(1)), m.group(2), int(m.group(3))
         else:
@@ -713,6 +733,134 @@ def _resolve_tool_result(
     return None, filename, extra_files
 
 
+def _flatten_sessions_as_turns(
+    search_sessions: List[Dict[str, Any]],
+    *,
+    display_session_index: int,
+) -> List[Dict[str, Any]]:
+    """
+    Merge handoff sessions for one key into a single turn list with unique
+    search_turn indices (1..N). Used when a multi-key search_pages call maps
+    each key to one display session.
+    """
+    turns: List[Dict[str, Any]] = []
+    n = 0
+    for sess in search_sessions or []:
+        for turn in sess.get("turns") or []:
+            n += 1
+            row = dict(turn)
+            row["search_turn"] = n
+            row["search_session"] = display_session_index
+            row["handoff_session_index"] = sess.get("session_index")
+            turns.append(row)
+    return turns
+
+
+def _build_batch_search_agent(
+    *,
+    batch_items: List[Dict[str, Any]],
+    step_call_queue: List[Dict[str, Any]],
+    search_by_prefix: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    master_step: int = 0,
+) -> Dict[str, Any]:
+    """
+    One SearchAgent node with session_index 1..N = one key each (parallel).
+
+    Consumes matching per-key calls from step_call_queue by key. If a per-key
+    dump is missing, rebuild turns from search step files for that key_prefix.
+    """
+    search_by_prefix = search_by_prefix or {}
+    sessions: List[Dict[str, Any]] = []
+    for i, item in enumerate(batch_items):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "")
+        call = None
+        for j, cand in enumerate(step_call_queue):
+            if str(cand.get("key") or "") == key:
+                call = step_call_queue.pop(j)
+                break
+
+        display_idx = i + 1
+        turns: List[Dict[str, Any]] = []
+        if call and (call.get("search_sessions") or []):
+            turns = _flatten_sessions_as_turns(
+                call.get("search_sessions") or [],
+                display_session_index=display_idx,
+            )
+        elif key:
+            # Recover when the per-key dump was overwritten / missing.
+            prefix = _safe_key(key)
+            rows = [
+                r
+                for r in (search_by_prefix.get(prefix) or [])
+                if int(r.get("master_step") or 0) == master_step
+            ]
+            if rows:
+                recovered = _group_search_sessions(
+                    rows,
+                    key_prefix=prefix,
+                    master_step=master_step,
+                )
+                turns = _flatten_sessions_as_turns(
+                    recovered, display_session_index=display_idx
+                )
+
+        pages = item.get("pages")
+        if pages is None and call:
+            pages = (call.get("output") or {}).get("pages")
+        page_reasons = item.get("page_reasons")
+        if page_reasons is None and call:
+            page_reasons = (call.get("output") or {}).get("page_reasons")
+        status = item.get("status")
+        if not status and call:
+            status = (call.get("output") or {}).get("status") or (
+                call.get("result") or {}
+            ).get("status")
+
+        sessions.append(
+            {
+                "session_index": display_idx,
+                "key": key,
+                "n_turns": len(turns),
+                "turns": turns,
+                "status": status or "unknown",
+                "pages": pages if pages is not None else [],
+                "page_reasons": page_reasons if isinstance(page_reasons, dict) else {},
+                "reasons": page_reasons if isinstance(page_reasons, dict) else {},
+                "reason": item.get("reason")
+                or ((call or {}).get("output") or {}).get("reason")
+                or "",
+                "prior_context_in": None,
+                "prior_context_out": None,
+                "handoff_summary": "",
+                "error": next(
+                    (t.get("error") for t in turns if t.get("error")), None
+                ),
+                "filename": (call or {}).get("filename"),
+            }
+        )
+
+    return {
+        "type": "search_agent",
+        "key": f"{len(sessions)} keys (parallel)",
+        "batch": True,
+        "output": {
+            "status": "complete",
+            "pages": [],
+            "page_reasons": {},
+            "n_keys": len(sessions),
+        },
+        "result": {
+            "status": "complete",
+            "n_search_sessions": len(sessions),
+            "n_keys": len(sessions),
+            "n_search_steps": sum(s.get("n_turns") or 0 for s in sessions),
+        },
+        "sessions": sessions,
+    }
+
+
 def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
     """
     Build Master → tools → SearchAgent sessions tree.
@@ -743,6 +891,11 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
         result = dump.get("result") or {}
         if not isinstance(result, dict):
             result = {}
+        # Batched multi-key summary dump — per-key dumps are saved separately.
+        if isinstance(result.get("results"), list) and "key" not in result:
+            continue
+        if isinstance(args.get("key"), list):
+            continue
         key = str(args.get("key") or result.get("key") or "")
         prefix = _safe_key(key)
         search_page_calls.append(
@@ -849,37 +1002,68 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
             if dump and dump.get("arguments") is not None and not tool_node["arguments"]:
                 tool_node["arguments"] = dump.get("arguments")
 
-            if tname == "search_pages" and step_call_queue:
-                call = step_call_queue.pop(0)
-                output = call.get("output") or {}
-                tool_node["search_output"] = output
-                tool_node["result"] = call.get("result") or tool_node.get("result")
-                tool_node["filename"] = call.get("filename") or tool_node.get("filename")
-                tool_node["children"].append(
-                    {
-                        "type": "search_agent",
-                        "key": call["key"],
-                        "key_prefix": call["key_prefix"],
-                        "output": output,
-                        "result": {
-                            "pages": output.get("pages"),
-                            "page_reasons": output.get("page_reasons"),
-                            "reasons": output.get("page_reasons"),
-                            "status": output.get("status")
-                            or call["result"].get("status"),
-                            "reason": output.get("reason")
-                            or call["result"].get("reason"),
-                            "n_search_steps": len(call.get("search_steps") or [])
-                            or call["result"].get("n_search_steps"),
-                            "n_search_sessions": call["result"].get(
-                                "n_search_sessions"
-                            ),
-                        },
-                        "sessions": call.get("search_sessions") or [],
-                        "filename": call.get("filename"),
-                        "note": call.get("note"),
+            if tname == "search_pages":
+                batch_items = None
+                if isinstance(result, dict) and isinstance(result.get("results"), list):
+                    batch_items = [
+                        x for x in result["results"] if isinstance(x, dict)
+                    ]
+                args_key = (tool_node.get("arguments") or {}).get("key")
+                if (
+                    batch_items is None
+                    and isinstance(args_key, list)
+                    and len(args_key) > 1
+                ):
+                    # Arguments list keys but result missing — still try queue.
+                    batch_items = [{"key": str(k)} for k in args_key]
+
+                if batch_items and len(batch_items) > 1:
+                    tool_node["children"].append(
+                        _build_batch_search_agent(
+                            batch_items=batch_items,
+                            step_call_queue=step_call_queue,
+                            search_by_prefix=search_by_prefix,
+                            master_step=mstep,
+                        )
+                    )
+                    tool_node["search_output"] = {
+                        "status": "complete",
+                        "n_keys": len(batch_items),
+                        "results": batch_items,
                     }
-                )
+                elif step_call_queue:
+                    call = step_call_queue.pop(0)
+                    output = call.get("output") or {}
+                    tool_node["search_output"] = output
+                    tool_node["result"] = call.get("result") or tool_node.get("result")
+                    tool_node["filename"] = call.get("filename") or tool_node.get(
+                        "filename"
+                    )
+                    tool_node["children"].append(
+                        {
+                            "type": "search_agent",
+                            "key": call["key"],
+                            "key_prefix": call["key_prefix"],
+                            "output": output,
+                            "result": {
+                                "pages": output.get("pages"),
+                                "page_reasons": output.get("page_reasons"),
+                                "reasons": output.get("page_reasons"),
+                                "status": output.get("status")
+                                or call["result"].get("status"),
+                                "reason": output.get("reason")
+                                or call["result"].get("reason"),
+                                "n_search_steps": len(call.get("search_steps") or [])
+                                or call["result"].get("n_search_steps"),
+                                "n_search_sessions": call["result"].get(
+                                    "n_search_sessions"
+                                ),
+                            },
+                            "sessions": call.get("search_sessions") or [],
+                            "filename": call.get("filename"),
+                            "note": call.get("note"),
+                        }
+                    )
             node["tools"].append(tool_node)
 
         tree.append(node)

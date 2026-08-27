@@ -698,6 +698,7 @@ function renderSearchSession(session, opts = {}) {
   return `<details class="tree-node session">
     <summary>
       <span class="title">Search session ${esc(session.session_index)}</span>
+      ${session.key ? `<span class="tree-kv">${esc(session.key)}</span>` : ""}
       ${status ? `<span class="tree-badge ${statusCls}">${esc(status)}</span>` : ""}
       <span class="tree-badge">${esc(turns.length)} turn(s)</span>
       ${timingBadge(session.timing)}
