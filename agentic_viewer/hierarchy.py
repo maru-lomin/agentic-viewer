@@ -18,22 +18,28 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _parse_search_label(label: str) -> Tuple[str, int, int]:
+def _parse_search_label(label: str) -> Tuple[str, int, int, int]:
     """
-    Parse search step label into (key_prefix, session, turn).
+    Parse search step label into (key_prefix, session, turn, master_step).
 
     Supports:
-      search_{safe_key}_s{session}_s{turn}  (multi-session handoff)
-      search_{safe_key}_s{turn}             (legacy single session)
+      m{master}_search_{safe_key}_s{session}_s{turn}  (namespaced per master call)
+      search_{safe_key}_s{session}_s{turn}              (legacy multi-session handoff)
+      search_{safe_key}_s{turn}                         (legacy single session)
+
+    master_step is 0 when the label has no mNNN prefix (legacy runs).
     """
     label = str(label or "")
+    m = re.match(r"^m(\d+)_search_(.+)_s(\d+)_s(\d+)$", label)
+    if m:
+        return m.group(2), int(m.group(3)), int(m.group(4)), int(m.group(1))
     m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
     if m:
-        return m.group(1), int(m.group(2)), int(m.group(3))
+        return m.group(1), int(m.group(2)), int(m.group(3)), 0
     m = re.match(r"^search_(.+)_s(\d+)$", label)
     if m:
-        return m.group(1), 1, int(m.group(2))
-    return label.replace("search_", "", 1), 1, 0
+        return m.group(1), 1, int(m.group(2)), 0
+    return label.replace("search_", "", 1), 1, 0, 0
 
 
 def _extract_submit_output(tool_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -154,10 +160,11 @@ def _load_steps(
         compact = _compact_step(data, filename=name)
 
         if label:
-            key_prefix, session, turn = _parse_search_label(str(label))
+            key_prefix, session, turn, master_step = _parse_search_label(str(label))
             compact["search_key_prefix"] = key_prefix
             compact["search_session"] = session
             compact["search_turn"] = turn
+            compact["master_step"] = master_step
             search_by_prefix.setdefault(key_prefix, []).append(compact)
         elif re.fullmatch(r"step_\d+\.json", name):
             master.append(compact)
@@ -166,6 +173,7 @@ def _load_steps(
     for rows in search_by_prefix.values():
         rows.sort(
             key=lambda s: (
+                int(s.get("master_step") or 0),
                 int(s.get("search_session") or 1),
                 int(s.get("search_turn") or 0),
             )
@@ -280,7 +288,7 @@ def _link_search_steps_to_calls(
     Attach search step rows to each search_pages call.
 
     Prefer timeline-based linking (robust for repeated keys). Fall back to per-prefix
-    queues when timeline data is missing.
+    + master_step queues when timeline data is missing.
     """
     by_label = _label_index(search_by_prefix)
     used_labels: set[str] = set()
@@ -290,14 +298,17 @@ def _link_search_steps_to_calls(
         k = (int(link.get("master_step") or 0), str(link.get("key") or ""))
         timeline_queues.setdefault(k, []).append(list(link.get("labels") or []))
 
-    prefix_queues: Dict[str, List[Dict[str, Any]]] = {
-        k: list(v) for k, v in search_by_prefix.items()
-    }
+    prefix_queues: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for prefix, rows in search_by_prefix.items():
+        for row in rows:
+            mstep = int(row.get("master_step") or 0)
+            prefix_queues.setdefault((prefix, mstep), []).append(row)
 
     for call in search_page_calls:
         prefix = call["key_prefix"]
+        master_step = int(call["master_step"] or 0)
         labels = _consume_queue_key(
-            timeline_queues, (call["master_step"], call["key"])
+            timeline_queues, (master_step, call["key"])
         )
 
         consumed: List[Dict[str, Any]] = []
@@ -312,7 +323,7 @@ def _link_search_steps_to_calls(
             n_steps = int(call["result"].get("n_search_steps") or 0)
             queue = [
                 row
-                for row in (prefix_queues.get(prefix) or [])
+                for row in (prefix_queues.get((prefix, master_step)) or [])
                 if str(row.get("label") or "") not in used_labels
             ]
             if n_steps <= 0 and queue:
@@ -333,28 +344,34 @@ def _link_search_steps_to_calls(
         if consumed:
             remaining = [
                 row
-                for row in (prefix_queues.get(prefix) or [])
+                for row in (prefix_queues.get((prefix, master_step)) or [])
                 if str(row.get("label") or "") not in used_labels
             ]
-            prefix_queues[prefix] = remaining
+            prefix_queues[(prefix, master_step)] = remaining
 
         call["search_steps"] = consumed
 
-    return prefix_queues
+    # Return unassigned rows keyed by prefix (legacy shape for debug panel).
+    unassigned_by_prefix: Dict[str, List[Dict[str, Any]]] = {}
+    for (prefix, _mstep), rows in prefix_queues.items():
+        if rows:
+            unassigned_by_prefix.setdefault(prefix, []).extend(rows)
+    return unassigned_by_prefix
 
 
 def _load_priors_from_conversation(
     agent_dir: Path,
-) -> Dict[Tuple[str, int], Dict[str, Any]]:
+) -> Dict[Tuple[int, str, int], Dict[str, Any]]:
     """
-    Map (key_prefix, session_index) → prior_context received by that session.
+    Map (master_step, key_prefix, session_index) → prior_context received by that session.
 
     Parsed from conversation.jsonl user messages (less truncated than step dumps).
     Kind examples:
-      search_Distance_between_GSU_Transformers_s2_user
+      m021_search_Distance_between_GSU_Transformers_s1_user
+      search_Distance_between_GSU_Transformers_s2_user  (legacy; master_step=0)
     """
     path = agent_dir / "conversation.jsonl"
-    out: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    out: Dict[Tuple[int, str, int], Dict[str, Any]] = {}
     if not path.is_file():
         return out
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -366,19 +383,25 @@ def _load_priors_from_conversation(
         except json.JSONDecodeError:
             continue
         kind = str(row.get("kind") or "")
-        if not kind.startswith("search_") or not kind.endswith("_user"):
+        if not kind.endswith("_user"):
             continue
-        # search_{prefix}_s{N}_user
-        m = re.match(r"^search_(.+)_s(\d+)_user$", kind)
-        if not m:
-            continue
-        prefix, sess = m.group(1), int(m.group(2))
+        master_step = 0
+        prefix = ""
+        sess = 0
+        m = re.match(r"^m(\d+)_search_(.+)_s(\d+)_user$", kind)
+        if m:
+            master_step, prefix, sess = int(m.group(1)), m.group(2), int(m.group(3))
+        else:
+            m = re.match(r"^search_(.+)_s(\d+)_user$", kind)
+            if not m:
+                continue
+            prefix, sess = m.group(1), int(m.group(2))
         content = row.get("content")
         if not isinstance(content, str):
             continue
         prior = _extract_prior_from_user(content)
         if prior:
-            out[(prefix, sess)] = prior
+            out[(master_step, prefix, sess)] = prior
     return out
 
 
@@ -388,8 +411,9 @@ def _group_search_sessions(
     meta_by_session: Optional[Dict[int, Dict[str, Any]]] = None,
     final_handoff_summary: str = "",
     final_prior_context: Optional[Dict[str, Any]] = None,
-    conversation_priors: Optional[Dict[Tuple[str, int], Dict[str, Any]]] = None,
+    conversation_priors: Optional[Dict[Tuple[int, str, int], Dict[str, Any]]] = None,
     key_prefix: str = "",
+    master_step: int = 0,
 ) -> List[Dict[str, Any]]:
     sessions: Dict[int, List[Dict[str, Any]]] = {}
     for row in steps:
@@ -407,7 +431,7 @@ def _group_search_sessions(
         # What this session received.
         prior_in = meta.get("prior_context_in")
         if prior_in is None:
-            prior_in = conversation_priors.get((key_prefix, sess))
+            prior_in = conversation_priors.get((master_step, key_prefix, sess))
         if prior_in is None and turns:
             prior_in = _extract_prior_from_user(
                 turns[0].get("first_user_content") or ""
@@ -756,6 +780,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
             final_prior_context=call["result"].get("prior_context"),
             conversation_priors=conversation_priors,
             key_prefix=prefix,
+            master_step=int(call["master_step"] or 0),
         )
         if not call["search_sessions"] and n_sessions:
             call["note"] = f"{n_sessions} session(s) recorded in result metadata"

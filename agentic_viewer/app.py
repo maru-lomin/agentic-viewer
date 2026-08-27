@@ -797,6 +797,7 @@ function renderExtractKvVlm(tool) {
   const result = tool.result || {};
   const pages = args.pages || result.pages || [];
   const keys = args.keys || result.keys || [];
+  const hints = args.hints;
   const parsed = result.result || {};
   const extractions = Array.isArray(parsed.extractions) ? parsed.extractions : [];
   const covered = result.all_keys_covered;
@@ -811,6 +812,11 @@ function renderExtractKvVlm(tool) {
   const fileLinks = Object.entries(files).map(([label, rel]) =>
     `<a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(rel)}" target="_blank">${esc(label)}</a>`
   ).join(" · ");
+  const hintsHtml = hints && String(hints).trim() ? `
+    <div class="viz-section" style="margin-top:6px">
+      <h3 style="margin:0 0 4px">Hints</h3>
+      <pre class="pretty" style="max-height:160px;margin:0">${esc(String(hints))}</pre>
+    </div>` : "";
   return `
     <div class="tree-kv">
       pages=${esc(JSON.stringify(pages))} · keys=${esc(JSON.stringify(keys))}
@@ -819,6 +825,7 @@ function renderExtractKvVlm(tool) {
       ${covered === true ? `<span class="tree-badge ok">all_keys_covered</span>` : ""}
       ${covered === false ? `<span class="tree-badge warn">partial</span>` : ""}
     </div>
+    ${hintsHtml}
     ${rows ? `<table class="kv-table" style="margin-top:8px">
       <thead><tr><th>Key</th><th>Value</th><th>Evidence</th></tr></thead>
       <tbody>${rows}</tbody>
