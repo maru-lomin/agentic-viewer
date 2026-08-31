@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from agentic_viewer.eval.evaluate_kv import build_report, load_json
+from agentic_viewer.eval.paths import answer_sheet_path
 from agentic_viewer.hierarchy import build_agent_tree
 from agentic_viewer.image_tokens import replace_base64_images
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
@@ -51,6 +53,66 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _eval_summary(report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(report, dict):
+        return None
+    overall = report.get("overall")
+    if not isinstance(overall, dict):
+        return None
+    return {
+        "value_exact_match": overall.get("value_exact_match"),
+        "page_f1_macro": overall.get("page_f1_macro"),
+        "evidence_token_f1": overall.get("evidence_token_f1"),
+        "n_keys": report.get("n_keys"),
+        "document": report.get("document"),
+    }
+
+
+def _compute_run_eval(run_id: str, *, refresh: bool = False) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    cache_path = root / "05_eval.json"
+    if cache_path.is_file() and not refresh:
+        cached = _read_json(cache_path)
+        if isinstance(cached, dict) and cached.get("overall"):
+            return cached
+
+    pred_path = root / "04_result.json"
+    pred = _read_json(pred_path)
+    if not isinstance(pred, dict):
+        raise HTTPException(status_code=404, detail="04_result.json not found")
+
+    ans_path = answer_sheet_path()
+    if not ans_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"answer sheet not found: {ans_path}",
+        )
+    answer_sheet = load_json(ans_path)
+    if not isinstance(answer_sheet, dict):
+        raise HTTPException(status_code=500, detail="invalid answer sheet JSON")
+
+    try:
+        report = build_report(
+            pred,
+            answer_sheet,
+            pred_path=str(pred_path),
+            answer_sheet_path=str(ans_path),
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    report["run_id"] = run_id
+    try:
+        cache_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Runs dir may be read-only; still return the scored report.
+        report["cache_write_error"] = str(cache_path)
+    return report
+
+
 @app.get("/api/runs")
 def list_runs() -> List[Dict[str, Any]]:
     RUNS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -60,6 +122,7 @@ def list_runs() -> List[Dict[str, Any]]:
             continue
         meta = _read_json(child / "meta.json") or {}
         result = _read_json(child / "04_result.json") or {}
+        eval_cached = _read_json(child / "05_eval.json")
         rows.append(
             {
                 "run_id": child.name,
@@ -69,6 +132,9 @@ def list_runs() -> List[Dict[str, Any]]:
                 "seconds": meta.get("seconds"),
                 "n_kv": len(result.get("kv_results") or []),
                 "page_count": (result.get("meta") or {}).get("page_count"),
+                "eval_summary": _eval_summary(
+                    eval_cached if isinstance(eval_cached, dict) else None
+                ),
             }
         )
     return rows
@@ -149,6 +215,12 @@ def get_agent_tree(run_id: str) -> Dict[str, Any]:
 def get_timing(run_id: str) -> Dict[str, Any]:
     """Agent / session / turn timing derived from timeline.jsonl."""
     return build_timing_report(_run_dir(run_id))
+
+
+@app.get("/api/runs/{run_id}/eval")
+def get_eval(run_id: str, refresh: bool = False) -> Dict[str, Any]:
+    """Score 04_result.json against dataset/answer_sheet.json; cache as 05_eval.json."""
+    return _compute_run_eval(run_id, refresh=refresh)
 
 
 @app.get("/api/runs/{run_id}/file")
@@ -389,6 +461,35 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .kv-table th { color: var(--muted); font-weight: 500; }
     .kv-table th:first-child { width: 180px; }
+    .score-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px; margin: 0 0 16px;
+    }
+    .score-card {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .score-card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .score-card .value { font-family: var(--mono); font-size: 20px; margin-top: 4px; font-weight: 600; }
+    .score-card .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+    .eval-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .eval-table th, .eval-table td {
+      text-align: left; vertical-align: top; padding: 8px 8px;
+      border-bottom: 1px solid var(--line);
+    }
+    .eval-table th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--bg); }
+    .eval-table .key { font-family: var(--mono); font-size: 11px; max-width: 220px; word-break: break-word; }
+    .eval-table details { margin-top: 4px; }
+    .eval-table details summary { cursor: pointer; color: var(--accent); font-size: 11px; }
+    .eval-table .ev-text {
+      white-space: pre-wrap; word-break: break-word; font-family: var(--mono);
+      font-size: 11px; max-height: 160px; overflow: auto; margin-top: 4px;
+      background: #121820; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+    }
+    .em-y { color: var(--ok); font-weight: 600; }
+    .em-n { color: var(--err); font-weight: 600; }
+    .run .eval-mini { color: var(--muted); font-size: 11px; margin-top: 3px; font-family: var(--mono); }
+
     .pill {
       display: inline-block; padding: 2px 8px; margin: 2px 4px 2px 0;
       border-radius: 999px; border: 1px solid var(--line); font-size: 11px;
@@ -487,6 +588,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 const state = {
   runs: [], runId: null, tab: "hierarchy",
   pages: [], agentTree: null, info: null,
+  evalReport: null, evalError: null, evalLoading: false,
 };
 
 async function api(path) {
@@ -530,16 +632,28 @@ function pretty(value, limit=4000) {
   return shortJson(deepParse(value), limit);
 }
 
+function fmtPct(v) {
+  if (v == null || Number.isNaN(Number(v))) return "—";
+  return Number(v).toFixed(2);
+}
+
 function renderRuns() {
   const el = document.getElementById("runList");
-  el.innerHTML = state.runs.map(r => `
+  el.innerHTML = state.runs.map(r => {
+    const es = r.eval_summary;
+    const evalLine = es
+      ? `<div class="eval-mini">EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)} · evidF1 ${fmtPct(es.evidence_token_f1)}</div>`
+      : "";
+    return `
     <div class="run ${r.run_id === state.runId ? "active" : ""}" data-id="${esc(r.run_id)}">
       <div class="id">${esc(r.run_id)}</div>
       <div class="sub">
         <span class="badge ${r.status === "ok" ? "ok" : (r.status === "error" ? "error" : "")}">${esc(r.status)}</span>
         ${r.seconds != null ? r.seconds + "s" : ""} · kv=${r.n_kv ?? "?"} · pages=${r.page_count ?? "?"}
       </div>
-    </div>`).join("") || `<div class="empty" style="padding:16px">No runs in outputs/runs</div>`;
+      ${evalLine}
+    </div>`;
+  }).join("") || `<div class="empty" style="padding:16px">No runs in outputs/runs</div>`;
   el.querySelectorAll(".run").forEach(node => {
     node.onclick = () => selectRun(node.dataset.id);
   });
@@ -552,6 +666,9 @@ async function selectRun(runId) {
   state.tab = "hierarchy";
   state.agentTree = null;
   state.pages = [];
+  state.evalReport = null;
+  state.evalError = null;
+  state.evalLoading = false;
   renderRuns();
   await renderDetail();
 }
@@ -579,6 +696,7 @@ function tabsHtml() {
     ["hierarchy", "Agent hierarchy"],
     ["timing", "Timing"],
     ["pages", "Pages"],
+    ["eval", "Eval"],
   ];
   return `<div class="tabs">${tabs.map(([id, label]) =>
     `<button class="tab ${state.tab===id?"active":""}" data-tab="${id}">${label}</button>`
@@ -1060,6 +1178,97 @@ function renderAgentHierarchy() {
   return html;
 }
 
+
+function renderEval() {
+  if (state.evalLoading) {
+    return `<div class="empty">Scoring against answer_sheet…</div>`;
+  }
+  if (state.evalError) {
+    return `<div class="empty" style="color:var(--err)">Eval failed: ${esc(state.evalError)}</div>
+      <button class="tab" id="evalRefresh">Retry</button>`;
+  }
+  const report = state.evalReport;
+  if (!report) {
+    return `<div class="empty">No eval report yet.</div>`;
+  }
+  const o = report.overall || {};
+  const cards = [
+    ["Value EM", o.value_exact_match, `${report.n_keys ?? "—"} keys`],
+    ["Page F1 (macro)", o.page_f1_macro, `P ${fmtPct(o.page_precision_macro)} / R ${fmtPct(o.page_recall_macro)}`],
+    ["Page F1 (micro)", o.page_f1_micro, `P ${fmtPct(o.page_precision_micro)} / R ${fmtPct(o.page_recall_micro)}`],
+    ["Evidence token F1", o.evidence_token_f1, report.document || ""],
+  ].map(([label, val, sub]) => `
+    <div class="score-card">
+      <div class="label">${esc(label)}</div>
+      <div class="value">${fmtPct(val)}</div>
+      <div class="sub">${esc(sub)}</div>
+    </div>`).join("");
+
+  const rows = (report.per_key || []).map(row => {
+    const em = row.value?.exact_match;
+    const sp = row.search_pages || {};
+    const et = row.evidence_text || {};
+    return `<tr>
+      <td class="key">${esc(row.key)}</td>
+      <td class="${em ? "em-y" : "em-n"}">${em ? "Y" : "N"}</td>
+      <td>${fmtPct(sp.f1)}<div class="sub">pred [${esc((sp.pred||[]).join(", "))}] · gold [${esc((sp.gold||[]).join(", "))}]</div></td>
+      <td>${fmtPct(et.token_f1)}</td>
+      <td>
+        <div><b>pred</b> ${esc(row.value?.pred ?? "")}</div>
+        <div><b>gold</b> ${esc(row.value?.gold ?? "")}</div>
+        <details>
+          <summary>evidence text</summary>
+          <div class="ev-text"><b>pred</b>\n${esc(et.pred || "(empty)")}\n\n<b>gold</b>\n${esc(et.gold || "(empty)")}</div>
+        </details>
+      </td>
+    </tr>`;
+  }).join("");
+
+  return `
+    <p class="hint">
+      Baseline metrics vs <code>dataset/answer_sheet.json</code>.
+      Cached as <code>05_eval.json</code> in the run directory.
+      <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
+    </p>
+    <div class="score-grid">${cards}</div>
+    <table class="eval-table">
+      <thead>
+        <tr>
+          <th>Key</th><th>EM</th><th>Page F1</th><th>Evid F1</th><th>Values / evidence</th>
+        </tr>
+      </thead>
+      <tbody>${rows || `<tr><td colspan="5" class="empty">No keys</td></tr>`}</tbody>
+    </table>`;
+}
+
+async function ensureEval(refresh=false) {
+  if (!state.runId) return;
+  if (!refresh && state.evalReport && !state.evalError) return;
+  state.evalLoading = true;
+  state.evalError = null;
+  paintDetail();
+  try {
+    const q = refresh ? "?refresh=1" : "";
+    state.evalReport = await api(`/api/runs/${encodeURIComponent(state.runId)}/eval${q}`);
+    state.evalError = null;
+    const es = {
+      value_exact_match: state.evalReport?.overall?.value_exact_match,
+      page_f1_macro: state.evalReport?.overall?.page_f1_macro,
+      evidence_token_f1: state.evalReport?.overall?.evidence_token_f1,
+      n_keys: state.evalReport?.n_keys,
+      document: state.evalReport?.document,
+    };
+    state.runs = state.runs.map(r => r.run_id === state.runId ? {...r, eval_summary: es} : r);
+    renderRuns();
+  } catch (err) {
+    state.evalReport = null;
+    state.evalError = String(err.message || err);
+  } finally {
+    state.evalLoading = false;
+    paintDetail();
+  }
+}
+
 function paintDetail() {
   const detail = document.getElementById("detail");
   let body = "";
@@ -1074,6 +1283,8 @@ function paintDetail() {
         <a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(p.md_path)}" target="_blank">open md</a>
         <pre class="code" data-md="${esc(p.md_path)}" style="max-height:220px"></pre>
       </div>`).join("") || `<div class="empty">No pages</div>`}</div>`;
+  } else if (state.tab === "eval") {
+    body = renderEval();
   }
   detail.innerHTML = `
     <div class="meta" style="margin-bottom:10px;color:var(--muted)">
@@ -1084,8 +1295,17 @@ function paintDetail() {
     ${tabsHtml()}
     ${body}`;
   detail.querySelectorAll(".tab").forEach(btn => {
-    btn.onclick = () => { state.tab = btn.dataset.tab; paintDetail(); };
+    btn.onclick = () => {
+      state.tab = btn.dataset.tab;
+      paintDetail();
+      if (state.tab === "eval") ensureEval(false);
+    };
   });
+  const refreshBtn = document.getElementById("evalRefresh");
+  if (refreshBtn) refreshBtn.onclick = () => ensureEval(true);
+  if (state.tab === "eval" && !state.evalReport && !state.evalLoading && !state.evalError) {
+    ensureEval(false);
+  }
   const openJsonDump = async (relPath) => {
     const data = await api(`/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(relPath)}`);
     const w = window.open("", "_blank");
