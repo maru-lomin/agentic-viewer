@@ -1160,7 +1160,8 @@ function renderTiming() {
         <div class="live-row">
           <span class="sess">session ${esc(sc.current_session ?? "?")} · turn ${esc(sc.current_turn || "?")}</span>
           · ${esc(phaseLabel(sc))} · master step ${esc(sc.master_step || "?")}
-          · ${esc(sc.key)}
+          · ${esc(sc.label || sc.key)}
+          ${sc.n_keys > 1 ? ` · ${esc(sc.n_keys)} keys` : ""}
         </div>`).join("")}
     </div>` : "";
 
@@ -1169,7 +1170,8 @@ function renderTiming() {
       Wall time from <code>timeline.jsonl</code>.
       Master turn wall includes nested SearchAgent work started on that step
       (async search is not just request→next-request).
-      SearchAgent calls are collapsed by default — expand a key to see turns.
+      SearchAgent calls are collapsed by default — expand a session to see
+      key outcomes and turns. Multi-key batches share one wall/model clock.
     </p>
     ${pipeBanner}
     ${liveBanner}
@@ -1198,9 +1200,17 @@ function renderTiming() {
     <div class="timing-search-list" style="display:flex;flex-direction:column;gap:8px">
       ${(timing.search_calls || []).map(sc => {
         const running = sc.status === "running";
+        const keyOutcomes = sc.keys || (sc.key ? [{key: sc.key, status: sc.status}] : []);
+        const shared = sc.shared || keyOutcomes.length > 1;
         const title = running
-          ? `<span class="tree-badge warn">running</span> session ${esc(sc.current_session ?? "?")} · turn ${esc(sc.current_turn || "?")} · ${esc(sc.key)}`
-          : esc(sc.key);
+          ? `<span class="tree-badge warn">running</span> session ${esc(sc.current_session ?? "?")} · turn ${esc(sc.current_turn || "?")} · ${esc(sc.label || sc.key)}`
+          : esc(sc.label || sc.key || "?");
+        const keyRows = shared ? keyOutcomes.map(k => `
+          <tr>
+            <td style="padding-left:12px">${esc(k.key)}</td>
+            <td><span class="tree-badge ${k.status === "complete" ? "ok" : (k.status === "pending" || String(k.status||"").startsWith("handoff") ? "warn" : "")}">${esc(k.status || "?")}</span></td>
+            <td>${k.n_pages != null ? esc(k.n_pages) : "—"}</td>
+          </tr>`).join("") : "";
         const turnRows = (sc.sessions || []).map(sess => (sess.turns || []).map(t => `
           <tr class="${t.status === "running" ? "running" : ""}">
             <td style="padding-left:12px">session ${esc(sess.session_index)} · turn ${esc(t.search_turn || t.step)}${t.status === "running" ? ` <span class="tree-badge warn">now</span>` : ""}</td>
@@ -1210,6 +1220,7 @@ function renderTiming() {
         return `<details class="tree-node search" style="margin:0">
           <summary>
             <span class="title">m${esc(sc.master_step)}</span>
+            ${shared ? `<span class="tree-badge">shared</span>` : ""}
             <span class="tree-kv" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">${title}</span>
             <span class="tree-badge ${running ? "warn" : ""}">${fmtSec(sc.wall_seconds)}</span>
             <span class="tree-badge">model ${fmtSec(sc.llm_seconds)}</span>
@@ -1217,7 +1228,11 @@ function renderTiming() {
             ${running ? `<span class="tree-badge warn">${esc(phaseLabel(sc))}</span>` : ""}
           </summary>
           <div class="tree-body">
-            <div class="tree-kv">overhead ${running ? "—" : fmtSec(sc.overhead_seconds)} · key=${esc(sc.key)}</div>
+            <div class="tree-kv">overhead ${running ? "—" : fmtSec(sc.overhead_seconds)}${shared ? ` · ${esc(keyOutcomes.length)} keys in one SearchAgent session` : ` · key=${esc(sc.key)}`}</div>
+            ${keyRows ? `<table class="timing-table" style="margin-top:8px">
+              <thead><tr><th>Key</th><th>Status</th><th>Pages</th></tr></thead>
+              <tbody>${keyRows}</tbody>
+            </table>` : ""}
             ${turnRows ? `<table class="timing-table" style="margin-top:8px">
               <thead><tr><th>Turn</th><th>Model</th><th>Tokens</th></tr></thead>
               <tbody>${turnRows}</tbody>

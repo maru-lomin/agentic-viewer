@@ -12,6 +12,76 @@ def _safe_key(key: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key or ""))[:40]
 
 
+def _safe_key_batch_fragment(key: str) -> str:
+    """Per-key fragment used in multi-key search trace labels (truncated to 24)."""
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key or ""))[:24]
+
+
+def _strip_batch_n_suffix(prefix: str) -> str:
+    """Drop trailing ``_n{N}`` key-count suffix from a parsed label prefix."""
+    return re.sub(r"_n\d+$", "", str(prefix or ""))
+
+
+def _key_prefix_matches(label_prefix: str, key: str) -> bool:
+    """
+    True when a parsed label key_prefix belongs to ``key``.
+
+    Handles single-key labels and multi-key batch tags that join the first
+    three safe-key fragments (each truncated to 24 chars).
+    """
+    want = _safe_key(key)
+    prefix = _strip_batch_n_suffix(label_prefix)
+    if not want:
+        return not prefix
+    if not prefix:
+        return False
+    if prefix == want or prefix.startswith(want) or want.startswith(prefix):
+        return True
+    want24 = _safe_key_batch_fragment(key)
+    if not want24:
+        return False
+    # Segment-ish match inside ``keyA_keyB_keyC`` batch tags.
+    padded = f"_{prefix}_"
+    return (
+        f"_{want24}_" in padded
+        or prefix.startswith(want24 + "_")
+        or prefix.endswith("_" + want24)
+        or prefix == want24
+    )
+
+
+def _search_rows_for_key(
+    search_by_prefix: Dict[str, List[Dict[str, Any]]],
+    key: str,
+    *,
+    master_step: int = 0,
+) -> List[Dict[str, Any]]:
+    """Collect search step rows whose label prefix matches ``key``."""
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for prefix, candidates in (search_by_prefix or {}).items():
+        if not _key_prefix_matches(prefix, key):
+            continue
+        for row in candidates:
+            mstep = int(row.get("master_step") or 0)
+            if master_step and mstep and mstep != master_step:
+                continue
+            label = str(row.get("label") or row.get("filename") or id(row))
+            if label in seen:
+                continue
+            seen.add(label)
+            rows.append(row)
+    rows.sort(
+        key=lambda s: (
+            int(s.get("master_step") or 0),
+            int(s.get("search_session") or 1),
+            int(s.get("search_turn") or 0),
+            int(s.get("step") or 0),
+        )
+    )
+    return rows
+
+
 def _read_json(path: Path) -> Any:
     if not path.is_file():
         return None
@@ -24,6 +94,7 @@ def _parse_search_label(label: str) -> Tuple[str, int, int, int]:
 
     Supports:
       m{master}_t{tool}_k{keyidx}_search_{safe_key}_s{session}_s{turn}
+      m{master}_t{tool}_search_{safe_key}_s{session}_s{turn}
       m{master}_search_{safe_key}_s{session}_s{turn}
       search_{safe_key}_s{session}_s{turn}
       search_{safe_key}_s{turn}
@@ -31,8 +102,9 @@ def _parse_search_label(label: str) -> Tuple[str, int, int, int]:
     master_step is 0 when the label has no mNNN prefix (legacy runs).
     """
     label = str(label or "")
+    # ``_t{tool}`` alone (current pipeline) or ``_t{tool}_k{key}`` (legacy).
     m = re.match(
-        r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)_s(\d+)$", label
+        r"^m(\d+)(?:_t\d+(?:_k\d+)?)?_search_(.+)_s(\d+)_s(\d+)$", label
     )
     if m:
         return m.group(2), int(m.group(3)), int(m.group(4)), int(m.group(1))
@@ -43,6 +115,106 @@ def _parse_search_label(label: str) -> Tuple[str, int, int, int]:
     if m:
         return m.group(1), 1, int(m.group(2)), 0
     return label.replace("search_", "", 1), 1, 0, 0
+
+
+def _batch_prefix_from_trace_label(label: str) -> str:
+    """
+    Extract the search key/batch prefix from a trace label.
+
+    Handles both session labels (``..._s{session}``) and turn labels
+    (``..._s{session}_s{turn}``).
+    """
+    label = str(label or "")
+    m = re.match(
+        r"^m\d+(?:_t\d+(?:_k\d+)?)?_search_(.+)_s\d+_s\d+$", label
+    )
+    if m:
+        return m.group(1)
+    m = re.match(r"^m\d+(?:_t\d+(?:_k\d+)?)?_search_(.+)_s\d+$", label)
+    if m:
+        return m.group(1)
+    m = re.match(r"^search_(.+)_s\d+_s\d+$", label)
+    if m:
+        return m.group(1)
+    m = re.match(r"^search_(.+)_s\d+$", label)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _rows_for_batch_prefix(
+    search_by_prefix: Dict[str, List[Dict[str, Any]]],
+    batch_prefix: str,
+    *,
+    master_step: int = 0,
+) -> List[Dict[str, Any]]:
+    """Return step rows for an exact batch/key prefix from a dump label."""
+    if not batch_prefix:
+        return []
+    rows = list(search_by_prefix.get(batch_prefix) or [])
+    if master_step:
+        filtered = [
+            r for r in rows if int(r.get("master_step") or 0) in (0, master_step)
+        ]
+        if filtered:
+            rows = filtered
+    rows.sort(
+        key=lambda s: (
+            int(s.get("master_step") or 0),
+            int(s.get("search_session") or 1),
+            int(s.get("search_turn") or 0),
+            int(s.get("step") or 0),
+        )
+    )
+    return rows
+
+
+def _load_per_key_search_page_dumps(tools_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Load SearchAgent per-key ``search_pages`` completion dumps from disk.
+
+    These are keyed separately from Master enqueue dumps so list-key master
+    files cannot overwrite per-key outcomes (same step/tool_index collision).
+    """
+    out: List[Dict[str, Any]] = []
+    if not tools_dir.is_dir():
+        return out
+    pat = re.compile(
+        r"^(?P<label>.+)_step_(?P<step>\d+)_(?P<idx>\d+)_search_pages\.json$"
+    )
+    for path in sorted(tools_dir.glob("*_search_pages.json")):
+        m = pat.match(path.name)
+        if not m:
+            continue
+        data = _read_json(path) or {}
+        args = data.get("arguments") or {}
+        result = data.get("result") or {}
+        if not isinstance(result, dict):
+            result = {}
+        key = str(args.get("key") or result.get("key") or "")
+        if not key or isinstance(args.get("key"), list):
+            continue
+        label = str(data.get("label") or m.group("label") or "")
+        batch_prefix = _batch_prefix_from_trace_label(label)
+        out.append(
+            {
+                "master_step": int(data.get("step") or m.group("step") or 0),
+                "tool_index": int(
+                    data.get("tool_index")
+                    if data.get("tool_index") is not None
+                    else m.group("idx")
+                ),
+                "key": key,
+                "key_prefix": _safe_key(key),
+                "batch_prefix": batch_prefix,
+                "label": label,
+                "arguments": args,
+                "result": result,
+                "filename": path.name,
+            }
+        )
+    out.sort(key=lambda r: (r["master_step"], r["tool_index"], r["key"]))
+    return out
 
 
 def _extract_submit_output(tool_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -269,7 +441,6 @@ def _load_timeline_search_links(run_dir: Path) -> List[Dict[str, Any]]:
         t_hi = float(sp.get("t") or 0)
         master_step = int(sp.get("step") or 0)
         labels = []
-        want_prefix = _safe_key(key)
         for e in step_events:
             t = float(e.get("t") or 0)
             if not (t_lo < t <= t_hi and e.get("label")):
@@ -280,7 +451,8 @@ def _load_timeline_search_links(run_dir: Path) -> List[Dict[str, Any]]:
             if parsed[3] and parsed[3] != master_step:
                 continue
             # Must belong to this key — parallel keys share the same time window.
-            if want_prefix and parsed[0] != want_prefix:
+            # Multi-key batch labels join several keys into one prefix.
+            if key and not _key_prefix_matches(parsed[0], key):
                 continue
             labels.append(label)
         links.append(
@@ -350,11 +522,31 @@ def _link_search_steps_to_calls(
 
         if not consumed:
             n_steps = int(call["result"].get("n_search_steps") or 0)
+            # Exact prefix first, then multi-key batch tag matches.
             queue = [
                 row
                 for row in (prefix_queues.get((prefix, master_step)) or [])
                 if str(row.get("label") or "") not in used_labels
             ]
+            if not queue:
+                matched = _search_rows_for_key(
+                    search_by_prefix, str(call.get("key") or ""), master_step=master_step
+                )
+                queue = [
+                    row
+                    for row in matched
+                    if str(row.get("label") or "") not in used_labels
+                ]
+            if not queue:
+                batch_prefix = str(call.get("batch_prefix") or "")
+                matched = _rows_for_batch_prefix(
+                    search_by_prefix, batch_prefix, master_step=master_step
+                )
+                queue = [
+                    row
+                    for row in matched
+                    if str(row.get("label") or "") not in used_labels
+                ]
             if n_steps <= 0 and queue:
                 n_steps = len(queue)
             if n_steps > 0 and queue:
@@ -371,12 +563,20 @@ def _link_search_steps_to_calls(
                         used_labels.add(label)
 
         if consumed:
-            remaining = [
-                row
-                for row in (prefix_queues.get((prefix, master_step)) or [])
-                if str(row.get("label") or "") not in used_labels
-            ]
-            prefix_queues[(prefix, master_step)] = remaining
+            # Drop consumed rows from every prefix queue that held them (shared batch).
+            consumed_labels = {
+                str(row.get("label") or "") for row in consumed if row.get("label")
+            }
+            for pq_key, rows in list(prefix_queues.items()):
+                remaining = [
+                    row
+                    for row in rows
+                    if str(row.get("label") or "") not in consumed_labels
+                ]
+                if remaining:
+                    prefix_queues[pq_key] = remaining
+                else:
+                    prefix_queues.pop(pq_key, None)
 
         call["search_steps"] = consumed
 
@@ -763,6 +963,7 @@ def _build_batch_search_agent(
     search_by_prefix: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     master_step: int = 0,
     default_status: str = "unknown",
+    key_batch_prefixes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     One SearchAgent node with session_index 1..N = one key each (parallel).
@@ -771,6 +972,7 @@ def _build_batch_search_agent(
     dump is missing, rebuild turns from search step files for that key_prefix.
     """
     search_by_prefix = search_by_prefix or {}
+    key_batch_prefixes = key_batch_prefixes or {}
     sessions: List[Dict[str, Any]] = []
     for i, item in enumerate(batch_items):
         if not isinstance(item, dict):
@@ -791,19 +993,32 @@ def _build_batch_search_agent(
             )
         elif key:
             # Recover when the per-key dump was overwritten / missing.
-            prefix = _safe_key(key)
-            rows = [
-                r
-                for r in (search_by_prefix.get(prefix) or [])
-                if int(r.get("master_step") or 0) == master_step
-            ]
+            # Match single-key prefixes and multi-key batch tags (joined keys).
+            rows = _search_rows_for_key(
+                search_by_prefix, key, master_step=master_step
+            )
             if not rows:
-                # Async jobs may still be writing; take any matching prefix.
-                rows = list(search_by_prefix.get(prefix) or [])
+                # Async jobs may still be writing; ignore master_step filter.
+                rows = _search_rows_for_key(search_by_prefix, key, master_step=0)
+            if not rows:
+                # Keys beyond the first 3 are omitted from batch tags; use the
+                # prefix embedded in the per-key dump / label map instead.
+                batch_prefix = str(
+                    (call or {}).get("batch_prefix")
+                    or key_batch_prefixes.get(key)
+                    or ""
+                )
+                rows = _rows_for_batch_prefix(
+                    search_by_prefix, batch_prefix, master_step=master_step
+                )
+                if not rows:
+                    rows = _rows_for_batch_prefix(
+                        search_by_prefix, batch_prefix, master_step=0
+                    )
             if rows:
                 recovered = _group_search_sessions(
                     rows,
-                    key_prefix=prefix,
+                    key_prefix=_safe_key(key),
                     master_step=master_step,
                 )
                 turns = _flatten_sessions_as_turns(
@@ -887,37 +1102,68 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
     }
 
     search_page_calls: List[Dict[str, Any]] = []
+    # Prefer on-disk per-key completion dumps (survive master list-key collisions).
+    seen_call_keys: set[Tuple[int, str]] = set()
+    for call in _load_per_key_search_page_dumps(tools_dir):
+        key = str(call.get("key") or "")
+        mstep = int(call.get("master_step") or 0)
+        sk = (mstep, key)
+        if not key or sk in seen_call_keys:
+            continue
+        seen_call_keys.add(sk)
+        search_page_calls.append(call)
+
     for (step, tool_index, name), dump in tool_dumps.items():
         if name != "search_pages":
-            continue
-        # Prefer unlabeled master dumps (search_pages is master-only).
-        if dump.get("label"):
             continue
         args = dump.get("arguments") or {}
         result = dump.get("result") or {}
         if not isinstance(result, dict):
             result = {}
+        # Master enqueue dumps with a key list have no per-key outcome.
+        if isinstance(args.get("key"), list):
+            continue
+        if isinstance(args.get("keys"), list) and "key" not in result:
+            continue
         # Batched multi-key summary dump — per-key dumps are saved separately.
         if isinstance(result.get("results"), list) and "key" not in result:
             continue
-        if isinstance(args.get("key"), list):
+        # Prefer unlabeled master dumps; also keep SearchAgent per-key completions
+        # (labeled) so collect/search trees can attach turns + pages.
+        if dump.get("label") and not (
+            result.get("key") or (isinstance(args.get("key"), str) and args.get("key"))
+        ):
             continue
         key = str(args.get("key") or result.get("key") or "")
-        prefix = _safe_key(key)
+        if not key:
+            continue
+        sk = (step, key)
+        if sk in seen_call_keys:
+            continue
+        seen_call_keys.add(sk)
+        label = str(dump.get("label") or "")
         search_page_calls.append(
             {
                 "master_step": step,
                 "tool_index": tool_index,
                 "key": key,
-                "key_prefix": prefix,
+                "key_prefix": _safe_key(key),
+                "batch_prefix": _batch_prefix_from_trace_label(label),
+                "label": label,
                 "arguments": args,
                 "result": result,
                 "filename": dump.get("filename"),
             }
         )
     search_page_calls.sort(
-        key=lambda r: (r["master_step"], r["tool_index"])
+        key=lambda r: (r["master_step"], r["tool_index"], r["key"])
     )
+    key_batch_prefixes: Dict[str, str] = {}
+    for call in search_page_calls:
+        bp = str(call.get("batch_prefix") or "")
+        key = str(call.get("key") or "")
+        if key and bp and key not in key_batch_prefixes:
+            key_batch_prefixes[key] = bp
 
     timeline_links = _load_timeline_search_links(run_dir)
     search_queues = _link_search_steps_to_calls(
@@ -1046,6 +1292,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                         search_by_prefix=search_by_prefix,
                         master_step=mstep,
                         default_status="running",
+                        key_batch_prefixes=key_batch_prefixes,
                     )
                     # Reflect enqueue status when nothing finished yet.
                     n_done = sum(
@@ -1124,6 +1371,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                                 step_call_queue=cross_queue,
                                 search_by_prefix=search_by_prefix,
                                 master_step=mstep,
+                                key_batch_prefixes=key_batch_prefixes,
                             )
                         )
                         remaining_ids = {id(c) for c in cross_queue}

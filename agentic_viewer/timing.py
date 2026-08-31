@@ -93,31 +93,56 @@ def _safe_key_prefix(key: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key or ""))[:40]
 
 
+def _safe_key_batch_fragment(key: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key or ""))[:24]
+
+
+def _strip_batch_n_suffix(prefix: str) -> str:
+    return re.sub(r"_n\d+$", "", str(prefix or ""))
+
+
 def _key_prefix_matches(label_prefix: str, key: str) -> bool:
     """True when a parsed label key_prefix belongs to ``key``."""
     want = _safe_key_prefix(key)
-    prefix = str(label_prefix or "")
+    prefix = _strip_batch_n_suffix(label_prefix)
     if not want:
         return not prefix
     if not prefix:
         return False
-    return prefix == want or want.startswith(prefix) or prefix.startswith(want)
+    if prefix == want or want.startswith(prefix) or prefix.startswith(want):
+        return True
+    want24 = _safe_key_batch_fragment(key)
+    if not want24:
+        return False
+    padded = f"_{prefix}_"
+    return (
+        f"_{want24}_" in padded
+        or prefix.startswith(want24 + "_")
+        or prefix.endswith("_" + want24)
+        or prefix == want24
+    )
 
 
 def _collect_search_step_labels(
     events: List[Dict[str, Any]],
     *,
-    key: str,
+    key: str = "",
     t_lo: float,
     t_hi: float,
     master_step: int = 0,
+    tool_index: Optional[int] = None,
+    keys: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Chronological step-dump labels for one search key in ``(t_lo, t_hi]``.
+    Chronological step-dump labels for a search call in ``(t_lo, t_hi]``.
 
-    Filters by key prefix embedded in the label so parallel SearchAgents that
-    reuse the same per-session ``step`` counters do not overwrite each other.
+    Prefer ``master_step`` + ``tool_index`` (shared multi-key batch). Fall back to
+    matching any of ``keys`` / ``key`` against the label prefix.
     """
+    key_list = [str(k) for k in (keys or []) if str(k).strip()]
+    if key and key not in key_list:
+        key_list.append(key)
+
     rows: List[Dict[str, Any]] = []
     for ev in events:
         if ev.get("stage") != "agent" or ev.get("event") != "step":
@@ -128,14 +153,27 @@ def _collect_search_step_labels(
         label = str(ev.get("label") or "")
         if not _is_search_step_label(label):
             continue
-        parsed = _parse_timing_search_label(label)
-        if parsed is None:
-            continue
-        label_prefix, session_index, search_turn, mstep = parsed
-        if not _key_prefix_matches(label_prefix, key):
-            continue
-        if mstep and master_step and mstep != master_step:
-            continue
+        parsed_mt = _parse_label_master_tool(label)
+        if parsed_mt is not None:
+            mstep, tidx, label_prefix, session_index, search_turn = parsed_mt
+            if master_step and mstep and mstep != master_step:
+                continue
+            if tool_index is not None and tidx != int(tool_index):
+                continue
+            if tool_index is None and key_list:
+                if not any(_key_prefix_matches(label_prefix, k) for k in key_list):
+                    continue
+        else:
+            parsed = _parse_timing_search_label(label)
+            if parsed is None:
+                continue
+            label_prefix, session_index, search_turn, mstep = parsed
+            if mstep and master_step and mstep != master_step:
+                continue
+            if key_list and not any(
+                _key_prefix_matches(label_prefix, k) for k in key_list
+            ):
+                continue
         rows.append(
             {
                 "t": t,
@@ -147,6 +185,25 @@ def _collect_search_step_labels(
         )
     rows.sort(key=lambda r: (float(r["t"]), int(r["step"]), int(r["search_session"])))
     return rows
+
+
+def _parse_label_master_tool(
+    label: str,
+) -> Optional[Tuple[int, int, str, int, int]]:
+    """Parse ``m{step}_t{tool}_search_{prefix}_s{sess}_s{turn}``."""
+    m = re.match(
+        r"^m(\d+)_t(\d+)(?:_k\d+)?_search_(.+)_s(\d+)_s(\d+)$",
+        str(label or ""),
+    )
+    if not m:
+        return None
+    return (
+        int(m.group(1)),
+        int(m.group(2)),
+        m.group(3),
+        int(m.group(4)),
+        int(m.group(5)),
+    )
 
 
 def _annotate_turns_from_labels(
@@ -458,67 +515,269 @@ def _search_call_timings(
     llm_pairs: List[Dict[str, Any]],
     total: float,
 ) -> List[Dict[str, Any]]:
-    """One row per search_pages completion (SearchAgent invocation)."""
+    """
+    One row per SearchAgent invocation (shared multi-key session).
+
+    Groups ``search_pages_enqueue`` batches with their per-key ``search_pages``
+    completions. Wall/model/turns are session-scoped; key outcomes hang off the
+    row without duplicating time.
+    """
+    enqueues = [
+        ev
+        for ev in events
+        if ev.get("stage") == "agent" and ev.get("event") == "search_pages_enqueue"
+    ]
+    if not enqueues:
+        return _search_call_timings_legacy_per_key(events, llm_pairs, total)
+
+    completions = [
+        ev
+        for ev in events
+        if ev.get("stage") == "agent" and ev.get("event") == "search_pages"
+    ]
+    comps_by_key: Dict[str, List[Dict[str, Any]]] = {}
+    for ev in completions:
+        comps_by_key.setdefault(str(ev.get("key") or ""), []).append(ev)
+
+    used_comp_ids: set[int] = set()
+    rows: List[Dict[str, Any]] = []
+    for enq in enqueues:
+        master_step = int(enq.get("step") or 0)
+        tool_index = int(enq.get("tool_index") or 0)
+        keys = [str(k) for k in (enq.get("keys_accepted") or []) if str(k).strip()]
+        if not keys:
+            continue
+        t_enq = float(enq.get("t") or 0)
+
+        matched_evs: List[Optional[Dict[str, Any]]] = []
+        for key in keys:
+            matched = None
+            for ev in comps_by_key.get(key) or []:
+                if id(ev) in used_comp_ids:
+                    continue
+                if float(ev.get("t") or 0) <= t_enq:
+                    continue
+                matched = ev
+                break
+            matched_evs.append(matched)
+
+        # Incomplete batches belong in the running section.
+        if any(ev is None for ev in matched_evs):
+            continue
+
+        key_outcomes: List[Dict[str, Any]] = []
+        end_t = t_enq
+        for key, matched in zip(keys, matched_evs):
+            assert matched is not None
+            used_comp_ids.add(id(matched))
+            end_t = max(end_t, float(matched.get("t") or 0))
+            key_outcomes.append(
+                {
+                    "key": key,
+                    "status": str(matched.get("status") or "complete"),
+                    "n_pages": int(matched.get("n_pages") or 0),
+                }
+            )
+
+        rows.append(
+            _build_batch_search_call_row(
+                events=events,
+                llm_pairs=llm_pairs,
+                master_step=master_step,
+                tool_index=tool_index,
+                keys=key_outcomes,
+                t_lo=t_enq,
+                end_t=end_t,
+                total=total,
+                status="complete",
+            )
+        )
+
+    # Legacy orphan completions not covered by any enqueue batch.
+    for ev in completions:
+        if id(ev) in used_comp_ids:
+            continue
+        key = str(ev.get("key") or "")
+        if not key:
+            continue
+        end_t = float(ev.get("t") or 0)
+        rows.append(
+            _build_batch_search_call_row(
+                events=events,
+                llm_pairs=llm_pairs,
+                master_step=int(ev.get("step") or 0),
+                tool_index=None,
+                keys=[
+                    {
+                        "key": key,
+                        "status": str(ev.get("status") or "complete"),
+                        "n_pages": int(ev.get("n_pages") or 0),
+                    }
+                ],
+                t_lo=-1.0,
+                end_t=end_t,
+                total=total,
+                status="complete",
+            )
+        )
+    return rows
+
+
+def _search_call_timings_legacy_per_key(
+    events: List[Dict[str, Any]],
+    llm_pairs: List[Dict[str, Any]],
+    total: float,
+) -> List[Dict[str, Any]]:
+    """Pre-batch traces: one row per search_pages completion."""
     sp_events = [
-        ev for ev in events if ev.get("stage") == "agent" and ev.get("event") == "search_pages"
+        ev
+        for ev in events
+        if ev.get("stage") == "agent" and ev.get("event") == "search_pages"
     ]
     if not sp_events:
         return []
 
     rows: List[Dict[str, Any]] = []
-    # Per-key lower bound so parallel SearchAgents (different keys) do not
-    # steal each other's LLM windows. Same-key follow-ups still stay sequential.
     prev_end_by_key: Dict[str, float] = {}
     for spe in sp_events:
         end_t = float(spe.get("t") or 0)
         key = str(spe.get("key") or "")
         master_step = int(spe.get("step") or 0)
         t_lo = float(prev_end_by_key.get(key, -1.0))
-
-        window_pairs = [
-            p
-            for p in llm_pairs
-            if p.get("agent") == "search"
-            and p.get("key") == key
-            and t_lo < float(p.get("start_t") or 0) <= end_t
-        ]
-        window_pairs.sort(key=lambda p: float(p.get("start_t") or 0))
-
-        start_t = end_t
-        if window_pairs:
-            start_t = min(float(p["start_t"]) for p in window_pairs)
-
-        step_labels = _collect_search_step_labels(
-            events,
-            key=key,
-            t_lo=t_lo,
-            t_hi=end_t,
-            master_step=master_step,
-        )
-        turns = _annotate_turns_from_labels(window_pairs, step_labels)
-        session_rows = _group_turns_into_sessions(turns)
-        # Flat list follows the same session/turn order as the UI table.
-        turns = [t for s in session_rows for t in (s.get("turns") or [])]
-
-        llm_total = sum(float(p.get("llm_seconds") or 0) for p in window_pairs)
-        wall = max(0.0, end_t - start_t) if window_pairs else 0.0
-
         rows.append(
-            {
-                "master_step": master_step,
-                "key": key,
-                "status": "complete",
-                "wall_seconds": _round_secs(wall),
-                "llm_seconds": _round_secs(llm_total),
-                "overhead_seconds": _round_secs(max(0.0, wall - llm_total)),
-                "pct": _pct(wall, total),
-                "n_turns": len(turns),
-                "sessions": session_rows,
-                "turns": turns,
-            }
+            _build_batch_search_call_row(
+                events=events,
+                llm_pairs=llm_pairs,
+                master_step=master_step,
+                tool_index=None,
+                keys=[
+                    {
+                        "key": key,
+                        "status": str(spe.get("status") or "complete"),
+                        "n_pages": int(spe.get("n_pages") or 0),
+                    }
+                ],
+                t_lo=t_lo,
+                end_t=end_t,
+                total=total,
+                status="complete",
+            )
         )
         prev_end_by_key[key] = end_t
     return rows
+
+
+def _build_batch_search_call_row(
+    *,
+    events: List[Dict[str, Any]],
+    llm_pairs: List[Dict[str, Any]],
+    master_step: int,
+    tool_index: Optional[int],
+    keys: List[Dict[str, Any]],
+    t_lo: float,
+    end_t: float,
+    total: float,
+    status: str,
+    open_req: Optional[Dict[str, Any]] = None,
+    current_session: Optional[int] = None,
+    current_turn: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Shared-session timing row with per-key outcome list."""
+    key_names = [str(k.get("key") or "") for k in keys if k.get("key")]
+    key_set = set(key_names)
+    primary = key_names[0] if key_names else ""
+
+    window_pairs = [
+        p
+        for p in llm_pairs
+        if p.get("agent") == "search"
+        and str(p.get("key") or "") in key_set
+        and t_lo < float(p.get("start_t") or 0) <= end_t
+    ]
+    window_pairs.sort(key=lambda p: float(p.get("start_t") or 0))
+
+    step_labels = _collect_search_step_labels(
+        events,
+        key=primary,
+        keys=key_names,
+        t_lo=t_lo,
+        t_hi=end_t,
+        master_step=master_step,
+        tool_index=tool_index,
+    )
+    turns = _annotate_turns_from_labels(
+        window_pairs,
+        step_labels,
+        status="complete" if status == "complete" else status,
+    )
+
+    running_llm = 0.0
+    if open_req is not None:
+        turn_step = int(open_req.get("step") or 0)
+        sess = int(current_session or 1)
+        search_turn = int(current_turn or turn_step)
+        running_llm = float(
+            _round_secs(max(0.0, end_t - float(open_req.get("start_t") or end_t)))
+            or 0.0
+        )
+        turns.append(
+            {
+                "step": turn_step,
+                "search_session": sess,
+                "search_turn": search_turn,
+                "label": None,
+                "status": "running",
+                "llm_seconds": running_llm,
+                "prompt_est_tokens": open_req.get("prompt_est_tokens"),
+                "input_tokens": None,
+                "output_tokens": None,
+                "start_t": open_req.get("start_t"),
+            }
+        )
+
+    session_rows = _group_turns_into_sessions(turns)
+    turns = [t for s in session_rows for t in (s.get("turns") or [])]
+
+    start_t = end_t
+    if window_pairs:
+        start_t = min(float(p["start_t"]) for p in window_pairs)
+    elif open_req is not None:
+        start_t = float(open_req.get("start_t") or end_t)
+
+    llm_total = sum(float(p.get("llm_seconds") or 0) for p in window_pairs) + running_llm
+    wall = max(0.0, end_t - start_t) if (window_pairs or open_req) else 0.0
+
+    n_keys = len(key_names)
+    label = primary if n_keys <= 1 else f"{n_keys} keys (shared)"
+    row: Dict[str, Any] = {
+        "master_step": master_step,
+        "tool_index": tool_index,
+        "key": primary,
+        "keys": keys,
+        "n_keys": n_keys,
+        "label": label,
+        "shared": n_keys > 1,
+        "status": status,
+        "wall_seconds": _round_secs(wall),
+        "llm_seconds": _round_secs(llm_total),
+        "overhead_seconds": _round_secs(max(0.0, wall - llm_total)),
+        "pct": _pct(wall, total) if status == "complete" else None,
+        "n_turns": len(turns),
+        "sessions": session_rows,
+        "turns": turns,
+    }
+    if status == "running":
+        row["current_session"] = int(current_session or 1)
+        row["current_turn"] = int(
+            current_turn or (open_req or {}).get("step") or 0
+        )
+        if open_req is not None:
+            row["phase"] = "llm"
+        elif window_pairs:
+            row["phase"] = "tools"
+        else:
+            row["phase"] = "starting"
+    return row
 
 
 def _latest_search_session_for_key(
@@ -553,7 +812,7 @@ def _latest_search_session_for_key(
         label = re.sub(r"_(?:assistant(?:_tool_calls)?|tool|user_nudge|user)$", "", raw)
 
         full = re.match(
-            r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)_s(\d+)$", label
+            r"^m(\d+)(?:_t\d+(?:_k\d+)?)?_search_(.+)_s(\d+)_s(\d+)$", label
         )
         sess_only = None
         if full:
@@ -563,7 +822,7 @@ def _latest_search_session_for_key(
             mstep = int(full.group(1))
         else:
             sess_only = re.match(
-                r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)$", label
+                r"^m(\d+)(?:_t\d+(?:_k\d+)?)?_search_(.+)_s(\d+)$", label
             )
             if not sess_only:
                 legacy = _parse_timing_search_label(label)
@@ -588,106 +847,114 @@ def _latest_search_session_for_key(
     return session_index, last_turn, master_step
 
 
-def _build_search_call_row(
-    *,
-    master_step: int,
-    key: str,
-    status: str,
-    window_pairs: List[Dict[str, Any]],
-    events: List[Dict[str, Any]],
-    t_lo: float,
-    end_t: float,
-    total: float,
-    open_req: Optional[Dict[str, Any]] = None,
-    current_session: Optional[int] = None,
-    current_turn: Optional[int] = None,
-) -> Dict[str, Any]:
-    step_labels = _collect_search_step_labels(
-        events,
-        key=key,
-        t_lo=t_lo,
-        t_hi=end_t,
-        master_step=master_step,
-    )
-    turns = _annotate_turns_from_labels(window_pairs, step_labels)
-
-    running_llm = 0.0
-    if open_req is not None:
-        turn_step = int(open_req.get("step") or 0)
-        sess = int(current_session or 1)
-        # Prefer explicit current_turn; else session-local step from the open request.
-        search_turn = int(current_turn or turn_step)
-        running_llm = float(
-            _round_secs(max(0.0, end_t - float(open_req.get("start_t") or end_t)))
-            or 0.0
-        )
-        turns.append(
-            {
-                "step": turn_step,
-                "search_session": sess,
-                "search_turn": search_turn,
-                "label": None,
-                "status": "running",
-                "llm_seconds": running_llm,
-                "prompt_est_tokens": open_req.get("prompt_est_tokens"),
-                "input_tokens": None,
-                "output_tokens": None,
-                "start_t": open_req.get("start_t"),
-            }
-        )
-
-    session_rows = _group_turns_into_sessions(turns)
-    turns = [t for s in session_rows for t in (s.get("turns") or [])]
-
-    start_t = end_t
-    if window_pairs:
-        start_t = min(float(p["start_t"]) for p in window_pairs)
-    elif open_req is not None:
-        start_t = float(open_req.get("start_t") or end_t)
-    llm_total = sum(float(p.get("llm_seconds") or 0) for p in window_pairs) + running_llm
-    wall = max(0.0, end_t - start_t) if (window_pairs or open_req) else 0.0
-
-    row: Dict[str, Any] = {
-        "master_step": master_step,
-        "key": key,
-        "status": status,
-        "wall_seconds": _round_secs(wall),
-        "llm_seconds": _round_secs(llm_total),
-        "overhead_seconds": _round_secs(max(0.0, wall - llm_total)),
-        "pct": _pct(wall, total) if status == "complete" else None,
-        "n_turns": len(turns),
-        "sessions": session_rows,
-        "turns": turns,
-    }
-    if status == "running":
-        row["current_session"] = int(current_session or 1)
-        row["current_turn"] = int(current_turn or (open_req or {}).get("step") or 0)
-        if open_req is not None:
-            row["phase"] = "llm"
-        elif window_pairs:
-            row["phase"] = "tools"
-        else:
-            row["phase"] = "starting"
-    return row
-
-
 def _in_progress_search_calls(
     events: List[Dict[str, Any]],
     llm_pairs: List[Dict[str, Any]],
     open_reqs: List[Dict[str, Any]],
     total: float,
 ) -> List[Dict[str, Any]]:
-    """SearchAgent jobs that have started but not yet emitted search_pages."""
-    last_complete_t: Dict[str, float] = {}
-    for ev in events:
-        if ev.get("stage") == "agent" and ev.get("event") == "search_pages":
-            key = str(ev.get("key") or "")
-            last_complete_t[key] = max(
-                last_complete_t.get(key, -1.0), float(ev.get("t") or 0)
-            )
+    """SearchAgent batches that have started but not finished every key."""
+    enqueues = [
+        ev
+        for ev in events
+        if ev.get("stage") == "agent" and ev.get("event") == "search_pages_enqueue"
+    ]
+    completions = [
+        ev
+        for ev in events
+        if ev.get("stage") == "agent" and ev.get("event") == "search_pages"
+    ]
+    comps_by_key: Dict[str, List[Dict[str, Any]]] = {}
+    for ev in completions:
+        comps_by_key.setdefault(str(ev.get("key") or ""), []).append(ev)
 
-    # Keys kicked off via search_pages_start after last completion.
-    started: Dict[str, Dict[str, Any]] = {}
+    now_t = total
+    if events:
+        now_t = max(total, float(events[-1].get("t") or 0))
+
+    open_by_key: Dict[str, Dict[str, Any]] = {}
+    for req in open_reqs:
+        if req.get("agent") != "search":
+            continue
+        key = str(req.get("key") or "")
+        prev = open_by_key.get(key)
+        if prev is None or float(req.get("start_t") or 0) >= float(
+            prev.get("start_t") or 0
+        ):
+            open_by_key[key] = req
+
+    rows: List[Dict[str, Any]] = []
+    if enqueues:
+        for enq in enqueues:
+            master_step = int(enq.get("step") or 0)
+            tool_index = int(enq.get("tool_index") or 0)
+            keys = [str(k) for k in (enq.get("keys_accepted") or []) if str(k).strip()]
+            if not keys:
+                continue
+            t_enq = float(enq.get("t") or 0)
+            key_outcomes: List[Dict[str, Any]] = []
+            pending = False
+            for key in keys:
+                hit = None
+                for ev in comps_by_key.get(key) or []:
+                    if float(ev.get("t") or 0) <= t_enq:
+                        continue
+                    hit = ev
+                    break
+                if hit is None:
+                    pending = True
+                    key_outcomes.append(
+                        {"key": key, "status": "pending", "n_pages": 0}
+                    )
+                else:
+                    key_outcomes.append(
+                        {
+                            "key": key,
+                            "status": str(hit.get("status") or "complete"),
+                            "n_pages": int(hit.get("n_pages") or 0),
+                        }
+                    )
+            if not pending:
+                continue
+
+            primary = keys[0]
+            open_req = open_by_key.get(primary)
+            session_index, last_turn, _ = _latest_search_session_for_key(
+                events, key=primary, t_lo=t_enq, t_hi=now_t
+            )
+            if open_req is not None:
+                current_turn = int(open_req.get("step") or 0)
+                current_session = session_index
+            else:
+                current_turn = last_turn
+                current_session = session_index
+
+            rows.append(
+                _build_batch_search_call_row(
+                    events=events,
+                    llm_pairs=llm_pairs,
+                    master_step=master_step,
+                    tool_index=tool_index,
+                    keys=key_outcomes,
+                    t_lo=t_enq,
+                    end_t=now_t,
+                    total=total,
+                    status="running",
+                    open_req=open_req,
+                    current_session=current_session,
+                    current_turn=current_turn,
+                )
+            )
+        return rows
+
+    # Legacy: no enqueue events — fall back to per-key running detection.
+    last_complete_t: Dict[str, float] = {}
+    for ev in completions:
+        key = str(ev.get("key") or "")
+        last_complete_t[key] = max(
+            last_complete_t.get(key, -1.0), float(ev.get("t") or 0)
+        )
+    active_keys: set = set()
     for ev in events:
         if ev.get("stage") != "agent" or ev.get("event") not in {
             "search_pages_start",
@@ -695,14 +962,10 @@ def _in_progress_search_calls(
         }:
             continue
         t = float(ev.get("t") or 0)
-        master_step = int(ev.get("step") or 0)
-        for key in ev.get("keys_started") or []:
+        for key in ev.get("keys_started") or ev.get("keys_accepted") or []:
             key_s = str(key)
             if t > last_complete_t.get(key_s, -1.0):
-                started[key_s] = {"master_step": master_step, "start_t": t}
-
-    # Any search LLM activity after last completion also counts as in-progress.
-    active_keys: set = set(started.keys())
+                active_keys.add(key_s)
     for p in llm_pairs:
         if p.get("agent") != "search":
             continue
@@ -716,68 +979,29 @@ def _in_progress_search_calls(
         if float(req.get("start_t") or 0) > last_complete_t.get(key, -1.0):
             active_keys.add(key)
 
-    if not active_keys:
-        return []
-
-    now_t = total
-    if events:
-        now_t = max(total, float(events[-1].get("t") or 0))
-
-    open_by_key: Dict[str, Dict[str, Any]] = {}
-    for req in open_reqs:
-        if req.get("agent") != "search":
-            continue
-        key = str(req.get("key") or "")
-        if key not in active_keys:
-            continue
-        prev = open_by_key.get(key)
-        if prev is None or float(req.get("start_t") or 0) >= float(
-            prev.get("start_t") or 0
-        ):
-            open_by_key[key] = req
-
-    rows: List[Dict[str, Any]] = []
     for key in sorted(active_keys):
         t_lo = float(last_complete_t.get(key, -1.0))
-        window_pairs = [
-            p
-            for p in llm_pairs
-            if p.get("agent") == "search"
-            and str(p.get("key") or "") == key
-            and float(p.get("start_t") or 0) > t_lo
-        ]
-        window_pairs.sort(key=lambda p: float(p.get("start_t") or 0))
         open_req = open_by_key.get(key)
-
         session_index, last_turn, label_master = _latest_search_session_for_key(
             events, key=key, t_lo=t_lo, t_hi=now_t
         )
-        master_step = int((started.get(key) or {}).get("master_step") or 0)
-        if not master_step:
-            master_step = label_master
-
-        if open_req is not None:
-            current_turn = int(open_req.get("step") or 0)
-            current_session = session_index
-        elif window_pairs:
-            current_turn = int(window_pairs[-1].get("step") or last_turn or 0)
-            current_session = session_index
-        else:
-            current_turn = 0
-            current_session = session_index
-
+        master_step = label_master
+        current_turn = int(
+            (open_req or {}).get("step") or last_turn or 0
+        )
         rows.append(
-            _build_search_call_row(
-                master_step=master_step,
-                key=key,
-                status="running",
-                window_pairs=window_pairs,
+            _build_batch_search_call_row(
                 events=events,
+                llm_pairs=llm_pairs,
+                master_step=master_step,
+                tool_index=None,
+                keys=[{"key": key, "status": "pending", "n_pages": 0}],
                 t_lo=t_lo,
                 end_t=now_t,
                 total=total,
+                status="running",
                 open_req=open_req,
-                current_session=current_session,
+                current_session=session_index,
                 current_turn=current_turn,
             )
         )
@@ -799,13 +1023,17 @@ def _parse_timing_search_label(
     Returns (key_prefix, session_index, turn, master_step) or None.
     master_step is 0 when the legacy search_* form has no master index.
     """
-    m = re.match(r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)_s(\d+)$", label)
+    m = re.match(
+        r"^m(\d+)(?:_t\d+(?:_k\d+)?)?_search_(.+)_s(\d+)_s(\d+)$", label
+    )
     if m:
         return m.group(2), int(m.group(3)), int(m.group(4)), int(m.group(1))
     m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
     if m:
         return m.group(1), int(m.group(2)), int(m.group(3)), 0
-    m = re.match(r"^(?:m\d+(?:_t\d+_k\d+)?)?_?search_(.+)_s(\d+)$", label)
+    m = re.match(
+        r"^(?:m\d+(?:_t\d+(?:_k\d+)?)?)?_?search_(.+)_s(\d+)$", label
+    )
     if m:
         return m.group(1), 1, int(m.group(2)), 0
     return None
@@ -886,42 +1114,55 @@ def attach_timing_to_tree(
                     continue
 
                 if child.get("batch") and batch_keys:
-                    # One timing row per key → attach onto session_index 1..N.
-                    by_key: Dict[str, Dict[str, Any]] = {}
-                    wall_sum = 0.0
-                    llm_sum = 0.0
-                    for bk in batch_keys:
-                        matched = None
-                        for idx, cand in enumerate(active_queue):
-                            if str(cand.get("key") or "") == bk:
-                                matched = active_queue.pop(idx)
-                                break
-                        if matched is None:
-                            continue
-                        by_key[bk] = matched
-                        wall_sum = max(
-                            wall_sum, float(matched.get("wall_seconds") or 0)
-                        )
-                        llm_sum += float(matched.get("llm_seconds") or 0)
-                    child["timing"] = {
-                        "wall_seconds": _round_secs(wall_sum),
-                        "llm_seconds": _round_secs(llm_sum),
-                        "overhead_seconds": _round_secs(
-                            max(0.0, wall_sum - llm_sum)
-                        ),
-                        "pct": None,
-                    }
-                    for sess in child.get("sessions") or []:
-                        st = by_key.get(str(sess.get("key") or ""))
-                        if not st:
-                            continue
-                        sess["timing"] = {
-                            "wall_seconds": st.get("wall_seconds"),
-                            "llm_seconds": st.get("llm_seconds"),
-                            "n_turns": st.get("n_turns"),
+                    # One timing row per shared SearchAgent session; a collect
+                    # may cover keys from several sessions — aggregate those.
+                    batch_set = {str(k) for k in batch_keys if str(k).strip()}
+                    matched_rows: List[Dict[str, Any]] = []
+                    remain: List[Dict[str, Any]] = []
+                    for cand in active_queue:
+                        cand_keys = {
+                            str(k.get("key") or k)
+                            for k in (cand.get("keys") or [])
+                            if (isinstance(k, dict) and k.get("key")) or str(k).strip()
                         }
-                        # Flattened turns: match by order within the key's LLM pairs.
-                        src_turns = st.get("turns") or []
+                        if not cand_keys and cand.get("key"):
+                            cand_keys = {str(cand.get("key"))}
+                        if cand_keys & batch_set:
+                            matched_rows.append(cand)
+                        else:
+                            remain.append(cand)
+                    active_queue[:] = remain
+                    if not matched_rows:
+                        continue
+                    wall = max(
+                        float(m.get("wall_seconds") or 0) for m in matched_rows
+                    )
+                    llm = sum(float(m.get("llm_seconds") or 0) for m in matched_rows)
+                    child["timing"] = {
+                        "wall_seconds": _round_secs(wall),
+                        "llm_seconds": _round_secs(llm),
+                        "overhead_seconds": _round_secs(max(0.0, wall - llm)),
+                        "pct": matched_rows[0].get("pct") if len(matched_rows) == 1 else None,
+                        "n_keys": sum(int(m.get("n_keys") or 0) for m in matched_rows),
+                        "shared": any(m.get("shared") for m in matched_rows)
+                        or len(matched_rows) > 1,
+                    }
+                    # Prefer turns from the session that covers each key.
+                    by_key_turns: Dict[str, List[Dict[str, Any]]] = {}
+                    shared_turns = matched_rows[0].get("turns") or []
+                    for m in matched_rows:
+                        turns = m.get("turns") or []
+                        for ko in m.get("keys") or []:
+                            kname = str(ko.get("key") or "")
+                            if kname:
+                                by_key_turns[kname] = turns
+                    for sess in child.get("sessions") or []:
+                        sk = str(sess.get("key") or "")
+                        src_turns = by_key_turns.get(sk) or shared_turns
+                        sess["timing"] = {
+                            "n_turns": len(sess.get("turns") or []) or len(src_turns),
+                            "shared": True if child["timing"].get("shared") else False,
+                        }
                         for ti, turn in enumerate(sess.get("turns") or []):
                             if ti < len(src_turns):
                                 tt = src_turns[ti]
@@ -950,7 +1191,14 @@ def attach_timing_to_tree(
                 call_timing = None
                 if tool_key:
                     for idx, cand in enumerate(active_queue):
-                        if str(cand.get("key") or "") == tool_key:
+                        cand_keys = [
+                            str(k.get("key") or k)
+                            for k in (cand.get("keys") or [])
+                            if (isinstance(k, dict) and k.get("key")) or str(k).strip()
+                        ]
+                        if not cand_keys and cand.get("key"):
+                            cand_keys = [str(cand.get("key"))]
+                        if tool_key in cand_keys or str(cand.get("key") or "") == tool_key:
                             call_timing = active_queue.pop(idx)
                             break
                 if call_timing is None and active_queue and tname == "search_pages":
@@ -971,6 +1219,21 @@ def attach_timing_to_tree(
                     sess_idx = int(sess.get("session_index") or 1)
                     st = sessions_by_index.get(sess_idx)
                     if not st:
+                        # Shared-session row: attach flattened turns by order.
+                        src_turns = call_timing.get("turns") or []
+                        sess["timing"] = {
+                            "n_turns": len(sess.get("turns") or [])
+                            or call_timing.get("n_turns"),
+                        }
+                        for ti, turn in enumerate(sess.get("turns") or []):
+                            if ti < len(src_turns):
+                                tt = src_turns[ti]
+                                turn["timing"] = {
+                                    "llm_seconds": tt.get("llm_seconds"),
+                                    "input_tokens": tt.get("input_tokens"),
+                                    "output_tokens": tt.get("output_tokens"),
+                                    "prompt_est_tokens": tt.get("prompt_est_tokens"),
+                                }
                         continue
                     sess["timing"] = {
                         "llm_seconds": st.get("llm_seconds"),
