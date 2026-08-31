@@ -44,6 +44,28 @@ def _join_evidence_texts(items: Sequence[Any]) -> str:
     return "\n".join(parts)
 
 
+def _format_search_reasons(reasons: Any) -> str:
+    """Format SearchAgent page_reasons as ``pN: reason`` lines."""
+    if not reasons:
+        return ""
+    if isinstance(reasons, str):
+        return reasons.strip()
+    if isinstance(reasons, dict):
+        def _page_key(item: Any) -> tuple:
+            key = str(item)
+            return (0, int(key)) if key.isdigit() else (1, key)
+
+        lines: List[str] = []
+        for page, text in sorted(reasons.items(), key=lambda kv: _page_key(kv[0])):
+            note = str(text or "").strip()
+            if note:
+                lines.append(f"p{page}: {note}")
+        return "\n".join(lines)
+    if isinstance(reasons, list):
+        return _join_evidence_texts(reasons)
+    return str(reasons).strip()
+
+
 def resolve_document_name(
     pred: Dict[str, Any],
     answer_sheet: Dict[str, Any],
@@ -126,8 +148,12 @@ def evaluate_document(
         micro_gold += len(gold_set)
 
         gold_evid = _join_evidence_texts(gold.get("evidences") or [])
+        # VLM extract_kv_vlm evidence_quote (not SearchAgent page_reasons).
         pred_evid = _join_evidence_texts(pred.get("evidence") or [])
         e_f1 = token_f1(pred_evid, gold_evid)
+        search_reasons = _format_search_reasons(
+            pred.get("search_reasons") or pred.get("page_reasons") or {}
+        )
 
         em_flags.append(1.0 if em else 0.0)
         page_p.append(p_prec)
@@ -151,9 +177,16 @@ def evaluate_document(
                     "f1": round(p_f1, 6),
                 },
                 "evidence_text": {
+                    # VLM evidence_quote only — used for token F1 vs gold evidences.
                     "pred": pred_evid,
                     "gold": gold_evid,
                     "token_f1": round(e_f1, 6),
+                    "source": "vlm_evidence_quote",
+                },
+                "search_reasons": {
+                    # SearchAgent submit_pages page_reasons (page selection rationale).
+                    "pred": search_reasons,
+                    "source": "search_agent_page_reasons",
                 },
             }
         )

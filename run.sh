@@ -16,4 +16,5 @@ if [[ -z "${AGENTIC_RUNS_DIR:-}" ]]; then
 fi
 
 echo "runs_root=$AGENTIC_RUNS_DIR"
+echo "inference_api=${INFERENCE_API_URL:-http://127.0.0.1:8010}  (for agentic-evaluation)"
 exec uv run python -m agentic_viewer.app

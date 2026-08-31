@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from agentic_viewer.eval.evaluate_kv import build_report, load_json
@@ -15,6 +15,9 @@ from agentic_viewer.eval.paths import answer_sheet_path
 from agentic_viewer.hierarchy import build_agent_tree
 from agentic_viewer.image_tokens import replace_base64_images
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
+
+import urllib.error
+import urllib.request
 
 def default_runs_root() -> Path:
     """Prefer sibling inference-pipeline outputs, else ./runs."""
@@ -36,8 +39,85 @@ def default_runs_root() -> Path:
 
 
 RUNS_ROOT = default_runs_root()
+INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "http://127.0.0.1:8010").rstrip(
+    "/"
+)
+# run_id -> currently evaluating key (serial per run in the viewer too)
+_AGENTIC_EVAL_INFLIGHT: Dict[str, str] = {}
 
 app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0")
+
+
+def _list_agentic_evals(run_id: str) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    out_dir = root / "06_agentic_eval"
+    by_key: Dict[str, Any] = {}
+    if not out_dir.is_dir():
+        return {"by_key": by_key, "inflight": _AGENTIC_EVAL_INFLIGHT.get(run_id)}
+    for path in sorted(out_dir.glob("*.json")):
+        if path.name.endswith(".status.json"):
+            continue
+        data = _read_json(path)
+        if not isinstance(data, dict):
+            continue
+        key = data.get("key")
+        if not key:
+            continue
+        by_key[str(key)] = data
+    # Merge running status files that may not have a result yet.
+    for path in out_dir.glob("*.status.json"):
+        status = _read_json(path)
+        if not isinstance(status, dict):
+            continue
+        key = status.get("key")
+        if not key:
+            continue
+        key = str(key)
+        if key not in by_key and status.get("status") == "running":
+            by_key[key] = status
+    return {
+        "by_key": by_key,
+        "inflight": _AGENTIC_EVAL_INFLIGHT.get(run_id),
+    }
+
+
+def _call_inference_agentic_eval(run_id: str, key: str) -> Dict[str, Any]:
+    payload = json.dumps(
+        {
+            "run_id": run_id,
+            "key": key,
+            "hooks": "agentic-evaluation_config",
+            "protocol": "grpc",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{INFERENCE_API_URL}/agentic-eval",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and "detail" in parsed:
+                detail = str(parsed["detail"])
+        except Exception:
+            pass
+        raise HTTPException(status_code=exc.code, detail=detail) from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Cannot reach inference API at {INFERENCE_API_URL}/agentic-eval: "
+                f"{exc.reason}. Set INFERENCE_API_URL or start the API "
+                "(inference-pipeline/run_api.sh)."
+            ),
+        ) from exc
 
 
 def _run_dir(run_id: str) -> Path:
@@ -68,12 +148,27 @@ def _eval_summary(report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _eval_cache_has_reason_split(report: Dict[str, Any]) -> bool:
+    """True when cached eval separates VLM evidence vs SearchAgent reasons."""
+    per_key = report.get("per_key")
+    if not isinstance(per_key, list) or not per_key:
+        return False
+    first = per_key[0]
+    if not isinstance(first, dict):
+        return False
+    return "search_reasons" in first
+
+
 def _compute_run_eval(run_id: str, *, refresh: bool = False) -> Dict[str, Any]:
     root = _run_dir(run_id)
     cache_path = root / "05_eval.json"
     if cache_path.is_file() and not refresh:
         cached = _read_json(cache_path)
-        if isinstance(cached, dict) and cached.get("overall"):
+        if (
+            isinstance(cached, dict)
+            and cached.get("overall")
+            and _eval_cache_has_reason_split(cached)
+        ):
             return cached
 
     pred_path = root / "04_result.json"
@@ -224,6 +319,42 @@ def get_timing(run_id: str) -> Dict[str, Any]:
 def get_eval(run_id: str, refresh: bool = False) -> Dict[str, Any]:
     """Score 04_result.json against dataset/answer_sheet.json; cache as 05_eval.json."""
     return _compute_run_eval(run_id, refresh=refresh)
+
+
+@app.get("/api/runs/{run_id}/agentic-eval")
+def get_agentic_evals(run_id: str) -> Dict[str, Any]:
+    """List cached per-key agentic-evaluation results under 06_agentic_eval/."""
+    _run_dir(run_id)
+    return _list_agentic_evals(run_id)
+
+
+@app.post("/api/runs/{run_id}/agentic-eval")
+def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """
+    Trigger EvalMasterAgent for one key via the inference-pipeline API.
+
+    Keys for the same run_id are evaluated serially (409 if already running).
+    Status files under 06_agentic_eval/ are written by the inference API
+    (container user); the viewer only tracks in-memory inflight state.
+    """
+    _run_dir(run_id)
+    key = str((body or {}).get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    inflight = _AGENTIC_EVAL_INFLIGHT.get(run_id)
+    if inflight:
+        raise HTTPException(
+            status_code=409,
+            detail=f"agentic-evaluation already running for key={inflight!r}",
+        )
+
+    _AGENTIC_EVAL_INFLIGHT[run_id] = key
+    try:
+        result = _call_inference_agentic_eval(run_id, key)
+        return result
+    finally:
+        _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
 
 
 @app.get("/api/runs/{run_id}/file")
@@ -562,6 +693,46 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-size: 11px; max-height: 160px; overflow: auto; margin-top: 4px;
       background: #121820; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
     }
+    .eval-table .ev-block { margin-top: 6px; }
+    .ev-label {
+      display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: 0.03em;
+      text-transform: uppercase; padding: 1px 6px; border-radius: 4px; margin-bottom: 4px;
+    }
+    .ev-label.vlm { color: #9ad0ff; background: #1a2a3d; border: 1px solid #2a4a6a; }
+    .ev-label.search { color: #b8e0a8; background: #1a2e1a; border: 1px solid #2a4a2a; }
+    .ev-label.gold { color: #e0d0a0; background: #2a2618; border: 1px solid #4a4020; }
+    .agentic-eval-btn {
+      padding: 4px 10px; border-radius: 6px; border: 1px solid var(--accent);
+      background: #152033; color: var(--accent); font-size: 11px; cursor: pointer;
+      white-space: nowrap;
+    }
+    .agentic-eval-btn:disabled {
+      opacity: 0.45; cursor: not-allowed; border-color: var(--line); color: var(--muted);
+    }
+    .agentic-eval-summary {
+      font-size: 12px; margin: 0 0 6px; line-height: 1.35;
+      max-width: 320px;
+    }
+    .agentic-eval-text {
+      white-space: pre-wrap; word-break: break-word; font-family: var(--mono);
+      font-size: 11px; max-height: 220px; overflow: auto;
+      background: #121820; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+      min-width: 180px; max-width: 320px;
+    }
+    .agentic-eval-detail details summary {
+      cursor: pointer; color: var(--accent); font-size: 11px;
+    }
+    .agentic-eval-verdict {
+      display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.03em;
+      text-transform: uppercase; padding: 2px 8px; border-radius: 4px; margin-bottom: 6px;
+    }
+    .agentic-eval-verdict.correct {
+      color: var(--ok); background: rgba(61, 214, 140, 0.12); border: 1px solid rgba(61, 214, 140, 0.35);
+    }
+    .agentic-eval-verdict.incorrect {
+      color: var(--err); background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.35);
+    }
+    .agentic-eval-err { color: var(--err); font-size: 11px; }
     .em-y { color: var(--ok); font-weight: 600; }
     .em-n { color: var(--err); font-weight: 600; }
     .run .eval-mini { color: var(--muted); font-size: 11px; margin-top: 3px; font-family: var(--mono); }
@@ -674,6 +845,7 @@ const state = {
   pages: [], chunks: null, pagesSubtab: "pages",
   agentTree: null, info: null,
   evalReport: null, evalError: null, evalLoading: false,
+  agenticEvals: {}, agenticEvalInflight: null, agenticEvalError: null,
 };
 
 async function api(path) {
@@ -756,6 +928,9 @@ async function selectRun(runId) {
   state.evalReport = null;
   state.evalError = null;
   state.evalLoading = false;
+  state.agenticEvals = {};
+  state.agenticEvalInflight = null;
+  state.agenticEvalError = null;
   renderRuns();
   await renderDetail();
 }
@@ -1342,6 +1517,10 @@ function renderMasterOutput() {
       const text = ev.text || ev.evidence_quote || "";
       return page ? `[${page}] ${text}` : text;
     }).filter(Boolean).join(" · ") || (item.evidence_quote || "");
+    const reasons = item.search_reasons || item.page_reasons || {};
+    const reasonText = (reasons && typeof reasons === "object")
+      ? Object.entries(reasons).map(([p, t]) => `p${p}: ${t}`).join(" · ")
+      : "";
     const found = item.found;
     const foundBadge = found === true
       ? `<span class="tree-badge ok">found</span>`
@@ -1349,7 +1528,10 @@ function renderMasterOutput() {
     return `<tr>
       <td>${esc(item.key)}</td>
       <td>${esc(item.value)} ${foundBadge}</td>
-      <td>${esc(evidenceText)}</td>
+      <td>
+        ${evidenceText ? `<div><span class="ev-label vlm">VLM</span> ${esc(evidenceText)}</div>` : ""}
+        ${reasonText ? `<div style="margin-top:4px"><span class="ev-label search">Search</span> ${esc(reasonText)}</div>` : ""}
+      </td>
     </tr>`;
   }).join("");
 
@@ -1447,6 +1629,35 @@ function renderEval() {
     const em = row.value?.exact_match;
     const sp = row.search_pages || {};
     const et = row.evidence_text || {};
+    const sr = row.search_reasons || {};
+    const ae = (state.agenticEvals || {})[row.key];
+    const inflight = state.agenticEvalInflight;
+    let agenticCell;
+    if (ae && ae.status === "done" && (ae.is_correct_answer || ae.reason_summary || ae.reason || ae.text)) {
+      const verdict = String(ae.is_correct_answer || "").toLowerCase();
+      const verdictCls = verdict === "correct" ? "correct" : (verdict === "incorrect" ? "incorrect" : "");
+      const verdictLabel = verdict === "correct" || verdict === "incorrect"
+        ? verdict
+        : "(no verdict)";
+      const summary = ae.reason_summary || ae.reason || "";
+      const detail = ae.reason_detail || ae.text || "";
+      agenticCell = `
+        <div class="agentic-eval-verdict ${verdictCls}">${esc(verdictLabel)}</div>
+        ${summary ? `<div class="agentic-eval-summary">${esc(summary)}</div>` : ""}
+        ${detail ? `<div class="agentic-eval-detail"><details>
+          <summary>detail</summary>
+          <div class="agentic-eval-text">${esc(detail)}</div>
+        </details></div>` : ""}`;
+    } else if (ae && ae.status === "error") {
+      agenticCell = `<div class="agentic-eval-err">${esc(ae.error || "error")}</div>
+        <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
+          ${inflight ? "disabled" : ""}>Retry</button>`;
+    } else if (inflight === row.key || (ae && ae.status === "running")) {
+      agenticCell = `<button type="button" class="agentic-eval-btn" disabled>Running…</button>`;
+    } else {
+      agenticCell = `<button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
+        ${inflight ? "disabled" : ""}>agentic-evaluation</button>`;
+    }
     return `<tr>
       <td class="key">${esc(row.key)}</td>
       <td class="${em ? "em-y" : "em-n"}">${em ? "Y" : "N"}</td>
@@ -1456,33 +1667,55 @@ function renderEval() {
         <div><b>pred</b> ${esc(row.value?.pred ?? "")}</div>
         <div><b>gold</b> ${esc(row.value?.gold ?? "")}</div>
         <details>
-          <summary>evidence text</summary>
-          <div class="ev-text"><b>pred</b>\n${esc(et.pred || "(empty)")}\n\n<b>gold</b>\n${esc(et.gold || "(empty)")}</div>
+          <summary>VLM evidence · Search reasons</summary>
+          <div class="ev-block">
+            <span class="ev-label vlm">VLM evidence_quote</span>
+            <div class="ev-text">${esc(et.pred || "(empty)")}</div>
+          </div>
+          <div class="ev-block">
+            <span class="ev-label search">SearchAgent page_reasons</span>
+            <div class="ev-text">${esc(sr.pred || "(empty)")}</div>
+          </div>
+          <div class="ev-block">
+            <span class="ev-label gold">gold evidences</span>
+            <div class="ev-text">${esc(et.gold || "(empty)")}</div>
+          </div>
         </details>
       </td>
+      <td>${agenticCell}</td>
     </tr>`;
   }).join("");
+
+  const aeErr = state.agenticEvalError
+    ? `<p class="hint" style="color:var(--err)">Agentic eval: ${esc(state.agenticEvalError)}</p>`
+    : "";
 
   return `
     <p class="hint">
       Baseline metrics vs <code>dataset/answer_sheet.json</code>.
       Cached as <code>05_eval.json</code> in the run directory.
+      Evid F1 uses <b>VLM evidence_quote</b> only; SearchAgent <b>page_reasons</b> are shown separately.
+      Agentic-evaluation runs serially via the inference API and saves under <code>06_agentic_eval/</code>.
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
     </p>
+    ${aeErr}
     <div class="score-grid">${cards}</div>
     <table class="eval-table">
       <thead>
         <tr>
-          <th>Key</th><th>EM</th><th>Page F1</th><th>Evid F1</th><th>Values / evidence</th>
+          <th>Key</th><th>EM</th><th>Page F1</th><th>Evid F1</th><th>Values / reasons</th><th>Agentic eval</th>
         </tr>
       </thead>
-      <tbody>${rows || `<tr><td colspan="5" class="empty">No keys</td></tr>`}</tbody>
+      <tbody>${rows || `<tr><td colspan="6" class="empty">No keys</td></tr>`}</tbody>
     </table>`;
 }
 
 async function ensureEval(refresh=false) {
   if (!state.runId) return;
-  if (!refresh && state.evalReport && !state.evalError) return;
+  if (!refresh && state.evalReport && !state.evalError) {
+    await ensureAgenticEvals();
+    return;
+  }
   state.evalLoading = true;
   state.evalError = null;
   paintDetail();
@@ -1499,11 +1732,64 @@ async function ensureEval(refresh=false) {
     };
     state.runs = state.runs.map(r => r.run_id === state.runId ? {...r, eval_summary: es} : r);
     renderRuns();
+    await ensureAgenticEvals();
   } catch (err) {
     state.evalReport = null;
     state.evalError = String(err.message || err);
   } finally {
     state.evalLoading = false;
+    paintDetail();
+  }
+}
+
+async function ensureAgenticEvals() {
+  if (!state.runId) return;
+  try {
+    const data = await api(`/api/runs/${encodeURIComponent(state.runId)}/agentic-eval`);
+    state.agenticEvals = data.by_key || {};
+    if (!state.agenticEvalInflight) {
+      state.agenticEvalInflight = data.inflight || null;
+    }
+    state.agenticEvalError = null;
+  } catch (err) {
+    state.agenticEvalError = String(err.message || err);
+  }
+}
+
+async function runAgenticEval(key) {
+  if (!state.runId || !key || state.agenticEvalInflight) return;
+  state.agenticEvalInflight = key;
+  state.agenticEvalError = null;
+  state.agenticEvals = {
+    ...state.agenticEvals,
+    [key]: { key, status: "running" },
+  };
+  paintDetail();
+  try {
+    const r = await fetch(
+      `/api/runs/${encodeURIComponent(state.runId)}/agentic-eval`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      }
+    );
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+    if (!r.ok) {
+      throw new Error(data.detail || text || r.statusText);
+    }
+    state.agenticEvals = { ...state.agenticEvals, [key]: data };
+  } catch (err) {
+    state.agenticEvalError = String(err.message || err);
+    state.agenticEvals = {
+      ...state.agenticEvals,
+      [key]: { key, status: "error", error: String(err.message || err) },
+    };
+  } finally {
+    state.agenticEvalInflight = null;
+    await ensureAgenticEvals();
     paintDetail();
   }
 }
@@ -1548,6 +1834,9 @@ function paintDetail() {
   if (state.tab === "eval" && !state.evalReport && !state.evalLoading && !state.evalError) {
     ensureEval(false);
   }
+  detail.querySelectorAll("[data-agentic-key]").forEach(btn => {
+    btn.onclick = () => runAgenticEval(btn.dataset.agenticKey);
+  });
   const chunkSearchBtn = document.getElementById("chunkSearchBtn");
   if (chunkSearchBtn) {
     const runFilter = async () => {
