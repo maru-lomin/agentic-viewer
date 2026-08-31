@@ -93,6 +93,144 @@ def _safe_key_prefix(key: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key or ""))[:40]
 
 
+def _key_prefix_matches(label_prefix: str, key: str) -> bool:
+    """True when a parsed label key_prefix belongs to ``key``."""
+    want = _safe_key_prefix(key)
+    prefix = str(label_prefix or "")
+    if not want:
+        return not prefix
+    if not prefix:
+        return False
+    return prefix == want or want.startswith(prefix) or prefix.startswith(want)
+
+
+def _collect_search_step_labels(
+    events: List[Dict[str, Any]],
+    *,
+    key: str,
+    t_lo: float,
+    t_hi: float,
+    master_step: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Chronological step-dump labels for one search key in ``(t_lo, t_hi]``.
+
+    Filters by key prefix embedded in the label so parallel SearchAgents that
+    reuse the same per-session ``step`` counters do not overwrite each other.
+    """
+    rows: List[Dict[str, Any]] = []
+    for ev in events:
+        if ev.get("stage") != "agent" or ev.get("event") != "step":
+            continue
+        t = float(ev.get("t") or 0)
+        if t <= t_lo or t > t_hi:
+            continue
+        label = str(ev.get("label") or "")
+        if not _is_search_step_label(label):
+            continue
+        parsed = _parse_timing_search_label(label)
+        if parsed is None:
+            continue
+        label_prefix, session_index, search_turn, mstep = parsed
+        if not _key_prefix_matches(label_prefix, key):
+            continue
+        if mstep and master_step and mstep != master_step:
+            continue
+        rows.append(
+            {
+                "t": t,
+                "step": int(ev.get("step") or 0),
+                "search_session": int(session_index),
+                "search_turn": int(search_turn),
+                "label": label,
+            }
+        )
+    rows.sort(key=lambda r: (float(r["t"]), int(r["step"]), int(r["search_session"])))
+    return rows
+
+
+def _annotate_turns_from_labels(
+    window_pairs: List[Dict[str, Any]],
+    step_labels: List[Dict[str, Any]],
+    *,
+    status: str = "complete",
+) -> List[Dict[str, Any]]:
+    """
+    Attach session/turn/label to each LLM pair.
+
+    Matches each pair to the earliest unused step dump with the same ``step``
+    whose timestamp is at/after the LLM request start. This survives handoff
+    sessions that reset the per-session step counter to 1.
+    """
+    unused = list(step_labels)
+    turns: List[Dict[str, Any]] = []
+    for p in window_pairs:
+        turn_step = int(p.get("step") or 0)
+        start_t = float(p.get("start_t") or 0)
+        matched: Optional[Dict[str, Any]] = None
+        for i, se in enumerate(unused):
+            if int(se.get("step") or 0) != turn_step:
+                continue
+            # Step dumps are written at/after the LLM response.
+            if float(se.get("t") or 0) < start_t - 0.05:
+                continue
+            matched = unused.pop(i)
+            break
+
+        if matched is not None:
+            session_index = int(matched.get("search_session") or 1)
+            search_turn = int(matched.get("search_turn") or turn_step)
+            label = matched.get("label") or None
+        else:
+            session_index = 1
+            search_turn = turn_step
+            label = None
+
+        turns.append(
+            {
+                "step": turn_step,
+                "search_session": session_index,
+                "search_turn": search_turn,
+                "label": label,
+                "status": status,
+                "llm_seconds": p.get("llm_seconds"),
+                "prompt_est_tokens": p.get("prompt_est_tokens"),
+                "input_tokens": p.get("input_tokens"),
+                "output_tokens": p.get("output_tokens"),
+                "start_t": p.get("start_t"),
+            }
+        )
+    return turns
+
+
+def _group_turns_into_sessions(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group turns by session; sort sessions and turns numerically."""
+    ordered = sorted(
+        turns,
+        key=lambda t: (
+            int(t.get("search_session") or 1),
+            int(t.get("search_turn") or 0),
+            float(t.get("start_t") or 0),
+        ),
+    )
+    sessions: Dict[int, List[Dict[str, Any]]] = {}
+    for turn in ordered:
+        sess = int(turn.get("search_session") or 1)
+        sessions.setdefault(sess, []).append(turn)
+
+    return [
+        {
+            "session_index": sess,
+            "llm_seconds": _round_secs(
+                sum(float(t.get("llm_seconds") or 0) for t in sess_turns)
+            ),
+            "n_turns": len(sess_turns),
+            "turns": sess_turns,
+        }
+        for sess, sess_turns in sorted(sessions.items())
+    ]
+
+
 def _stage_timings(events: List[Dict[str, Any]], total: float) -> List[Dict[str, Any]]:
     bounds: Dict[str, List[float]] = {}
     done_at: Dict[str, float] = {}
@@ -350,77 +488,20 @@ def _search_call_timings(
         if window_pairs:
             start_t = min(float(p["start_t"]) for p in window_pairs)
 
-        # Labels for turns inside this search_pages window.
-        label_by_step: Dict[int, str] = {}
-        for ev in events:
-            if ev.get("stage") != "agent" or ev.get("event") != "step":
-                continue
-            t = float(ev.get("t") or 0)
-            if t <= t_lo or t > end_t:
-                continue
-            label = str(ev.get("label") or "")
-            if not _is_search_step_label(label):
-                continue
-            # Prefer labels that belong to this key when parallel agents interleave.
-            parsed = _parse_timing_search_label(label)
-            if parsed is not None:
-                _label_key_prefix, _sess, _turn, _mstep = parsed
-                # Soft filter: if master_step encoded, require match when present.
-                if _mstep and _mstep != master_step:
-                    continue
-            label_by_step[int(ev.get("step") or 0)] = label
+        step_labels = _collect_search_step_labels(
+            events,
+            key=key,
+            t_lo=t_lo,
+            t_hi=end_t,
+            master_step=master_step,
+        )
+        turns = _annotate_turns_from_labels(window_pairs, step_labels)
+        session_rows = _group_turns_into_sessions(turns)
+        # Flat list follows the same session/turn order as the UI table.
+        turns = [t for s in session_rows for t in (s.get("turns") or [])]
 
         llm_total = sum(float(p.get("llm_seconds") or 0) for p in window_pairs)
         wall = max(0.0, end_t - start_t) if window_pairs else 0.0
-
-        turns: List[Dict[str, Any]] = []
-        for p in window_pairs:
-            turn_step = int(p.get("step") or 0)
-            label = label_by_step.get(turn_step, "")
-            session_index = 1
-            search_turn = turn_step
-            parsed = _parse_timing_search_label(label) if label else None
-            if parsed is not None:
-                _prefix, session_index, search_turn, _mstep = parsed
-            else:
-                m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
-                if m:
-                    session_index = int(m.group(2))
-                    search_turn = int(m.group(3))
-                else:
-                    m = re.match(r"^search_(.+)_s(\d+)$", label)
-                    if m:
-                        search_turn = int(m.group(2))
-
-            turns.append(
-                {
-                    "step": turn_step,
-                    "search_session": session_index,
-                    "search_turn": search_turn,
-                    "label": label or None,
-                    "llm_seconds": p.get("llm_seconds"),
-                    "prompt_est_tokens": p.get("prompt_est_tokens"),
-                    "input_tokens": p.get("input_tokens"),
-                    "output_tokens": p.get("output_tokens"),
-                }
-            )
-
-        sessions: Dict[int, List[Dict[str, Any]]] = {}
-        for turn in turns:
-            sess = int(turn.get("search_session") or 1)
-            sessions.setdefault(sess, []).append(turn)
-
-        session_rows = [
-            {
-                "session_index": sess,
-                "llm_seconds": _round_secs(
-                    sum(float(t.get("llm_seconds") or 0) for t in sess_turns)
-                ),
-                "n_turns": len(sess_turns),
-                "turns": sess_turns,
-            }
-            for sess, sess_turns in sorted(sessions.items())
-        ]
 
         rows.append(
             {
@@ -453,7 +534,6 @@ def _latest_search_session_for_key(
     Session comes from the newest search label in the window (step/tool/message).
     Turn comes from the newest completed ``_sN_sM`` step label.
     """
-    want = _safe_key_prefix(key)
     session_index = 1
     last_turn = 0
     master_step = 0
@@ -496,9 +576,7 @@ def _latest_search_session_for_key(
                 turn = 0
                 mstep = int(sess_only.group(1))
 
-        if want and prefix and not (
-            prefix == want or want.startswith(prefix) or prefix.startswith(want)
-        ):
+        if not _key_prefix_matches(prefix, key):
             continue
         if t >= best_t:
             best_t = t
@@ -524,99 +602,49 @@ def _build_search_call_row(
     current_session: Optional[int] = None,
     current_turn: Optional[int] = None,
 ) -> Dict[str, Any]:
-    label_by_step: Dict[int, str] = {}
-    for ev in events:
-        if ev.get("stage") != "agent" or ev.get("event") != "step":
-            continue
-        t = float(ev.get("t") or 0)
-        if t <= t_lo or t > end_t:
-            continue
-        label = str(ev.get("label") or "")
-        if not _is_search_step_label(label):
-            continue
-        parsed = _parse_timing_search_label(label)
-        if parsed is not None:
-            _label_key_prefix, _sess, _turn, _mstep = parsed
-            if _mstep and master_step and _mstep != master_step:
-                continue
-        label_by_step[int(ev.get("step") or 0)] = label
+    step_labels = _collect_search_step_labels(
+        events,
+        key=key,
+        t_lo=t_lo,
+        t_hi=end_t,
+        master_step=master_step,
+    )
+    turns = _annotate_turns_from_labels(window_pairs, step_labels)
 
-    turns: List[Dict[str, Any]] = []
-    for p in window_pairs:
-        turn_step = int(p.get("step") or 0)
-        label = label_by_step.get(turn_step, "")
-        session_index = 1
-        search_turn = turn_step
-        parsed = _parse_timing_search_label(label) if label else None
-        if parsed is not None:
-            _prefix, session_index, search_turn, _mstep = parsed
-        else:
-            m = re.match(r"^search_(.+)_s(\d+)_s(\d+)$", label)
-            if m:
-                session_index = int(m.group(2))
-                search_turn = int(m.group(3))
-            else:
-                m = re.match(r"^search_(.+)_s(\d+)$", label)
-                if m:
-                    search_turn = int(m.group(2))
-        turns.append(
-            {
-                "step": turn_step,
-                "search_session": session_index,
-                "search_turn": search_turn,
-                "label": label or None,
-                "status": "complete",
-                "llm_seconds": p.get("llm_seconds"),
-                "prompt_est_tokens": p.get("prompt_est_tokens"),
-                "input_tokens": p.get("input_tokens"),
-                "output_tokens": p.get("output_tokens"),
-            }
-        )
-
+    running_llm = 0.0
     if open_req is not None:
         turn_step = int(open_req.get("step") or 0)
         sess = int(current_session or 1)
+        # Prefer explicit current_turn; else session-local step from the open request.
+        search_turn = int(current_turn or turn_step)
+        running_llm = float(
+            _round_secs(max(0.0, end_t - float(open_req.get("start_t") or end_t)))
+            or 0.0
+        )
         turns.append(
             {
                 "step": turn_step,
                 "search_session": sess,
-                "search_turn": int(current_turn or turn_step),
+                "search_turn": search_turn,
                 "label": None,
                 "status": "running",
-                "llm_seconds": _round_secs(
-                    max(0.0, end_t - float(open_req.get("start_t") or end_t))
-                ),
+                "llm_seconds": running_llm,
                 "prompt_est_tokens": open_req.get("prompt_est_tokens"),
                 "input_tokens": None,
                 "output_tokens": None,
+                "start_t": open_req.get("start_t"),
             }
         )
 
-    sessions: Dict[int, List[Dict[str, Any]]] = {}
-    for turn in turns:
-        sess = int(turn.get("search_session") or 1)
-        sessions.setdefault(sess, []).append(turn)
-
-    session_rows = [
-        {
-            "session_index": sess,
-            "llm_seconds": _round_secs(
-                sum(float(t.get("llm_seconds") or 0) for t in sess_turns)
-            ),
-            "n_turns": len(sess_turns),
-            "turns": sess_turns,
-        }
-        for sess, sess_turns in sorted(sessions.items())
-    ]
+    session_rows = _group_turns_into_sessions(turns)
+    turns = [t for s in session_rows for t in (s.get("turns") or [])]
 
     start_t = end_t
     if window_pairs:
         start_t = min(float(p["start_t"]) for p in window_pairs)
     elif open_req is not None:
         start_t = float(open_req.get("start_t") or end_t)
-    llm_total = sum(float(p.get("llm_seconds") or 0) for p in window_pairs)
-    if open_req is not None and turns and turns[-1].get("status") == "running":
-        llm_total += float(turns[-1].get("llm_seconds") or 0)
+    llm_total = sum(float(p.get("llm_seconds") or 0) for p in window_pairs) + running_llm
     wall = max(0.0, end_t - start_t) if (window_pairs or open_req) else 0.0
 
     row: Dict[str, Any] = {
