@@ -762,6 +762,7 @@ def _build_batch_search_agent(
     step_call_queue: List[Dict[str, Any]],
     search_by_prefix: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     master_step: int = 0,
+    default_status: str = "unknown",
 ) -> Dict[str, Any]:
     """
     One SearchAgent node with session_index 1..N = one key each (parallel).
@@ -796,6 +797,9 @@ def _build_batch_search_agent(
                 for r in (search_by_prefix.get(prefix) or [])
                 if int(r.get("master_step") or 0) == master_step
             ]
+            if not rows:
+                # Async jobs may still be writing; take any matching prefix.
+                rows = list(search_by_prefix.get(prefix) or [])
             if rows:
                 recovered = _group_search_sessions(
                     rows,
@@ -817,6 +821,8 @@ def _build_batch_search_agent(
             status = (call.get("output") or {}).get("status") or (
                 call.get("result") or {}
             ).get("status")
+        if not status:
+            status = "complete" if turns else default_status
 
         sessions.append(
             {
@@ -824,7 +830,7 @@ def _build_batch_search_agent(
                 "key": key,
                 "n_turns": len(turns),
                 "turns": turns,
-                "status": status or "unknown",
+                "status": status or default_status,
                 "pages": pages if pages is not None else [],
                 "page_reasons": page_reasons if isinstance(page_reasons, dict) else {},
                 "reasons": page_reasons if isinstance(page_reasons, dict) else {},
@@ -1002,36 +1008,170 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
             if dump and dump.get("arguments") is not None and not tool_node["arguments"]:
                 tool_node["arguments"] = dump.get("arguments")
 
-            if tname == "search_pages":
+            # Normalize key/keys so viewers can always read a single field.
+            args = tool_node.get("arguments")
+            if isinstance(args, dict):
+                if args.get("key") is None and args.get("keys") is not None:
+                    args = dict(args)
+                    args["key"] = args.get("keys")
+                    tool_node["arguments"] = args
+
+            if tname == "search_pages" and isinstance(result, dict) and "accepted" in result:
+                accepted = result.get("accepted") or []
+                if not isinstance(accepted, list):
+                    accepted = []
+                # Prefer explicit accepted list; fall back to normalized key(s).
+                if not accepted:
+                    raw = (tool_node.get("arguments") or {}).get("key")
+                    if isinstance(raw, list):
+                        accepted = [str(k) for k in raw if str(k).strip()]
+                    elif raw:
+                        accepted = [str(raw)]
+                tool_node["search_output"] = {
+                    "status": "accepted",
+                    "n_keys": len(accepted),
+                    "accepted": accepted,
+                    "skipped": result.get("skipped") or [],
+                }
+                # Link whatever per-key dumps / step turns already exist for these
+                # keys (async jobs finish and dump under the start step).
+                if accepted:
+                    batch_items = [{"key": str(k)} for k in accepted]
+                    cross_queue: List[Dict[str, Any]] = []
+                    for q in call_queues.values():
+                        cross_queue.extend(q)
+                    child = _build_batch_search_agent(
+                        batch_items=batch_items,
+                        step_call_queue=cross_queue,
+                        search_by_prefix=search_by_prefix,
+                        master_step=mstep,
+                        default_status="running",
+                    )
+                    # Reflect enqueue status when nothing finished yet.
+                    n_done = sum(
+                        1
+                        for s in (child.get("sessions") or [])
+                        if str(s.get("status") or "")
+                        not in {"", "unknown", "running", "accepted", "queued"}
+                    )
+                    child["key"] = (
+                        accepted[0]
+                        if len(accepted) == 1
+                        else f"{len(accepted)} keys (accepted)"
+                    )
+                    child["output"] = {
+                        **(child.get("output") or {}),
+                        "status": "complete" if n_done == len(accepted) else "accepted",
+                        "accepted": accepted,
+                        "n_keys": len(accepted),
+                    }
+                    child["result"] = {
+                        **(child.get("result") or {}),
+                        "status": child["output"]["status"],
+                    }
+                    remaining_ids = {id(c) for c in cross_queue}
+                    for q in call_queues.values():
+                        q[:] = [c for c in q if id(c) in remaining_ids]
+                    tool_node["children"].append(child)
+            elif tname in {"search_pages", "collect_search_results", "await_searches"}:
                 batch_items = None
                 if isinstance(result, dict) and isinstance(result.get("results"), list):
                     batch_items = [
                         x for x in result["results"] if isinstance(x, dict)
                     ]
+                if (
+                    batch_items is None
+                    and isinstance(result, dict)
+                    and isinstance(result.get("completed"), list)
+                ):
+                    batch_items = [
+                        x for x in result["completed"] if isinstance(x, dict)
+                    ]
                 args_key = (tool_node.get("arguments") or {}).get("key")
+                if args_key is None:
+                    args_key = (tool_node.get("arguments") or {}).get("keys")
                 if (
                     batch_items is None
                     and isinstance(args_key, list)
-                    and len(args_key) > 1
+                    and len(args_key) >= 1
                 ):
                     # Arguments list keys but result missing — still try queue.
                     batch_items = [{"key": str(k)} for k in args_key]
+                elif (
+                    batch_items is None
+                    and isinstance(args_key, str)
+                    and args_key.strip()
+                ):
+                    batch_items = [{"key": args_key}]
 
-                if batch_items and len(batch_items) > 1:
-                    tool_node["children"].append(
-                        _build_batch_search_agent(
-                            batch_items=batch_items,
-                            step_call_queue=step_call_queue,
-                            search_by_prefix=search_by_prefix,
-                            master_step=mstep,
+                if batch_items and len(batch_items) >= 1 and tname in {
+                    "collect_search_results",
+                    "await_searches",
+                    "search_pages",
+                }:
+                    # Async jobs dump under the start step; match by key across steps.
+                    # Works for 1..N completed keys (single-key used to miss the tree
+                    # when the dump was already claimed by the enqueue tool).
+                    if tname in {"collect_search_results", "await_searches"} or len(
+                        batch_items
+                    ) > 1:
+                        cross_queue: List[Dict[str, Any]] = []
+                        for q in call_queues.values():
+                            cross_queue.extend(q)
+                        tool_node["children"].append(
+                            _build_batch_search_agent(
+                                batch_items=batch_items,
+                                step_call_queue=cross_queue,
+                                search_by_prefix=search_by_prefix,
+                                master_step=mstep,
+                            )
                         )
-                    )
-                    tool_node["search_output"] = {
-                        "status": "complete",
-                        "n_keys": len(batch_items),
-                        "results": batch_items,
-                    }
-                elif step_call_queue:
+                        remaining_ids = {id(c) for c in cross_queue}
+                        for q in call_queues.values():
+                            q[:] = [c for c in q if id(c) in remaining_ids]
+                        tool_node["search_output"] = {
+                            "status": "complete",
+                            "n_keys": len(batch_items),
+                            "results": batch_items,
+                        }
+                    elif step_call_queue and tname == "search_pages":
+                        call = step_call_queue.pop(0)
+                        output = call.get("output") or {}
+                        tool_node["search_output"] = output
+                        tool_node["result"] = call.get("result") or tool_node.get(
+                            "result"
+                        )
+                        tool_node["filename"] = call.get("filename") or tool_node.get(
+                            "filename"
+                        )
+                        tool_node["children"].append(
+                            {
+                                "type": "search_agent",
+                                "key": call["key"],
+                                "key_prefix": call["key_prefix"],
+                                "output": output,
+                                "result": {
+                                    "pages": output.get("pages"),
+                                    "page_reasons": output.get("page_reasons"),
+                                    "reasons": output.get("page_reasons"),
+                                    "status": output.get("status")
+                                    or call["result"].get("status"),
+                                    "reason": output.get("reason")
+                                    or call["result"].get("reason"),
+                                    "n_search_steps": len(
+                                        call.get("search_steps") or []
+                                    )
+                                    or call["result"].get("n_search_steps"),
+                                    "n_search_sessions": call["result"].get(
+                                        "n_search_sessions"
+                                    ),
+                                },
+                                "sessions": call.get("search_sessions") or [],
+                                "filename": call.get("filename"),
+                                "note": call.get("note"),
+                            }
+                        )
+                elif step_call_queue and tname == "search_pages":
                     call = step_call_queue.pop(0)
                     output = call.get("output") or {}
                     tool_node["search_output"] = output
@@ -1065,6 +1205,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                         }
                     )
             node["tools"].append(tool_node)
+
 
         tree.append(node)
 

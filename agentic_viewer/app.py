@@ -123,10 +123,13 @@ def list_runs() -> List[Dict[str, Any]]:
         meta = _read_json(child / "meta.json") or {}
         result = _read_json(child / "04_result.json") or {}
         eval_cached = _read_json(child / "05_eval.json")
+        status = meta.get("status")
+        if not status:
+            status = "running" if not meta.get("finished_at") else "unknown"
         rows.append(
             {
                 "run_id": child.name,
-                "status": meta.get("status", "unknown"),
+                "status": status,
                 "started_at": meta.get("started_at"),
                 "finished_at": meta.get("finished_at"),
                 "seconds": meta.get("seconds"),
@@ -262,9 +265,81 @@ def get_file(run_id: str, path: str):
 
 
 @app.get("/api/runs/{run_id}/pages")
-def list_pages(run_id: str) -> List[Dict[str, Any]]:
-    summary = _read_json(_run_dir(run_id) / "01_parse" / "summary.json") or {}
-    return summary.get("pages") or []
+def list_pages(run_id: str) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    summary = _read_json(root / "01_parse" / "summary.json") or {}
+    progress = _read_json(root / "01_parse" / "progress.json") or {}
+    pages = list(summary.get("pages") or [])
+    if not pages:
+        # Mid-parse: summary not written yet — scan per-page meta dumps.
+        parse_dir = root / "01_parse"
+        if parse_dir.is_dir():
+            for meta_path in sorted(parse_dir.glob("page_*.meta.json")):
+                meta = _read_json(meta_path)
+                if isinstance(meta, dict) and meta.get("page") is not None:
+                    pages.append(meta)
+    return {
+        "pages": pages,
+        "page_count": summary.get("page_count") or len(pages),
+        "progress": progress or None,
+        "seconds": summary.get("seconds"),
+    }
+
+
+@app.get("/api/runs/{run_id}/chunks")
+def list_chunks(
+    run_id: str, offset: int = 0, limit: int = 200, q: str = ""
+) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    summary = _read_json(root / "02_chunk" / "summary.json") or {}
+    progress = _read_json(root / "02_chunk" / "progress.json") or {}
+    chunks = list(summary.get("chunks") or [])
+    query = (q or "").strip().lower()
+    if query:
+        chunks = [
+            c
+            for c in chunks
+            if query in str(c.get("chunk_id") or "").lower()
+            or query in str(c.get("heading_path") or "").lower()
+            or query in str(c.get("page") or "")
+        ]
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(1000, int(limit or 200)))
+    slice_ = chunks[offset : offset + limit]
+    return {
+        "strategy": summary.get("strategy"),
+        "chunk_count": summary.get("chunk_count") or len(summary.get("chunks") or []),
+        "filtered_count": len(chunks),
+        "offset": offset,
+        "limit": limit,
+        "total_chars": summary.get("total_chars"),
+        "total_est_tokens": summary.get("total_est_tokens"),
+        "progress": progress or None,
+        "chunks": slice_,
+    }
+
+
+@app.get("/api/runs/{run_id}/chunks/{chunk_id}")
+def get_chunk(run_id: str, chunk_id: str) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    path = root / "02_chunk" / "chunks.jsonl"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="chunks.jsonl not found")
+    want = str(chunk_id)
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(row.get("chunk_id") or "") == want:
+            text = row.get("text") or ""
+            if isinstance(text, str):
+                row["text"] = replace_base64_images(text)
+            return row
+    raise HTTPException(status_code=404, detail=f"chunk not found: {chunk_id}")
 
 
 @app.get("/api/runs/{run_id}/conversation")
@@ -374,6 +449,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .badge.ok { color: var(--ok); border-color: #2a6b4f; }
     .badge.error { color: var(--err); border-color: #7a3a3f; }
+    .badge.warn { color: #e0a45c; border-color: #6b5530; }
     section { padding: 16px 20px; overflow: auto; }
     .tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
     .tab {
@@ -571,6 +647,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-family: var(--mono); vertical-align: top;
     }
     .timing-table th { color: var(--muted); font-weight: 500; }
+    .timing-table tr.running td { background: rgba(224, 164, 92, 0.08); }
+    .timing-live {
+      border: 1px solid #6b5530; background: rgba(224, 164, 92, 0.12);
+      border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .timing-live .live-title { color: #e0a45c; font-weight: 600; font-size: 13px; }
+    .timing-live .live-row { font-family: var(--mono); font-size: 12px; }
+    .timing-live .live-row .sess { color: #e0a45c; }
   </style>
 </head>
 <body>
@@ -587,7 +671,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 const state = {
   runs: [], runId: null, tab: "hierarchy",
-  pages: [], agentTree: null, info: null,
+  pages: [], chunks: null, pagesSubtab: "pages",
+  agentTree: null, info: null,
   evalReport: null, evalError: null, evalLoading: false,
 };
 
@@ -648,7 +733,7 @@ function renderRuns() {
     <div class="run ${r.run_id === state.runId ? "active" : ""}" data-id="${esc(r.run_id)}">
       <div class="id">${esc(r.run_id)}</div>
       <div class="sub">
-        <span class="badge ${r.status === "ok" ? "ok" : (r.status === "error" ? "error" : "")}">${esc(r.status)}</span>
+        <span class="badge ${r.status === "ok" ? "ok" : (r.status === "error" ? "error" : (r.status === "running" ? "warn" : ""))}">${esc(r.status)}</span>
         ${r.seconds != null ? r.seconds + "s" : ""} · kv=${r.n_kv ?? "?"} · pages=${r.page_count ?? "?"}
       </div>
       ${evalLine}
@@ -664,8 +749,10 @@ function renderRuns() {
 async function selectRun(runId) {
   state.runId = runId;
   state.tab = "hierarchy";
+  state.pagesSubtab = "pages";
   state.agentTree = null;
   state.pages = [];
+  state.chunks = null;
   state.evalReport = null;
   state.evalError = null;
   state.evalLoading = false;
@@ -679,15 +766,23 @@ async function renderDetail() {
     detail.innerHTML = `<div class="empty">Select a run</div>`;
     return;
   }
+  const keepTab = state.tab;
   detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
-  const [info, pages, agentTree] = await Promise.all([
+  const [info, pagesPayload, agentTree, runs, chunksPayload] = await Promise.all([
     api(`/api/runs/${encodeURIComponent(state.runId)}`),
     api(`/api/runs/${encodeURIComponent(state.runId)}/pages`),
     api(`/api/runs/${encodeURIComponent(state.runId)}/agent-tree`),
+    api("/api/runs"),
+    api(`/api/runs/${encodeURIComponent(state.runId)}/chunks?limit=200`),
   ]);
   state.info = info;
-  state.pages = pages;
+  state.pages = Array.isArray(pagesPayload) ? pagesPayload : (pagesPayload?.pages || []);
+  state.pagesMeta = Array.isArray(pagesPayload) ? null : pagesPayload;
+  state.chunks = chunksPayload;
   state.agentTree = agentTree;
+  state.runs = runs;
+  state.tab = keepTab;
+  renderRuns();
   paintDetail();
 }
 
@@ -695,7 +790,7 @@ function tabsHtml() {
   const tabs = [
     ["hierarchy", "Agent hierarchy"],
     ["timing", "Timing"],
-    ["pages", "Pages"],
+    ["pages", "Pages / Chunks"],
     ["eval", "Eval"],
   ];
   return `<div class="tabs">${tabs.map(([id, label]) =>
@@ -995,12 +1090,35 @@ function renderGenericToolResult(tool) {
   return html;
 }
 
+function formatSearchKeys(tool) {
+  const args = tool.arguments || {};
+  const result = tool.result || {};
+  const so = tool.search_output || {};
+  let keys = args.key ?? args.keys ?? result.key ?? result.accepted ?? so.accepted;
+  if (keys == null || keys === "") return "?";
+  if (Array.isArray(keys)) {
+    const clean = keys.map(k => (typeof k === "object" && k ? (k.key || JSON.stringify(k)) : String(k))).filter(Boolean);
+    if (!clean.length) return "∅";
+    if (clean.length === 1) return clean[0];
+    return `${clean.length} keys · ${clean.join(" · ")}`;
+  }
+  return String(keys);
+}
+
 function renderMasterTool(tool) {
   let inner = `<div class="name">${esc(tool.name)}</div>`;
-  if (tool.name === "search_pages") {
-    const args = tool.arguments || {};
-    const preview = tool.result || tool.result_preview || {};
-    inner += `<div class="tree-kv">key=${esc(args.key || preview.key || "?")}</div>`;
+  if (tool.name === "search_pages" || tool.name === "search_pages_start") {
+    const so = tool.search_output || {};
+    const status = so.status ? ` · ${esc(so.status)}` : "";
+    inner += `<div class="tree-kv">key=${esc(formatSearchKeys(tool))}${status}</div>`;
+    if (Array.isArray(so.accepted) && so.accepted.length) {
+      inner += `<div class="tree-kv" style="margin-top:4px">accepted: ${esc(so.accepted.join(" · "))}</div>`;
+    }
+    inner += (tool.children || []).map(renderSearchAgent).join("");
+  } else if (tool.name === "collect_search_results" || tool.name === "await_searches") {
+    const so = tool.search_output || {};
+    const n = so.n_keys != null ? so.n_keys : ((so.results || so.completed || []).length || null);
+    inner += `<div class="tree-kv">policy=${esc((tool.arguments || {}).policy || "?")}${n != null ? ` · n_keys=${esc(n)}` : ""}</div>`;
     inner += (tool.children || []).map(renderSearchAgent).join("");
   } else if (tool.name === "extract_kv_vlm") {
     inner += renderExtractKvVlm(tool);
@@ -1018,51 +1136,157 @@ function renderTiming() {
 
   const total = timing.total_seconds || 0;
   const summary = timing.summary || {};
+  const active = timing.active_searches || (timing.search_calls || []).filter(sc => sc.status === "running");
+  const pipe = timing.pipeline_progress;
+  const phaseLabel = (sc) => {
+    if (sc.phase === "llm") return "waiting on LLM";
+    if (sc.phase === "tools") return "running tools";
+    if (sc.phase === "starting") return "starting";
+    return "running";
+  };
+  const pipeBanner = pipe ? `
+    <div class="timing-live">
+      <div class="live-title">● ${esc(pipe.label || pipe.stage)}</div>
+      <div class="live-row">
+        stage=${esc(pipe.stage)} · elapsed ${fmtSec(pipe.seconds)}
+        ${pipe.page != null ? ` · page ${esc(pipe.page)}${pipe.total_pages != null ? "/" + esc(pipe.total_pages) : ""}` : ""}
+        ${pipe.strategy ? ` · strategy=${esc(pipe.strategy)}` : ""}
+      </div>
+    </div>` : "";
+  const liveBanner = active.length ? `
+    <div class="timing-live">
+      <div class="live-title">● Now running · ${esc(active.length)} SearchAgent job(s)</div>
+      ${active.map(sc => `
+        <div class="live-row">
+          <span class="sess">session ${esc(sc.current_session ?? "?")} · turn ${esc(sc.current_turn || "?")}</span>
+          · ${esc(phaseLabel(sc))} · master step ${esc(sc.master_step || "?")}
+          · ${esc(sc.key)}
+        </div>`).join("")}
+    </div>` : "";
+
   let html = `<div class="timing-panel">
     <p class="hint">
-      Wall time from <code>timeline.jsonl</code>. Master turn = request → next request.
-      SearchAgent = nested LLM calls inside each <code>search_pages</code>.
+      Wall time from <code>timeline.jsonl</code>.
+      Master turn wall includes nested SearchAgent work started on that step
+      (async search is not just request→next-request).
+      SearchAgent calls are collapsed by default — expand a key to see turns.
     </p>
+    ${pipeBanner}
+    ${liveBanner}
     <div class="tree-kv">
       total ${fmtSec(total)} · master model ${fmtSec(summary.master_llm_seconds)}
       · search model ${fmtSec(summary.search_llm_seconds)}
       · ${esc(summary.search_page_calls || 0)} search_pages
+      ${summary.active_searches ? ` · <span style="color:#e0a45c">${esc(summary.active_searches)} active</span>` : ""}
     </div>
     <h3 style="margin:8px 0 6px">Pipeline stages</h3>
-    ${(timing.stages || []).map(s => renderTimingBar(s.stage, s.seconds, s.pct, s.stage)).join("")}
+    ${(timing.stages || []).map(s => {
+      const label = s.status === "running" ? `${s.stage} (running)` : s.stage;
+      return renderTimingBar(label, s.seconds, s.pct, s.stage);
+    }).join("") || `<div class="empty">No stage events yet</div>`}
     <h3 style="margin:16px 0 6px">Master turns</h3>
-    ${(timing.master_turns || []).map(mt => `
-      <div>
+    ${(timing.master_turns || []).map(mt => {
+      const searchBit = mt.n_search_calls
+        ? ` · search wall ${fmtSec(mt.search_wall_seconds)} (max of ${esc(mt.n_search_calls)}) · search model ${fmtSec(mt.search_llm_seconds)}`
+        : "";
+      return `<div>
         ${renderTimingBar(`Turn ${mt.step}`, mt.wall_seconds, mt.pct, "master")}
-        <div class="timing-sub tree-kv">model ${fmtSec(mt.llm_seconds)} · tools/overhead ${fmtSec(mt.tool_seconds)}${tokenLabel(mt) ? ` · ${esc(tokenLabel(mt))}` : ""}</div>
-      </div>`).join("") || `<div class="empty">No master turns</div>`}
+        <div class="timing-sub tree-kv">model ${fmtSec(mt.llm_seconds)} · tools/overhead ${fmtSec(mt.tool_seconds)}${searchBit}${tokenLabel(mt) ? ` · ${esc(tokenLabel(mt))}` : ""}</div>
+      </div>`;
+    }).join("") || `<div class="empty">No master turns</div>`}
     <h3 style="margin:16px 0 6px">SearchAgent calls</h3>
-    <table class="timing-table">
-      <thead><tr><th>Master step</th><th>Key</th><th>Wall</th><th>Model</th><th>Overhead</th><th>Tokens</th></tr></thead>
-      <tbody>
-        ${(timing.search_calls || []).map(sc => `
-          <tr>
-            <td>${esc(sc.master_step)}</td>
-            <td>${esc(sc.key)}</td>
-            <td>${fmtSec(sc.wall_seconds)}</td>
-            <td>${fmtSec(sc.llm_seconds)}</td>
-            <td>${fmtSec(sc.overhead_seconds)}</td>
-            <td>${esc(sc.n_turns)} turns</td>
-          </tr>
-          ${(sc.sessions || []).map(sess => (sess.turns || []).map(t => `
-            <tr>
-              <td></td>
-              <td style="padding-left:18px">session ${esc(sess.session_index)} · turn ${esc(t.search_turn || t.step)}</td>
-              <td></td>
-              <td>${fmtSec(t.llm_seconds)}</td>
-              <td></td>
-              <td>${esc(tokenLabel(t))}</td>
-            </tr>`).join("")).join("")}
-        `).join("")}
-      </tbody>
-    </table>
+    <div class="timing-search-list" style="display:flex;flex-direction:column;gap:8px">
+      ${(timing.search_calls || []).map(sc => {
+        const running = sc.status === "running";
+        const title = running
+          ? `<span class="tree-badge warn">running</span> session ${esc(sc.current_session ?? "?")} · turn ${esc(sc.current_turn || "?")} · ${esc(sc.key)}`
+          : esc(sc.key);
+        const turnRows = (sc.sessions || []).map(sess => (sess.turns || []).map(t => `
+          <tr class="${t.status === "running" ? "running" : ""}">
+            <td style="padding-left:12px">session ${esc(sess.session_index)} · turn ${esc(t.search_turn || t.step)}${t.status === "running" ? ` <span class="tree-badge warn">now</span>` : ""}</td>
+            <td>${fmtSec(t.llm_seconds)}</td>
+            <td>${esc(tokenLabel(t))}</td>
+          </tr>`).join("")).join("");
+        return `<details class="tree-node search" style="margin:0">
+          <summary>
+            <span class="title">m${esc(sc.master_step)}</span>
+            <span class="tree-kv" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">${title}</span>
+            <span class="tree-badge ${running ? "warn" : ""}">${fmtSec(sc.wall_seconds)}</span>
+            <span class="tree-badge">model ${fmtSec(sc.llm_seconds)}</span>
+            <span class="tree-badge">${esc(sc.n_turns || 0)} turns</span>
+            ${running ? `<span class="tree-badge warn">${esc(phaseLabel(sc))}</span>` : ""}
+          </summary>
+          <div class="tree-body">
+            <div class="tree-kv">overhead ${running ? "—" : fmtSec(sc.overhead_seconds)} · key=${esc(sc.key)}</div>
+            ${turnRows ? `<table class="timing-table" style="margin-top:8px">
+              <thead><tr><th>Turn</th><th>Model</th><th>Tokens</th></tr></thead>
+              <tbody>${turnRows}</tbody>
+            </table>` : `<div class="empty">No turns</div>`}
+          </div>
+        </details>`;
+      }).join("") || `<div class="empty">No SearchAgent calls</div>`}
+    </div>
   </div>`;
   return html;
+}
+
+function renderPagesChunks() {
+  const sub = state.pagesSubtab || "pages";
+  const subTabs = `
+    <div class="tabs" style="margin-bottom:10px">
+      <button class="tab ${sub==="pages"?"active":""}" data-pages-sub="pages">Pages</button>
+      <button class="tab ${sub==="chunks"?"active":""}" data-pages-sub="chunks">Chunks</button>
+    </div>`;
+  if (sub === "chunks") {
+    const ch = state.chunks || {};
+    const rows = ch.chunks || [];
+    const prog = ch.progress;
+    const progLine = prog && prog.status === "running"
+      ? `<div class="timing-live" style="margin-bottom:10px"><div class="live-title">● Chunking (${esc(prog.strategy || "…")})</div></div>`
+      : "";
+    return `${subTabs}
+      ${progLine}
+      <p class="hint">strategy=${esc(ch.strategy || "?")} · ${esc(ch.chunk_count || 0)} chunks
+        · ${esc(ch.total_est_tokens || "?")} est tokens
+        · showing ${esc(rows.length)} / filtered ${esc(ch.filtered_count ?? rows.length)}</p>
+      <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center">
+        <input id="chunkSearch" type="search" placeholder="filter chunk id / heading / page"
+          style="flex:1;min-width:180px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:#0f1419;color:var(--text);font-family:var(--mono);font-size:12px"
+          value="${esc(state.chunkQuery || "")}" />
+        <button type="button" id="chunkSearchBtn" style="padding:4px 12px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--text);font-size:12px;cursor:pointer">Filter</button>
+      </div>
+      <table class="timing-table">
+        <thead><tr><th>chunk_id</th><th>pages</th><th>heading</th><th>chars</th><th>tokens</th><th></th></tr></thead>
+        <tbody>
+          ${rows.map(c => `
+            <tr class="chunk-row" data-chunk-id="${esc(c.chunk_id)}">
+              <td>${esc(c.chunk_id)}</td>
+              <td>${esc((c.pages || [c.page]).join(", "))}${c.page_end && c.page_end !== c.page ? ` → ${esc(c.page_end)}` : ""}</td>
+              <td style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.heading_path || "")}</td>
+              <td>${esc(c.chars)}</td>
+              <td>${esc(c.est_tokens)}</td>
+              <td><button type="button" class="chunk-open" data-chunk-id="${esc(c.chunk_id)}" style="padding:2px 8px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--accent);font-size:11px;cursor:pointer">open</button></td>
+            </tr>`).join("") || `<tr><td colspan="6" class="empty">No chunks yet</td></tr>`}
+        </tbody>
+      </table>`;
+  }
+
+  const prog = state.pagesMeta?.progress;
+  const progLine = prog && prog.status === "running"
+    ? `<div class="timing-live" style="margin-bottom:10px">
+        <div class="live-title">● Parsing page ${esc(prog.page || 0)}${prog.total_pages != null ? "/" + esc(prog.total_pages) : ""}</div>
+      </div>`
+    : "";
+  return `${subTabs}
+    ${progLine}
+    <p class="hint">${esc((state.pages || []).length)} page(s)
+      ${state.pagesMeta?.seconds != null ? ` · parse ${esc(state.pagesMeta.seconds)}s` : ""}</p>
+    <div class="grid2">${(state.pages || []).map(p => `
+      <div>
+        <div class="sub" style="margin-bottom:6px;color:var(--muted)">page ${esc(p.page)} · ${esc(p.chars)} chars · ~${esc(p.est_tokens)} tok</div>
+        <a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(p.md_path)}" target="_blank">open md</a>
+        <pre class="code" data-md="${esc(p.md_path)}" style="max-height:220px"></pre>
+      </div>`).join("") || `<div class="empty">No pages yet — parse may still be running</div>`}</div>`;
 }
 
 function renderMasterOutput() {
@@ -1277,35 +1501,86 @@ function paintDetail() {
   } else if (state.tab === "timing") {
     body = renderTiming();
   } else if (state.tab === "pages") {
-    body = `<div class="grid2">${(state.pages || []).map(p => `
-      <div>
-        <div class="sub" style="margin-bottom:6px;color:var(--muted)">page ${esc(p.page)} · ${esc(p.chars)} chars · ~${esc(p.est_tokens)} tok</div>
-        <a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(p.md_path)}" target="_blank">open md</a>
-        <pre class="code" data-md="${esc(p.md_path)}" style="max-height:220px"></pre>
-      </div>`).join("") || `<div class="empty">No pages</div>`}</div>`;
+    body = renderPagesChunks();
   } else if (state.tab === "eval") {
     body = renderEval();
   }
   detail.innerHTML = `
-    <div class="meta" style="margin-bottom:10px;color:var(--muted)">
+    <div class="meta" style="margin-bottom:10px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <code>${esc(state.runId)}</code>
-      · status=${esc(state.info?.meta?.status)}
+      · status=${esc(state.info?.meta?.status || (state.info?.meta?.finished_at ? "done" : "running"))}
       · ${esc(state.info?.meta?.seconds)}s
+      <button type="button" id="runRefresh" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--text);font-size:12px;cursor:pointer">Refresh</button>
     </div>
     ${tabsHtml()}
     ${body}`;
   detail.querySelectorAll(".tab").forEach(btn => {
     btn.onclick = () => {
+      if (btn.dataset.pagesSub) {
+        state.pagesSubtab = btn.dataset.pagesSub;
+        paintDetail();
+        return;
+      }
       state.tab = btn.dataset.tab;
       paintDetail();
       if (state.tab === "eval") ensureEval(false);
     };
   });
+  const runRefresh = document.getElementById("runRefresh");
+  if (runRefresh) runRefresh.onclick = () => renderDetail();
   const refreshBtn = document.getElementById("evalRefresh");
   if (refreshBtn) refreshBtn.onclick = () => ensureEval(true);
   if (state.tab === "eval" && !state.evalReport && !state.evalLoading && !state.evalError) {
     ensureEval(false);
   }
+  const chunkSearchBtn = document.getElementById("chunkSearchBtn");
+  if (chunkSearchBtn) {
+    const runFilter = async () => {
+      const input = document.getElementById("chunkSearch");
+      state.chunkQuery = input ? input.value : "";
+      const q = encodeURIComponent(state.chunkQuery || "");
+      state.chunks = await api(`/api/runs/${encodeURIComponent(state.runId)}/chunks?limit=200&q=${q}`);
+      paintDetail();
+    };
+    chunkSearchBtn.onclick = runFilter;
+    const input = document.getElementById("chunkSearch");
+    if (input) input.onkeydown = (e) => { if (e.key === "Enter") runFilter(); };
+  }
+  detail.querySelectorAll(".chunk-open").forEach(btn => {
+    btn.onclick = async () => {
+      const id = btn.dataset.chunkId;
+      const dataRow = btn.closest("tr.chunk-row");
+      if (!dataRow) return;
+      // Toggle closed if same preview already open under this row.
+      const existing = dataRow.nextElementSibling;
+      if (existing && existing.classList.contains("chunk-preview-row")
+          && existing.dataset.chunkId === id) {
+        existing.remove();
+        return;
+      }
+      // Remove any other inline previews.
+      detail.querySelectorAll("tr.chunk-preview-row").forEach(r => r.remove());
+      const previewRow = document.createElement("tr");
+      previewRow.className = "chunk-preview-row";
+      previewRow.dataset.chunkId = id;
+      previewRow.innerHTML = `<td colspan="6"><div class="empty">Loading ${esc(id)}…</div></td>`;
+      dataRow.after(previewRow);
+      try {
+        const row = await api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}`);
+        previewRow.innerHTML = `<td colspan="6" style="padding:8px 10px;background:#121820">
+          <details class="tree-node" open style="margin:0">
+            <summary><span class="title">${esc(row.chunk_id)}</span>
+              <span class="tree-badge">${esc((row.pages || [row.page]).join(","))}</span>
+              <span class="tree-kv">${esc(row.heading_path || "")}</span>
+            </summary>
+            <div class="tree-body"><pre class="pretty">${esc(row.text || "")}</pre></div>
+          </details>
+        </td>`;
+      } catch (err) {
+        previewRow.innerHTML = `<td colspan="6"><div class="empty" style="color:var(--err)">${esc(err.message || err)}</div></td>`;
+      }
+    };
+  });
   const openJsonDump = async (relPath) => {
     const data = await api(`/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(relPath)}`);
     const w = window.open("", "_blank");
