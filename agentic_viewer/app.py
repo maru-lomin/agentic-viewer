@@ -1001,6 +1001,31 @@ function fmtSec(v) {
   return n >= 100 ? `${n.toFixed(0)}s` : `${n.toFixed(1)}s`;
 }
 
+function fmtRunClock(relativeSec) {
+  if (relativeSec == null || Number.isNaN(Number(relativeSec))) return "—";
+  const started = state.info?.meta?.started_at;
+  if (!started) {
+    const n = Number(relativeSec);
+    return n >= 100 ? `t+${n.toFixed(0)}s` : `t+${n.toFixed(1)}s`;
+  }
+  const ms = new Date(started).getTime() + Number(relativeSec) * 1000;
+  return new Date(ms).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+}
+
+function masterTurnTimingBadge(timing) {
+  if (!timing) return "";
+  const wall = timing.wall_seconds ?? timing.llm_seconds;
+  if (wall == null) return "";
+  const start = timing.start_t;
+  const end = timing.end_t;
+  const range = (start != null && end != null)
+    ? ` · ${fmtRunClock(start)} → ${fmtRunClock(end)}`
+    : "";
+  return `<span class="tree-badge master">${fmtSec(wall)}${range}</span>`;
+}
+
 function timingBadge(timing, kind="") {
   if (!timing) return "";
   const wall = timing.wall_seconds ?? timing.llm_seconds;
@@ -1028,6 +1053,30 @@ function tokenBadge(node, kind="") {
   const label = tokenLabel(node);
   if (!label) return "";
   return `<span class="tree-badge ${kind}">${esc(label)}</span>`;
+}
+
+function fmtTok(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  return Number(n).toLocaleString();
+}
+
+function masterTurnTokenBadges(mt) {
+  const label = tokenLabel(mt);
+  let html = "";
+  if (label) {
+    html += `<span class="tree-badge master" title="Master LLM usage for this turn (out = assistant/tool-call generation)">${esc(label)}</span>`;
+  }
+  const toolMsgs = mt.tool_message_est_tokens;
+  if (toolMsgs != null && toolMsgs > 0) {
+    html += `<span class="tree-badge" title="Estimated tokens appended as tool-role messages before the next Master turn">tool msgs≈${fmtTok(toolMsgs)}</span>`;
+  }
+  return html;
+}
+
+function toolMessageTokenHint(tool) {
+  const n = tool.message_est_tokens;
+  if (n == null) return "";
+  return ` · tool message≈${fmtTok(n)} tok (added to conversation)`;
 }
 
 function renderTimingBar(label, seconds, pct, cls="") {
@@ -1357,6 +1406,7 @@ function renderExtractKvVlm(tool) {
 function renderGenericToolResult(tool) {
   const args = tool.arguments || {};
   const result = tool.result != null ? tool.result : tool.result_preview;
+  const tokenHint = toolMessageTokenHint(tool);
   let html = "";
   if (args && Object.keys(args).length) {
     html += `<div class="viz-section" style="margin-top:6px">
@@ -1372,6 +1422,9 @@ function renderGenericToolResult(tool) {
   }
   if (!html) {
     html = `<div class="tree-kv">No arguments or result recorded.</div>`;
+  }
+  if (tokenHint) {
+    html += `<div class="tree-kv" style="margin-top:4px">${esc(tokenHint.replace(/^ · /, ""))}</div>`;
   }
   return html;
 }
@@ -1391,6 +1444,84 @@ function formatSearchKeys(tool) {
   return String(keys);
 }
 
+function failurePhaseLabel(phase) {
+  const labels = {
+    llm_request: "Master LLM API call failed (no assistant response received)",
+    tool_execution: "Tool execution failed after assistant tool calls",
+    response_processing: "Failed while processing assistant response / final JSON",
+    unknown: "Turn failed",
+  };
+  return labels[phase] || labels.unknown;
+}
+
+function shortenErrorMessage(err) {
+  if (!err) return "";
+  const text = String(err);
+  const msgMatch = text.match(/'message':\s*"([^"]+)"/);
+  if (msgMatch) return msgMatch[1];
+  const altMatch = text.match(/"message":\s*"([^"]+)"/);
+  if (altMatch) return altMatch[1];
+  return text.length > 500 ? text.slice(0, 500) + "…" : text;
+}
+
+function renderRequestTail(tail) {
+  if (!tail || !tail.length) return "";
+  const rows = tail.map((m, i) => {
+    const tools = (m.tool_calls || []).filter(Boolean);
+    const toolBit = tools.length ? `<div class="tree-kv">tools: ${esc(tools.join(", "))}</div>` : "";
+    const preview = m.content_preview
+      ? `<pre class="pretty" style="max-height:120px;margin:4px 0 0">${esc(m.content_preview)}</pre>`
+      : `<div class="tree-kv" style="color:var(--muted)">(no text content)</div>`;
+    return `<div class="flow-item ${esc(m.role)}" style="margin-top:6px">
+      <div class="label">${esc(m.role)}${tail.length > 1 ? ` · tail ${i + 1}/${tail.length}` : ""}</div>
+      ${toolBit}
+      ${preview}
+    </div>`;
+  }).join("");
+  return `<div class="viz-section" style="margin-top:8px">
+    <h3 style="margin:0 0 4px">Request tail (messages sent to LLM)</h3>
+    ${rows}
+  </div>`;
+}
+
+function renderMasterTurnFailure(mt) {
+  if (!mt.error && !(mt.request_summary || {}).n_messages) return "";
+  const phase = mt.failure_phase || (mt.error ? "unknown" : "");
+  const req = mt.request_summary || {};
+  const roles = req.roles || {};
+  const roleBits = Object.entries(roles).map(([r, n]) => `${r}=${n}`).join(" · ");
+  const stats = [
+    req.n_messages != null ? `${req.n_messages} messages` : null,
+    roleBits || null,
+    mt.prompt_est_tokens != null ? `prompt≈${mt.prompt_est_tokens}` : null,
+    mt.budget_est_total != null ? `budget≈${mt.budget_est_total}` : null,
+    mt.max_tokens != null ? `max_tokens=${mt.max_tokens}` : null,
+    mt.n_tools != null ? `${mt.n_tools} tools` : null,
+    mt.tool_choice ? `tool_choice=${mt.tool_choice}` : null,
+  ].filter(Boolean).join(" · ");
+  const errShort = shortenErrorMessage(mt.error);
+  const assistant = (mt.assistant_content || "").trim();
+  return `<div class="viz-section master-failure" style="margin:4px 0 8px">
+    ${phase ? `<div class="tree-kv" style="color:var(--err);margin-bottom:6px"><b>${esc(failurePhaseLabel(phase))}</b></div>` : ""}
+    ${errShort ? `<pre class="pretty" style="max-height:160px;border-color:#7a3a3f">${esc(errShort)}</pre>` : ""}
+    ${stats ? `<div class="tree-kv" style="margin-top:8px">Request: ${esc(stats)}</div>` : ""}
+    ${assistant ? `<div class="viz-section" style="margin-top:8px">
+      <h3 style="margin:0 0 4px">Partial assistant output</h3>
+      <pre class="pretty" style="max-height:160px">${esc(assistant)}</pre>
+    </div>` : ""}
+    ${renderRequestTail(req.tail)}
+    ${mt.filename ? `<div class="tree-kv" style="margin-top:8px"><a href="#" data-step="${esc(mt.filename)}">open step JSON</a></div>` : ""}
+  </div>`;
+}
+
+function renderMasterTurnBody(mt) {
+  const tools = (mt.tools || []).map(renderMasterTool).join("");
+  if (tools) return tools;
+  const failure = renderMasterTurnFailure(mt);
+  if (failure) return failure;
+  return `<div class="empty">No tools on this turn</div>`;
+}
+
 function renderMasterTool(tool) {
   let inner = `<div class="name">${esc(tool.name)}</div>`;
   if (tool.name === "search_pages" || tool.name === "search_pages_start") {
@@ -1404,7 +1535,7 @@ function renderMasterTool(tool) {
   } else if (tool.name === "collect_search_results" || tool.name === "await_searches") {
     const so = tool.search_output || {};
     const n = so.n_keys != null ? so.n_keys : ((so.results || so.completed || []).length || null);
-    inner += `<div class="tree-kv">policy=${esc((tool.arguments || {}).policy || "?")}${n != null ? ` · n_keys=${esc(n)}` : ""}</div>`;
+    inner += `<div class="tree-kv">policy=${esc((tool.arguments || {}).policy || "?")}${n != null ? ` · n_keys=${esc(n)}` : ""}${toolMessageTokenHint(tool)}</div>`;
     inner += (tool.children || []).map(renderSearchAgent).join("");
   } else if (tool.name === "extract_kv_vlm") {
     inner += renderExtractKvVlm(tool);
@@ -1688,12 +1819,12 @@ function renderAgentHierarchy() {
       <summary>
         <span class="title">Master turn ${esc(mt.step)}</span>
         ${err}
-        ${timingBadge(mt.timing, "master")}
-        ${tokenBadge(mt, "master")}
+        ${masterTurnTimingBadge(mt.timing)}
+        ${masterTurnTokenBadges(mt)}
         ${toolNames.map(n => `<span class="pill">${esc(n)}</span>`).join("")}
       </summary>
       <div class="tree-body">
-        ${(mt.tools || []).map(renderMasterTool).join("") || `<div class="empty">No tools on this turn</div>`}
+        ${renderMasterTurnBody(mt)}
       </div>
     </details>`;
   }

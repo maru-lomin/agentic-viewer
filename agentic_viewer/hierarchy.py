@@ -250,19 +250,118 @@ def _extract_submit_output(tool_results: List[Dict[str, Any]]) -> Optional[Dict[
     return None
 
 
+def _preview_text(value: Any, limit: int = 300) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... ({len(text) - limit} more chars)"
+
+
+def _estimate_text_tokens(text: str, *, chars_per_token: float = 4.0) -> int:
+    if not text:
+        return 0
+    return max(1, int(len(text) / max(1.0, float(chars_per_token))))
+
+
+def _tool_message_content(
+    tr: Dict[str, Any], messages_after: Optional[List[Dict[str, Any]]] = None
+) -> str:
+    """Serialized tool role message as appended to the Master conversation."""
+    tool_call_id = tr.get("tool_call_id")
+    for m in messages_after or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool" and m.get("tool_call_id") == tool_call_id:
+            content = m.get("content")
+            if isinstance(content, str):
+                return content
+    preview = tr.get("result_preview")
+    if preview is None:
+        return ""
+    if isinstance(preview, str):
+        return preview
+    return json.dumps(preview, ensure_ascii=False, default=str)
+
+
+def _compact_tool_result(
+    tr: Dict[str, Any], *, messages_after: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    message_content = _tool_message_content(tr, messages_after)
+    message_chars = len(message_content)
+    return {
+        "name": tr.get("name"),
+        "arguments": tr.get("arguments"),
+        "tool_call_id": tr.get("tool_call_id"),
+        "result_preview": tr.get("result_preview"),
+        "message_chars": message_chars or None,
+        "message_est_tokens": _estimate_text_tokens(message_content) or None,
+    }
+
+
+def _summarize_request_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compact request payload for failed / empty master turns in the viewer."""
+    roles: Dict[str, int] = {}
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "?")
+        roles[role] = roles.get(role, 0) + 1
+
+    tail: List[Dict[str, Any]] = []
+    for m in messages[-4:]:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "?")
+        entry: Dict[str, Any] = {"role": role}
+        content = m.get("content")
+        if isinstance(content, str) and content.strip():
+            entry["content_preview"] = _preview_text(content, 320)
+        tool_calls = m.get("tool_calls") or []
+        if tool_calls:
+            entry["tool_calls"] = [
+                (tc.get("function") or {}).get("name")
+                for tc in tool_calls
+                if isinstance(tc, dict)
+            ]
+        tail.append(entry)
+
+    return {
+        "n_messages": len(messages),
+        "roles": roles,
+        "tail": tail,
+    }
+
+
+def _infer_failure_phase(step: Dict[str, Any]) -> Optional[str]:
+    if not step.get("error"):
+        return None
+    assistant = step.get("assistant") or {}
+    tool_calls = assistant.get("tool_calls") or []
+    tool_results = step.get("tool_results") or []
+    if not tool_calls and not tool_results:
+        return "llm_request"
+    if tool_calls and not tool_results:
+        return "tool_execution"
+    if assistant.get("content") and not tool_calls:
+        return "response_processing"
+    return "unknown"
+
+
 def _compact_step(step: Dict[str, Any], *, filename: str) -> Dict[str, Any]:
     assistant = step.get("assistant") or {}
     tool_calls = assistant.get("tool_calls") or []
     tool_results = step.get("tool_results") or []
+    messages_after = step.get("messages_after") or []
     compact_tool_results = [
-        {
-            "name": tr.get("name"),
-            "arguments": tr.get("arguments"),
-            "result_preview": tr.get("result_preview"),
-        }
+        _compact_tool_result(tr, messages_after=messages_after)
         for tr in tool_results
         if isinstance(tr, dict)
     ]
+    tool_message_est_tokens = sum(
+        int(tr.get("message_est_tokens") or 0) for tr in compact_tool_results
+    )
     return {
         "filename": filename,
         "step": step.get("step"),
@@ -284,9 +383,17 @@ def _compact_step(step: Dict[str, Any], *, filename: str) -> Dict[str, Any]:
             if isinstance(tc, dict)
         ],
         "tool_results": compact_tool_results,
+        "tool_message_est_tokens": tool_message_est_tokens or None,
         "submit_output": _extract_submit_output(compact_tool_results),
         # Keep first user message for prior_context reconstruction (legacy runs).
         "first_user_content": _first_user_content(step.get("request_messages") or []),
+        "request_summary": _summarize_request_messages(
+            step.get("request_messages") or []
+        ),
+        "budget_est_total": step.get("budget_est_total"),
+        "tool_choice": step.get("tool_choice"),
+        "n_tools": len(step.get("tools") or []),
+        "failure_phase": _infer_failure_phase(step),
     }
 
 
@@ -1377,11 +1484,19 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
         node: Dict[str, Any] = {
             "type": "master_turn",
             "step": mstep,
+            "filename": ms.get("filename"),
             "prompt_est_tokens": ms.get("prompt_est_tokens"),
             "input_tokens": ms.get("input_tokens"),
             "output_tokens": ms.get("output_tokens"),
             "max_tokens": ms.get("max_tokens"),
+            "budget_est_total": ms.get("budget_est_total"),
+            "tool_choice": ms.get("tool_choice"),
+            "n_tools": ms.get("n_tools"),
             "error": ms.get("error"),
+            "failure_phase": ms.get("failure_phase"),
+            "request_summary": ms.get("request_summary"),
+            "assistant_content": ms.get("assistant_content"),
+            "tool_message_est_tokens": ms.get("tool_message_est_tokens"),
             "assistant": ms.get("tool_calls"),
             "tools": [],
         }
@@ -1407,6 +1522,8 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                 "tool_index": ti,
                 "arguments": tr.get("arguments"),
                 "result_preview": preview,
+                "message_est_tokens": tr.get("message_est_tokens"),
+                "message_chars": tr.get("message_chars"),
                 "result": result,
                 "filename": filename,
                 "extra_files": extra_files,

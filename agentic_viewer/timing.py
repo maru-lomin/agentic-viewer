@@ -494,6 +494,8 @@ def _master_turn_timings(
         rows.append(
             {
                 "step": step,
+                "start_t": _round_secs(start),
+                "end_t": _round_secs(start + wall),
                 "wall_seconds": _round_secs(wall),
                 "span_seconds": _round_secs(span),
                 "llm_seconds": _round_secs(llm),
