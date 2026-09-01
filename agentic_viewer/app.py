@@ -1053,7 +1053,7 @@ function renderMasterPrompts(prompts) {
   const sys = prompts.system;
   const user = prompts.user;
   if (!sys && !user) return "";
-  return `<details class="tree-node master-prompts" open>
+  return `<details class="tree-node master-prompts">
     <summary>
       <span class="title">Master prompts</span>
       <span class="tree-badge">system + user</span>
