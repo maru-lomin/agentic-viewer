@@ -777,6 +777,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .tree-node.master > summary { border-left: 4px solid var(--accent); }
     .tree-node.search > summary { border-left: 4px solid #e0a45c; margin-left: 16px; }
     .tree-node.session > summary { border-left: 4px solid #9b7bd4; margin-left: 32px; }
+    .tree-node.session.shared > summary { border-left: 4px solid #7eb8da; margin-left: 32px; }
+    .tree-node.key-result > summary { border-left: 4px solid #5a9b6a; margin-left: 32px; }
     .tree-node.turn > summary { border-left: 4px solid #6b7c93; margin-left: 48px; }
     .tree-node.output > summary { border-left: 4px solid #3ecf8e; }
     .tree-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -1074,23 +1076,28 @@ function renderSearchSession(session, opts = {}) {
   const statusCls = status === "complete" ? "ok"
     : (status === "not_found" || String(status).startsWith("handoff") ? "warn" : "");
   const pages = session.pages || [];
+  const shared = session.shared || opts.shared;
   const hasIn = session.prior_context_in != null;
-  // Single-session searches already expose progress via turns; hide redundant
-  // prior_context_out snapshot. Keep it only when a later session may consume it.
   const nSessions = opts.nSessions || 1;
   const isHandoff = String(status).startsWith("handoff");
   const showPriorOut = nSessions > 1 || isHandoff;
   const showHandoffSummary = showPriorOut && !!session.handoff_summary;
   const showPriorOutBox = showPriorOut && session.prior_context_out != null;
   const hasOut = showHandoffSummary || showPriorOutBox;
-  return `<details class="tree-node session">
+  const title = shared
+    ? (nSessions <= 1
+      ? `Shared search (${esc(turns.length)} turn(s))`
+      : `Shared search session ${esc(session.session_index)} (${esc(turns.length)} turn(s))`)
+    : `Search session ${esc(session.session_index)}`;
+  const sessionCls = shared ? "session shared" : "session";
+  return `<details class="tree-node ${sessionCls}">
     <summary>
-      <span class="title">Search session ${esc(session.session_index)}</span>
-      ${session.key ? `<span class="tree-kv">${esc(session.key)}</span>` : ""}
+      <span class="title">${title}</span>
+      ${!shared && session.key ? `<span class="tree-kv">${esc(session.key)}</span>` : ""}
       ${status ? `<span class="tree-badge ${statusCls}">${esc(status)}</span>` : ""}
-      <span class="tree-badge">${esc(turns.length)} turn(s)</span>
+      ${!shared ? `<span class="tree-badge">${esc(turns.length)} turn(s)</span>` : ""}
       ${timingBadge(session.timing)}
-      ${pages.length ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>` : ""}
+      ${!shared && pages.length ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>` : ""}
       ${hasIn ? `<span class="tree-badge">received prior</span>` : ""}
       ${hasOut ? `<span class="tree-badge warn">handoff out</span>` : ""}
       ${err}
@@ -1141,6 +1148,41 @@ function renderSearchOutput(output) {
   </div>`;
 }
 
+function renderKeyResultRow(kr) {
+  const pages = kr.pages || [];
+  const status = kr.status || "?";
+  const statusCls = status === "complete" ? "ok"
+    : (status === "not_found" || String(status).startsWith("handoff") ? "warn" : "");
+  const reasons = kr.page_reasons || kr.reasons || {};
+  return `<details class="tree-node key-result">
+    <summary>
+      <span class="tree-kv">${esc(kr.key)}</span>
+      <span class="tree-badge ${statusCls}">${esc(status)}</span>
+      ${pages.length ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>` : `<span class="tree-badge warn">pages=∅</span>`}
+    </summary>
+    <div class="tree-body">
+      ${kr.reason ? `<div class="tree-kv">reason=${esc(kr.reason)}</div>` : ""}
+      ${renderPageReasonsTable(reasons) || (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 800))}</pre>` : "")}
+      ${kr.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(kr.filename)}">open per-key dump</a></div>` : ""}
+    </div>
+  </details>`;
+}
+
+function renderKeyResultsSection(keyResults) {
+  if (!keyResults || !keyResults.length) return "";
+  const nResolved = keyResults.filter(kr =>
+    ["complete", "not_found", "handoff", "handoff_no_candidates"].includes(String(kr.status || ""))
+  ).length;
+  return `<div class="viz-section" style="margin:8px 0">
+    <h3 style="margin:0 0 6px">Key results (${esc(nResolved)}/${esc(keyResults.length)} resolved)</h3>
+    <p class="hint" style="margin:0 0 8px">
+      Per-key pages from <code>submit_pages</code> / <code>no_relevant_pages</code>.
+      Turns above are shared across all keys in this batch.
+    </p>
+    ${keyResults.map(renderKeyResultRow).join("")}
+  </div>`;
+}
+
 function renderSearchAgent(node) {
   const res = node.result || {};
   const output = node.output || {
@@ -1148,31 +1190,57 @@ function renderSearchAgent(node) {
     page_reasons: res.page_reasons || res.reasons || {},
     status: res.status,
   };
+  const shared = !!(node.shared || (node.batch && (node.key_results || []).length > 1));
+  const keyResults = node.key_results || [];
+  const sessions = node.sessions || [];
+  const nTurns = res.n_search_steps
+    ?? sessions.reduce((n, s) => n + ((s.turns || []).length), 0);
+  const nRuntimeSessions = res.n_search_sessions || sessions.length || 0;
   const pages = output.pages || res.pages || [];
   const status = output.status || res.status || (pages.length ? "complete" : "unknown");
   const statusCls = status === "complete" ? "ok"
     : (status === "not_found" || String(status).startsWith("handoff") ? "warn" : "");
-  const sessions = node.sessions || [];
+  const nResolved = output.n_resolved ?? res.n_resolved;
+  const nKeys = output.n_keys ?? res.n_keys ?? keyResults.length;
+  const summaryBadge = shared
+    ? (nResolved != null && nKeys
+      ? `<span class="tree-badge ok">${esc(nResolved)}/${esc(nKeys)} keys</span>`
+      : `<span class="tree-badge">${esc(nKeys)} keys</span>`)
+    : (pages.length
+      ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>`
+      : `<span class="tree-badge warn">pages=∅</span>`);
+  const sharedHint = shared
+    ? `<p class="hint" style="margin:4px 0 8px">
+        One shared SearchAgent ReAct loop for ${esc(nKeys)} keys
+        (${esc(nRuntimeSessions || 1)} runtime session(s), ${esc(nTurns)} turn(s)).
+        <code>submit_pages</code> / <code>no_relevant_pages</code> output per key is below.
+      </p>`
+    : `<p class="hint" style="margin:4px 0 8px">
+        Turn-by-turn tool calls below. Final <code>submit_pages</code> /
+        <code>no_relevant_pages</code> output is shown on the last turn.
+      </p>`;
   return `<details class="tree-node search">
     <summary>
       <span class="title">SearchAgent</span>
       <span class="tree-badge ${statusCls}">${esc(status)}</span>
       <span class="tree-kv">${esc(node.key)}</span>
       ${timingBadge(node.timing, "warn")}
-      ${pages.length ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>` : `<span class="tree-badge warn">pages=∅</span>`}
+      ${summaryBadge}
     </summary>
     <div class="tree-body">
-      ${renderSearchOutput(output)}
+      ${shared ? "" : renderSearchOutput(output)}
       <div class="tree-kv">
-        ${res.n_search_sessions ? `sessions=${esc(res.n_search_sessions)} · steps=${esc(res.n_search_steps)}` : ""}
+        ${nRuntimeSessions ? `runtime sessions=${esc(nRuntimeSessions)} · turns=${esc(nTurns)}` : ""}
+        ${shared && nKeys ? ` · keys=${esc(nKeys)}` : ""}
       </div>
       ${node.note ? `<div class="tree-kv">${esc(node.note)}</div>` : ""}
-      <p class="hint" style="margin:4px 0 8px">
-        Turn-by-turn tool calls below. Final <code>submit_pages</code> /
-        <code>no_relevant_pages</code> output is shown on the last turn.
-      </p>
-      ${sessions.length ? sessions.map(s => renderSearchSession(s, { nSessions: sessions.length })).join("") :
+      ${sharedHint}
+      ${sessions.length ? sessions.map(s => renderSearchSession(s, {
+        nSessions: sessions.length,
+        shared,
+      })).join("") :
         `<div class="tree-kv">Search turn dumps not linked (legacy run).</div>`}
+      ${shared ? renderKeyResultsSection(keyResults) : ""}
     </div>
   </details>`;
 }
@@ -1564,7 +1632,8 @@ function renderAgentHierarchy() {
   }
   let html = `<p class="hint">
     <b>Agent hierarchy</b> = Master LLM turns → tools → nested SearchAgent sessions.<br/>
-    Each <code>search_pages</code> call expands into SearchAgent session(s) with their own turns.
+    Each <code>search_pages</code> call expands into a SearchAgent node.
+    Multi-key batches share one ReAct loop; single-key searches show one session per handoff.
   </p><div class="tree">`;
 
   for (const mt of tree.master_turns) {

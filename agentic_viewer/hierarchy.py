@@ -956,6 +956,89 @@ def _flatten_sessions_as_turns(
     return turns
 
 
+def _dedupe_search_steps(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep one row per search step dump (shared multi-key batches reuse labels)."""
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        ident = str(row.get("filename") or row.get("label") or id(row))
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(row)
+    out.sort(
+        key=lambda s: (
+            int(s.get("master_step") or 0),
+            int(s.get("search_session") or 1),
+            int(s.get("search_turn") or 0),
+            int(s.get("step") or 0),
+        )
+    )
+    return out
+
+
+def _recover_shared_search_steps(
+    *,
+    batch_items: List[Dict[str, Any]],
+    calls_by_key: Dict[str, Optional[Dict[str, Any]]],
+    search_by_prefix: Dict[str, List[Dict[str, Any]]],
+    master_step: int,
+    key_batch_prefixes: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Recover the shared ReAct turn list for a multi-key SearchAgent batch.
+
+    All keys in one ``search_pages`` call share one trace label prefix and one
+    turn sequence; per-key dumps only carry final pages/status.
+    """
+    merged: List[Dict[str, Any]] = []
+    batch_prefix = ""
+    for call in calls_by_key.values():
+        if not call:
+            continue
+        merged.extend(call.get("search_steps") or [])
+        if not batch_prefix:
+            batch_prefix = str(call.get("batch_prefix") or "")
+    merged = _dedupe_search_steps(merged)
+    if merged:
+        return merged, batch_prefix
+
+    if not batch_prefix:
+        for call in calls_by_key.values():
+            if call and call.get("batch_prefix"):
+                batch_prefix = str(call["batch_prefix"])
+                break
+    if not batch_prefix:
+        for item in batch_items:
+            key = str(item.get("key") or "")
+            batch_prefix = key_batch_prefixes.get(key) or ""
+            if batch_prefix:
+                break
+
+    if batch_prefix:
+        rows = _rows_for_batch_prefix(
+            search_by_prefix, batch_prefix, master_step=master_step
+        )
+        if not rows:
+            rows = _rows_for_batch_prefix(
+                search_by_prefix, batch_prefix, master_step=0
+            )
+        if rows:
+            return rows, batch_prefix
+
+    # Last resort: union per-key prefix matches (may over-include on legacy runs).
+    fallback: List[Dict[str, Any]] = []
+    for item in batch_items:
+        key = str(item.get("key") or "")
+        if not key:
+            continue
+        fallback.extend(
+            _search_rows_for_key(search_by_prefix, key, master_step=master_step)
+            or _search_rows_for_key(search_by_prefix, key, master_step=0)
+        )
+    return _dedupe_search_steps(fallback), batch_prefix
+
+
 def _build_batch_search_agent(
     *,
     batch_items: List[Dict[str, Any]],
@@ -966,64 +1049,29 @@ def _build_batch_search_agent(
     key_batch_prefixes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    One SearchAgent node with session_index 1..N = one key each (parallel).
+    One SearchAgent node for a multi-key ``search_pages`` batch.
 
-    Consumes matching per-key calls from step_call_queue by key. If a per-key
-    dump is missing, rebuild turns from search step files for that key_prefix.
+    Runtime model: keys share one ReAct loop (optionally several handoff
+    sessions). Turns are attached once; per-key pages/page_reasons live in
+    ``key_results``.
     """
     search_by_prefix = search_by_prefix or {}
     key_batch_prefixes = key_batch_prefixes or {}
-    sessions: List[Dict[str, Any]] = []
-    for i, item in enumerate(batch_items):
+    key_results: List[Dict[str, Any]] = []
+    calls_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    for item in batch_items:
         if not isinstance(item, dict):
             continue
         key = str(item.get("key") or "")
+        if not key:
+            continue
         call = None
         for j, cand in enumerate(step_call_queue):
             if str(cand.get("key") or "") == key:
                 call = step_call_queue.pop(j)
                 break
-
-        display_idx = i + 1
-        turns: List[Dict[str, Any]] = []
-        if call and (call.get("search_sessions") or []):
-            turns = _flatten_sessions_as_turns(
-                call.get("search_sessions") or [],
-                display_session_index=display_idx,
-            )
-        elif key:
-            # Recover when the per-key dump was overwritten / missing.
-            # Match single-key prefixes and multi-key batch tags (joined keys).
-            rows = _search_rows_for_key(
-                search_by_prefix, key, master_step=master_step
-            )
-            if not rows:
-                # Async jobs may still be writing; ignore master_step filter.
-                rows = _search_rows_for_key(search_by_prefix, key, master_step=0)
-            if not rows:
-                # Keys beyond the first 3 are omitted from batch tags; use the
-                # prefix embedded in the per-key dump / label map instead.
-                batch_prefix = str(
-                    (call or {}).get("batch_prefix")
-                    or key_batch_prefixes.get(key)
-                    or ""
-                )
-                rows = _rows_for_batch_prefix(
-                    search_by_prefix, batch_prefix, master_step=master_step
-                )
-                if not rows:
-                    rows = _rows_for_batch_prefix(
-                        search_by_prefix, batch_prefix, master_step=0
-                    )
-            if rows:
-                recovered = _group_search_sessions(
-                    rows,
-                    key_prefix=_safe_key(key),
-                    master_step=master_step,
-                )
-                turns = _flatten_sessions_as_turns(
-                    recovered, display_session_index=display_idx
-                )
+        calls_by_key[key] = call
 
         pages = item.get("pages")
         if pages is None and call:
@@ -1031,54 +1079,100 @@ def _build_batch_search_agent(
         page_reasons = item.get("page_reasons")
         if page_reasons is None and call:
             page_reasons = (call.get("output") or {}).get("page_reasons")
+        if not isinstance(page_reasons, dict):
+            page_reasons = {}
         status = item.get("status")
         if not status and call:
             status = (call.get("output") or {}).get("status") or (
                 call.get("result") or {}
             ).get("status")
         if not status:
-            status = "complete" if turns else default_status
+            status = default_status
 
-        sessions.append(
+        key_results.append(
             {
-                "session_index": display_idx,
                 "key": key,
-                "n_turns": len(turns),
-                "turns": turns,
                 "status": status or default_status,
                 "pages": pages if pages is not None else [],
-                "page_reasons": page_reasons if isinstance(page_reasons, dict) else {},
-                "reasons": page_reasons if isinstance(page_reasons, dict) else {},
+                "page_reasons": page_reasons,
+                "reasons": page_reasons,
                 "reason": item.get("reason")
                 or ((call or {}).get("output") or {}).get("reason")
                 or "",
-                "prior_context_in": None,
-                "prior_context_out": None,
-                "handoff_summary": "",
-                "error": next(
-                    (t.get("error") for t in turns if t.get("error")), None
-                ),
                 "filename": (call or {}).get("filename"),
             }
         )
 
+    shared_steps, batch_prefix = _recover_shared_search_steps(
+        batch_items=batch_items,
+        calls_by_key=calls_by_key,
+        search_by_prefix=search_by_prefix,
+        master_step=master_step,
+        key_batch_prefixes=key_batch_prefixes,
+    )
+    shared_sessions = _group_search_sessions(
+        shared_steps,
+        key_prefix=batch_prefix or _safe_key(
+            str((batch_items[0] or {}).get("key") or "")
+        ),
+        master_step=master_step,
+    )
+    n_turns = sum(len(s.get("turns") or []) for s in shared_sessions)
+    n_runtime_sessions = len(shared_sessions) or 1
+    n_keys = len(key_results)
+    is_shared_batch = n_keys > 1
+
+    if is_shared_batch:
+        for sess in shared_sessions:
+            sess["shared"] = True
+            sess.pop("key", None)
+            sess.pop("pages", None)
+            sess.pop("page_reasons", None)
+            sess.pop("reasons", None)
+    elif n_keys == 1 and key_results and shared_sessions:
+        kr = key_results[0]
+        shared_sessions[0]["key"] = kr["key"]
+        shared_sessions[0]["pages"] = kr.get("pages") or []
+        shared_sessions[0]["page_reasons"] = kr.get("page_reasons") or {}
+        shared_sessions[0]["reasons"] = kr.get("page_reasons") or {}
+        shared_sessions[0]["status"] = kr.get("status") or default_status
+        shared_sessions[0]["reason"] = kr.get("reason") or ""
+
+    terminal = {"complete", "not_found", "handoff", "handoff_no_candidates"}
+    n_resolved = sum(
+        1 for kr in key_results if str(kr.get("status") or "") in terminal
+    )
+    batch_status = (
+        "complete"
+        if n_resolved == n_keys and n_keys
+        else ("accepted" if default_status in {"accepted", "running", "queued"} else default_status)
+    )
+
     return {
         "type": "search_agent",
-        "key": f"{len(sessions)} keys (parallel)",
+        "key": (
+            f"{n_keys} keys (shared)"
+            if is_shared_batch
+            else (key_results[0]["key"] if key_results else "?")
+        ),
         "batch": True,
+        "shared": is_shared_batch,
+        "key_results": key_results,
         "output": {
-            "status": "complete",
+            "status": batch_status,
             "pages": [],
             "page_reasons": {},
-            "n_keys": len(sessions),
+            "n_keys": n_keys,
+            "n_resolved": n_resolved,
         },
         "result": {
-            "status": "complete",
-            "n_search_sessions": len(sessions),
-            "n_keys": len(sessions),
-            "n_search_steps": sum(s.get("n_turns") or 0 for s in sessions),
+            "status": batch_status,
+            "n_search_sessions": n_runtime_sessions,
+            "n_keys": n_keys,
+            "n_resolved": n_resolved,
+            "n_search_steps": n_turns,
         },
-        "sessions": sessions,
+        "sessions": shared_sessions,
     }
 
 
@@ -1244,6 +1338,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
             tool_node: Dict[str, Any] = {
                 "type": "tool",
                 "name": tname,
+                "tool_index": ti,
                 "arguments": tr.get("arguments"),
                 "result_preview": preview,
                 "result": result,

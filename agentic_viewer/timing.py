@@ -1039,6 +1039,195 @@ def _parse_timing_search_label(
     return None
 
 
+def _normalize_trace_label(label: Any) -> str:
+    return str(label or "").strip()
+
+
+def _timing_turn_payload(tt: Dict[str, Any]) -> Dict[str, Any]:
+    llm = tt.get("llm_seconds")
+    return {
+        "llm_seconds": llm,
+        "wall_seconds": llm,
+        "input_tokens": tt.get("input_tokens"),
+        "output_tokens": tt.get("output_tokens"),
+        "prompt_est_tokens": tt.get("prompt_est_tokens"),
+    }
+
+
+def _merge_timing_turn_rows(matched_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Dedupe timing turns across matched search call rows (async collect)."""
+    merged: List[Dict[str, Any]] = []
+    seen: set[Tuple[int, int, str]] = set()
+    for row in matched_rows:
+        for tt in row.get("turns") or []:
+            if not isinstance(tt, dict):
+                continue
+            ident = (
+                int(tt.get("search_session") or 1),
+                int(tt.get("search_turn") or tt.get("step") or 0),
+                _normalize_trace_label(tt.get("label")),
+            )
+            if ident in seen:
+                continue
+            seen.add(ident)
+            merged.append(dict(tt))
+    merged.sort(
+        key=lambda t: (
+            int(t.get("search_session") or 1),
+            int(t.get("search_turn") or t.get("step") or 0),
+            float(t.get("start_t") or 0),
+        )
+    )
+    return merged
+
+
+def _lookup_timing_turn(
+    turn: Dict[str, Any],
+    src_turns: List[Dict[str, Any]],
+    *,
+    used: set[int],
+) -> Optional[Dict[str, Any]]:
+    """
+    Match a hierarchy turn to a timing row by label, then session/turn, then step.
+    """
+    label = _normalize_trace_label(turn.get("label"))
+    filename = _normalize_trace_label(turn.get("filename"))
+    sess = int(
+        turn.get("search_session")
+        or turn.get("handoff_session_index")
+        or 1
+    )
+    search_turn = int(turn.get("search_turn") or turn.get("step") or 0)
+    step = int(turn.get("step") or 0)
+
+    if label:
+        for i, tt in enumerate(src_turns):
+            if i in used:
+                continue
+            if _normalize_trace_label(tt.get("label")) == label:
+                used.add(i)
+                return tt
+        for i, tt in enumerate(src_turns):
+            if i in used:
+                continue
+            tl = _normalize_trace_label(tt.get("label"))
+            if tl and tl in filename:
+                used.add(i)
+                return tt
+
+    for i, tt in enumerate(src_turns):
+        if i in used:
+            continue
+        tt_sess = int(tt.get("search_session") or 1)
+        tt_turn = int(tt.get("search_turn") or tt.get("step") or 0)
+        if tt_sess == sess and tt_turn == search_turn:
+            used.add(i)
+            return tt
+
+    for i, tt in enumerate(src_turns):
+        if i in used:
+            continue
+        if int(tt.get("search_session") or 1) == sess and int(tt.get("step") or 0) == step:
+            used.add(i)
+            return tt
+
+    return None
+
+
+def _attach_session_turn_timings(
+    sess: Dict[str, Any],
+    src_turns: List[Dict[str, Any]],
+    *,
+    shared: bool = False,
+) -> None:
+    """Attach per-turn LLM timings using label / search_turn keys."""
+    used: set[int] = set()
+    matched_llm = 0.0
+    n_matched = 0
+    for turn in sess.get("turns") or []:
+        if not isinstance(turn, dict):
+            continue
+        tt = _lookup_timing_turn(turn, src_turns, used=used)
+        if tt is None:
+            continue
+        turn["timing"] = _timing_turn_payload(tt)
+        matched_llm += float(tt.get("llm_seconds") or 0)
+        n_matched += 1
+
+    sess_timing = dict(sess.get("timing") or {})
+    sess_timing.update(
+        {
+            "n_turns": len(sess.get("turns") or []),
+            "n_turns_timed": n_matched,
+            "shared": shared,
+        }
+    )
+    if n_matched:
+        sess_timing["llm_seconds"] = _round_secs(matched_llm)
+    sess["timing"] = sess_timing
+
+
+def _batch_keys_from_tool(tool: Dict[str, Any]) -> List[str]:
+    args = tool.get("arguments") or {}
+    raw = args.get("key")
+    if raw is None:
+        raw = args.get("keys")
+    if isinstance(raw, list):
+        return [str(k) for k in raw if str(k).strip()]
+    if isinstance(raw, str) and raw.strip():
+        return [raw.strip()]
+    result = tool.get("result") or {}
+    for field in ("results", "completed", "started", "accepted"):
+        rows = result.get(field)
+        if not isinstance(rows, list):
+            continue
+        keys = [
+            str(x.get("key") or x)
+            for x in rows
+            if (isinstance(x, dict) and x.get("key")) or str(x).strip()
+        ]
+        if keys:
+            return keys
+    return []
+
+
+def _cand_row_keys(cand: Dict[str, Any]) -> set[str]:
+    keys = {
+        str(k.get("key") or k)
+        for k in (cand.get("keys") or [])
+        if (isinstance(k, dict) and k.get("key")) or str(k).strip()
+    }
+    if not keys and cand.get("key"):
+        keys = {str(cand.get("key"))}
+    return keys
+
+
+def _partition_search_call_rows(
+    active_queue: List[Dict[str, Any]],
+    *,
+    batch_set: set[str],
+    master_step: int,
+    tool_index: Optional[int],
+    require_tool_index: bool,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    matched: List[Dict[str, Any]] = []
+    remain: List[Dict[str, Any]] = []
+    for cand in active_queue:
+        if batch_set and not (_cand_row_keys(cand) & batch_set):
+            remain.append(cand)
+            continue
+        if master_step and int(cand.get("master_step") or 0) not in (0, master_step):
+            remain.append(cand)
+            continue
+        if require_tool_index and tool_index is not None:
+            cand_idx = cand.get("tool_index")
+            if cand_idx is not None and int(cand_idx) != int(tool_index):
+                remain.append(cand)
+                continue
+        matched.append(cand)
+    return matched, remain
+
+
 def attach_timing_to_tree(
     tree: Dict[str, Any], timing: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -1066,7 +1255,7 @@ def attach_timing_to_tree(
             mt["timing"] = mt_timing
 
         call_queue = list(search_queues.get(step) or [])
-        for tool in mt.get("tools") or []:
+        for ti, tool in enumerate(mt.get("tools") or []):
             tname = tool.get("name")
             if tname not in {
                 "search_pages",
@@ -1075,6 +1264,9 @@ def attach_timing_to_tree(
                 "search_pages_start",
             }:
                 continue
+            tool_index = tool.get("tool_index")
+            if tool_index is None:
+                tool_index = ti
             # Prefer same-step queue; fall back to unmatched global for async collect.
             active_queue = (
                 unmatched_search_calls
@@ -1086,51 +1278,22 @@ def attach_timing_to_tree(
                 "search_pages_start",
             }:
                 continue
-            args_key = (tool.get("arguments") or {}).get("key")
-            batch_keys: List[str] = []
-            if isinstance(args_key, list):
-                batch_keys = [str(k) for k in args_key if str(k).strip()]
-            elif isinstance((tool.get("result") or {}).get("results"), list):
-                batch_keys = [
-                    str(x.get("key") or "")
-                    for x in (tool.get("result") or {}).get("results")
-                    if isinstance(x, dict) and x.get("key")
-                ]
-            elif isinstance((tool.get("result") or {}).get("completed"), list):
-                batch_keys = [
-                    str(x.get("key") or "")
-                    for x in (tool.get("result") or {}).get("completed")
-                    if isinstance(x, dict) and x.get("key")
-                ]
-            elif isinstance((tool.get("result") or {}).get("started"), list):
-                batch_keys = [
-                    str(x.get("key") or "")
-                    for x in (tool.get("result") or {}).get("started")
-                    if isinstance(x, dict) and x.get("key")
-                ]
+            batch_keys = _batch_keys_from_tool(tool)
+            require_tool_index = tname in {"search_pages", "search_pages_start"}
 
             for child in tool.get("children") or []:
                 if child.get("type") != "search_agent":
                     continue
 
                 if child.get("batch") and batch_keys:
-                    # One timing row per shared SearchAgent session; a collect
-                    # may cover keys from several sessions — aggregate those.
                     batch_set = {str(k) for k in batch_keys if str(k).strip()}
-                    matched_rows: List[Dict[str, Any]] = []
-                    remain: List[Dict[str, Any]] = []
-                    for cand in active_queue:
-                        cand_keys = {
-                            str(k.get("key") or k)
-                            for k in (cand.get("keys") or [])
-                            if (isinstance(k, dict) and k.get("key")) or str(k).strip()
-                        }
-                        if not cand_keys and cand.get("key"):
-                            cand_keys = {str(cand.get("key"))}
-                        if cand_keys & batch_set:
-                            matched_rows.append(cand)
-                        else:
-                            remain.append(cand)
+                    matched_rows, remain = _partition_search_call_rows(
+                        active_queue,
+                        batch_set=batch_set,
+                        master_step=step,
+                        tool_index=int(tool_index),
+                        require_tool_index=require_tool_index,
+                    )
                     active_queue[:] = remain
                     if not matched_rows:
                         continue
@@ -1142,65 +1305,44 @@ def attach_timing_to_tree(
                         "wall_seconds": _round_secs(wall),
                         "llm_seconds": _round_secs(llm),
                         "overhead_seconds": _round_secs(max(0.0, wall - llm)),
-                        "pct": matched_rows[0].get("pct") if len(matched_rows) == 1 else None,
+                        "pct": matched_rows[0].get("pct")
+                        if len(matched_rows) == 1
+                        else None,
                         "n_keys": sum(int(m.get("n_keys") or 0) for m in matched_rows),
                         "shared": any(m.get("shared") for m in matched_rows)
                         or len(matched_rows) > 1,
                     }
-                    # Prefer turns from the session that covers each key.
-                    by_key_turns: Dict[str, List[Dict[str, Any]]] = {}
-                    shared_turns = matched_rows[0].get("turns") or []
-                    for m in matched_rows:
-                        turns = m.get("turns") or []
-                        for ko in m.get("keys") or []:
-                            kname = str(ko.get("key") or "")
-                            if kname:
-                                by_key_turns[kname] = turns
+                    src_turns = _merge_timing_turn_rows(matched_rows)
+                    is_shared = bool(child["timing"].get("shared"))
                     for sess in child.get("sessions") or []:
-                        sk = str(sess.get("key") or "")
-                        src_turns = by_key_turns.get(sk) or shared_turns
-                        sess["timing"] = {
-                            "n_turns": len(sess.get("turns") or []) or len(src_turns),
-                            "shared": True if child["timing"].get("shared") else False,
-                        }
-                        for ti, turn in enumerate(sess.get("turns") or []):
-                            if ti < len(src_turns):
-                                tt = src_turns[ti]
-                                turn["timing"] = {
-                                    "llm_seconds": tt.get("llm_seconds"),
-                                    "input_tokens": tt.get("input_tokens"),
-                                    "output_tokens": tt.get("output_tokens"),
-                                    "prompt_est_tokens": tt.get("prompt_est_tokens"),
-                                }
+                        _attach_session_turn_timings(
+                            sess,
+                            src_turns,
+                            shared=is_shared,
+                        )
                     continue
 
                 # Single-key search_pages (legacy / one key).
-                tool_key = str(args_key or "") if not isinstance(args_key, list) else ""
-                if not tool_key and isinstance((tool.get("result") or {}), dict):
-                    one = (tool.get("result") or {}).get("key")
-                    if one:
-                        tool_key = str(one)
-                if not tool_key:
-                    completed = (tool.get("result") or {}).get("completed") or []
-                    if (
-                        isinstance(completed, list)
-                        and completed
-                        and isinstance(completed[0], dict)
-                    ):
-                        tool_key = str(completed[0].get("key") or "")
+                tool_key = batch_keys[0] if len(batch_keys) == 1 else ""
                 call_timing = None
                 if tool_key:
-                    for idx, cand in enumerate(active_queue):
-                        cand_keys = [
-                            str(k.get("key") or k)
-                            for k in (cand.get("keys") or [])
-                            if (isinstance(k, dict) and k.get("key")) or str(k).strip()
-                        ]
-                        if not cand_keys and cand.get("key"):
-                            cand_keys = [str(cand.get("key"))]
-                        if tool_key in cand_keys or str(cand.get("key") or "") == tool_key:
-                            call_timing = active_queue.pop(idx)
-                            break
+                    matched_rows, remain = _partition_search_call_rows(
+                        active_queue,
+                        batch_set={tool_key},
+                        master_step=step if require_tool_index else 0,
+                        tool_index=int(tool_index),
+                        require_tool_index=require_tool_index,
+                    )
+                    if matched_rows:
+                        call_timing = matched_rows[0]
+                        if require_tool_index:
+                            active_queue[:] = remain
+                        else:
+                            # Global collect pool: drop only the claimed row.
+                            try:
+                                unmatched_search_calls.remove(call_timing)
+                            except ValueError:
+                                pass
                 if call_timing is None and active_queue and tname == "search_pages":
                     call_timing = active_queue.pop(0)
                 if call_timing is None:
@@ -1211,6 +1353,7 @@ def attach_timing_to_tree(
                     "overhead_seconds": call_timing.get("overhead_seconds"),
                     "pct": call_timing.get("pct"),
                 }
+                src_turns = list(call_timing.get("turns") or [])
                 sessions_by_index = {
                     int(s.get("session_index") or 1): s
                     for s in call_timing.get("sessions") or []
@@ -1218,47 +1361,10 @@ def attach_timing_to_tree(
                 for sess in child.get("sessions") or []:
                     sess_idx = int(sess.get("session_index") or 1)
                     st = sessions_by_index.get(sess_idx)
-                    if not st:
-                        # Shared-session row: attach flattened turns by order.
-                        src_turns = call_timing.get("turns") or []
-                        sess["timing"] = {
-                            "n_turns": len(sess.get("turns") or [])
-                            or call_timing.get("n_turns"),
-                        }
-                        for ti, turn in enumerate(sess.get("turns") or []):
-                            if ti < len(src_turns):
-                                tt = src_turns[ti]
-                                turn["timing"] = {
-                                    "llm_seconds": tt.get("llm_seconds"),
-                                    "input_tokens": tt.get("input_tokens"),
-                                    "output_tokens": tt.get("output_tokens"),
-                                    "prompt_est_tokens": tt.get("prompt_est_tokens"),
-                                }
-                        continue
-                    sess["timing"] = {
-                        "llm_seconds": st.get("llm_seconds"),
-                        "n_turns": st.get("n_turns"),
-                    }
-                    turns_by_key = {
-                        (
-                            int(t.get("search_turn") or t.get("step") or 0),
-                            int(t.get("step") or 0),
-                        ): t
-                        for t in st.get("turns") or []
-                    }
-                    for turn in sess.get("turns") or []:
-                        tk = (
-                            int(turn.get("search_turn") or turn.get("step") or 0),
-                            int(turn.get("step") or 0),
-                        )
-                        tt = turns_by_key.get(tk)
-                        if tt:
-                            turn["timing"] = {
-                                "llm_seconds": tt.get("llm_seconds"),
-                                "input_tokens": tt.get("input_tokens"),
-                                "output_tokens": tt.get("output_tokens"),
-                                "prompt_est_tokens": tt.get("prompt_est_tokens"),
-                            }
+                    session_turns = (
+                        list(st.get("turns") or []) if st else src_turns
+                    )
+                    _attach_session_turn_timings(sess, session_turns, shared=False)
 
     tree["timing"] = timing
     return tree
