@@ -3,12 +3,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-# Default: sibling inference-pipeline runs dir when present.
+# Default: shared repo outputs/runs (see ../outputs/README.md).
 if [[ -z "${AGENTIC_RUNS_DIR:-}" ]]; then
-  SIBLING="$ROOT/../inference-pipeline/outputs/runs"
-  if [[ -d "$SIBLING" || -d "$ROOT/../inference-pipeline" ]]; then
-    mkdir -p "$SIBLING"
-    export AGENTIC_RUNS_DIR="$(cd "$SIBLING" && pwd)"
+  SHARED="$ROOT/../outputs/runs"
+  LEGACY="$ROOT/../inference-pipeline/outputs/runs"
+  if [[ -d "$SHARED" || -d "$ROOT/../outputs" ]]; then
+    mkdir -p "$SHARED"
+    export AGENTIC_RUNS_DIR="$(cd "$SHARED" && pwd)"
+  elif [[ -d "$LEGACY" || -d "$ROOT/../inference-pipeline" ]]; then
+    mkdir -p "$LEGACY"
+    export AGENTIC_RUNS_DIR="$(cd "$LEGACY" && pwd)"
   else
     mkdir -p "$ROOT/runs"
     export AGENTIC_RUNS_DIR="$ROOT/runs"

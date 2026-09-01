@@ -10,20 +10,27 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from agentic_viewer.eval.evaluate_kv import build_report, load_json
 from agentic_viewer.eval.paths import answer_sheet_path
+from agentic_viewer.evaluation.agentic_client import AgenticEvalError, invoke_agentic_eval
+from agentic_viewer.evaluation.batch import make_batch_manager
+from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
+from agentic_viewer.evaluation.summary import (
+    agentic_eval_summary,
+    build_evaluation_summary,
+    read_agentic_evals,
+)
+from agentic_viewer.evaluation_page import EVALUATION_HTML
 from agentic_viewer.hierarchy import build_agent_tree
 from agentic_viewer.image_tokens import replace_base64_images
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
 
-import urllib.error
-import urllib.request
-
 def default_runs_root() -> Path:
-    """Prefer sibling inference-pipeline outputs, else ./runs."""
+    """Prefer shared repo outputs/runs, else legacy inference-pipeline path."""
     here = Path(__file__).resolve()
+    repo_root = here.parents[2]
     candidates = [
-        here.parents[2] / "inference-pipeline" / "outputs" / "runs",
+        repo_root / "outputs" / "runs",
+        repo_root / "inference-pipeline" / "outputs" / "runs",
         Path.cwd() / "runs",
         here.parents[1] / "runs",
     ]
@@ -44,80 +51,34 @@ INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "http://127.0.0.1:8010")
 )
 # run_id -> currently evaluating key (serial per run in the viewer too)
 _AGENTIC_EVAL_INFLIGHT: Dict[str, str] = {}
+_BATCH_MANAGER = make_batch_manager(
+    RUNS_ROOT,
+    INFERENCE_API_URL,
+    _AGENTIC_EVAL_INFLIGHT,
+)
 
 app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0")
 
 
 def _list_agentic_evals(run_id: str) -> Dict[str, Any]:
     root = _run_dir(run_id)
-    out_dir = root / "06_agentic_eval"
-    by_key: Dict[str, Any] = {}
-    if not out_dir.is_dir():
-        return {"by_key": by_key, "inflight": _AGENTIC_EVAL_INFLIGHT.get(run_id)}
-    for path in sorted(out_dir.glob("*.json")):
-        if path.name.endswith(".status.json"):
-            continue
-        data = _read_json(path)
-        if not isinstance(data, dict):
-            continue
-        key = data.get("key")
-        if not key:
-            continue
-        by_key[str(key)] = data
-    # Merge running status files that may not have a result yet.
-    for path in out_dir.glob("*.status.json"):
-        status = _read_json(path)
-        if not isinstance(status, dict):
-            continue
-        key = status.get("key")
-        if not key:
-            continue
-        key = str(key)
-        if key not in by_key and status.get("status") == "running":
-            by_key[key] = status
     return {
-        "by_key": by_key,
+        "by_key": read_agentic_evals(root),
         "inflight": _AGENTIC_EVAL_INFLIGHT.get(run_id),
     }
 
 
 def _call_inference_agentic_eval(run_id: str, key: str) -> Dict[str, Any]:
-    payload = json.dumps(
-        {
-            "run_id": run_id,
-            "key": key,
-            "hooks": "agentic-evaluation_config",
-            "protocol": "grpc",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        f"{INFERENCE_API_URL}/agentic-eval",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=1800) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(detail)
-            if isinstance(parsed, dict) and "detail" in parsed:
-                detail = str(parsed["detail"])
-        except Exception:
-            pass
-        raise HTTPException(status_code=exc.code, detail=detail) from exc
-    except urllib.error.URLError as exc:
+    active = _BATCH_MANAGER.get_active_job()
+    if active and active.status == "running" and run_id in active.run_ids:
         raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Cannot reach inference API at {INFERENCE_API_URL}/agentic-eval: "
-                f"{exc.reason}. Set INFERENCE_API_URL or start the API "
-                "(inference-pipeline/run_api.sh)."
-            ),
-        ) from exc
+            status_code=409,
+            detail=f"batch agentic-evaluation job {active.job_id} is running for this run",
+        )
+    try:
+        return invoke_agentic_eval(INFERENCE_API_URL, run_id, key)
+    except AgenticEvalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 def _run_dir(run_id: str) -> Path:
@@ -148,32 +109,16 @@ def _eval_summary(report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _eval_cache_has_reason_split(report: Dict[str, Any]) -> bool:
-    """True when cached eval separates VLM evidence vs SearchAgent reasons."""
-    per_key = report.get("per_key")
-    if not isinstance(per_key, list) or not per_key:
-        return False
-    first = per_key[0]
-    if not isinstance(first, dict):
-        return False
-    return "search_reasons" in first
-
-
 def _compute_run_eval(run_id: str, *, refresh: bool = False) -> Dict[str, Any]:
     root = _run_dir(run_id)
-    cache_path = root / "05_eval.json"
-    if cache_path.is_file() and not refresh:
-        cached = _read_json(cache_path)
-        if (
-            isinstance(cached, dict)
-            and cached.get("overall")
-            and _eval_cache_has_reason_split(cached)
-        ):
-            return cached
+    report = load_or_compute_run_eval(
+        root, run_id=run_id, refresh=refresh, write_cache=True
+    )
+    if report is not None:
+        return report
 
     pred_path = root / "04_result.json"
-    pred = _read_json(pred_path)
-    if not isinstance(pred, dict):
+    if not _read_json(pred_path):
         raise HTTPException(status_code=404, detail="04_result.json not found")
 
     ans_path = answer_sheet_path()
@@ -182,30 +127,7 @@ def _compute_run_eval(run_id: str, *, refresh: bool = False) -> Dict[str, Any]:
             status_code=404,
             detail=f"answer sheet not found: {ans_path}",
         )
-    answer_sheet = load_json(ans_path)
-    if not isinstance(answer_sheet, dict):
-        raise HTTPException(status_code=500, detail="invalid answer sheet JSON")
-
-    try:
-        report = build_report(
-            pred,
-            answer_sheet,
-            pred_path=str(pred_path),
-            answer_sheet_path=str(ans_path),
-        )
-    except (KeyError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    report["run_id"] = run_id
-    try:
-        cache_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        # Runs dir may be read-only; still return the scored report.
-        report["cache_write_error"] = str(cache_path)
-    return report
+    raise HTTPException(status_code=400, detail="could not score run against answer sheet")
 
 
 @app.get("/api/runs")
@@ -217,7 +139,15 @@ def list_runs() -> List[Dict[str, Any]]:
             continue
         meta = _read_json(child / "meta.json") or {}
         result = _read_json(child / "04_result.json") or {}
-        eval_cached = _read_json(child / "05_eval.json")
+        eval_report = load_or_compute_run_eval(
+            child, run_id=child.name, write_cache=True
+        )
+        gold_keys: List[str] = []
+        if isinstance(eval_report, dict):
+            for row in eval_report.get("per_key") or []:
+                if isinstance(row, dict) and "key" in row:
+                    gold_keys.append(str(row["key"]))
+        agentic_by_key = read_agentic_evals(child)
         status = meta.get("status")
         if not status:
             status = "running" if not meta.get("finished_at") else "unknown"
@@ -230,8 +160,9 @@ def list_runs() -> List[Dict[str, Any]]:
                 "seconds": meta.get("seconds"),
                 "n_kv": len(result.get("kv_results") or []),
                 "page_count": (result.get("meta") or {}).get("page_count"),
-                "eval_summary": _eval_summary(
-                    eval_cached if isinstance(eval_cached, dict) else None
+                "eval_summary": _eval_summary(eval_report),
+                "agentic_eval_summary": agentic_eval_summary(
+                    agentic_by_key, gold_keys
                 ),
             }
         )
@@ -328,6 +259,65 @@ def get_agentic_evals(run_id: str) -> Dict[str, Any]:
     return _list_agentic_evals(run_id)
 
 
+@app.get("/api/evaluation/summary")
+def get_evaluation_summary(run_ids: str = "") -> Dict[str, Any]:
+    """Aggregate cached baseline + agentic eval across multiple runs."""
+    ids = [x.strip() for x in run_ids.split(",") if x.strip()]
+    if not ids:
+        return build_evaluation_summary([], RUNS_ROOT)
+    try:
+        return build_evaluation_summary(ids, RUNS_ROOT)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/evaluation/batch-jobs/active")
+def get_active_batch_job() -> Dict[str, Any]:
+    job = _BATCH_MANAGER.get_active_job()
+    if job is None:
+        return {"active": False, "job": None}
+    return {"active": True, "job": job.to_dict()}
+
+
+@app.get("/api/evaluation/batch-jobs/{job_id}")
+def get_batch_job(job_id: str) -> Dict[str, Any]:
+    job = _BATCH_MANAGER.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+    return job.to_dict()
+
+
+@app.post("/api/evaluation/batch-agentic-eval")
+def post_batch_agentic_eval(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """
+    Run agentic-evaluation for all keys across selected runs (background job).
+
+    Body: {run_ids: [...], skip_existing?: true}
+    """
+    run_ids = body.get("run_ids") or []
+    if not isinstance(run_ids, list):
+        raise HTTPException(status_code=400, detail="run_ids must be a list")
+    skip_existing = bool(body.get("skip_existing", True))
+    try:
+        job = _BATCH_MANAGER.start(run_ids, skip_existing=skip_existing)
+        return job.to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/evaluation/batch-jobs/{job_id}/cancel")
+def cancel_batch_job(job_id: str) -> Dict[str, Any]:
+    try:
+        job = _BATCH_MANAGER.cancel(job_id)
+        return job.to_dict()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.post("/api/runs/{run_id}/agentic-eval")
 def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
@@ -347,6 +337,13 @@ def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str
         raise HTTPException(
             status_code=409,
             detail=f"agentic-evaluation already running for key={inflight!r}",
+        )
+
+    active = _BATCH_MANAGER.get_active_job()
+    if active and active.status == "running" and run_id in active.run_ids:
+        raise HTTPException(
+            status_code=409,
+            detail=f"batch agentic-evaluation job {active.job_id} is running for this run",
         )
 
     _AGENTIC_EVAL_INFLIGHT[run_id] = key
@@ -535,7 +532,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Agentic Run Trace</title>
+  <title>Agentic Viewer — Inference</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -559,11 +556,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-family: var(--sans); min-height: 100vh;
     }
     header {
-      padding: 16px 20px; border-bottom: 1px solid var(--line);
-      display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+      padding: 14px 20px; border-bottom: 1px solid var(--line);
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
     }
     header h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
-    header .meta { color: var(--muted); font-size: 13px; }
+    header .meta { color: var(--muted); font-size: 13px; margin-left: auto; }
+    .topnav { display: flex; gap: 4px; }
+    .topnav a {
+      color: var(--muted); text-decoration: none; font-size: 13px;
+      padding: 6px 12px; border-radius: 999px; border: 1px solid transparent;
+    }
+    .topnav a:hover { color: var(--text); border-color: var(--line); }
+    .topnav a.active {
+      color: var(--text); background: var(--panel); border-color: var(--line);
+    }
     main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 58px); }
     aside {
       border-right: 1px solid var(--line); overflow: auto; background: #121820;
@@ -832,7 +838,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <header>
-    <h1>Agentic Run Trace</h1>
+    <h1>Agentic Viewer</h1>
+    <nav class="topnav">
+      <a href="/" class="active">Inference</a>
+      <a href="/evaluation">Evaluation</a>
+    </nav>
     <div class="meta" id="headerMeta">Loading runs…</div>
   </header>
   <main>
@@ -848,6 +858,8 @@ const state = {
   agentTree: null, info: null,
   evalReport: null, evalError: null, evalLoading: false,
   agenticEvals: {}, agenticEvalInflight: null, agenticEvalError: null,
+  evalOpenDetails: new Set(),
+  batchJob: null, batchPollTimer: null,
 };
 
 async function api(path) {
@@ -903,6 +915,10 @@ function renderRuns() {
     const evalLine = es
       ? `<div class="eval-mini">EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)} · evidF1 ${fmtPct(es.evidence_token_f1)}</div>`
       : "";
+    const ae = r.agentic_eval_summary;
+    const agenticLine = ae && ae.n_total
+      ? `<div class="eval-mini">agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · acc ${fmtPct(ae.accuracy)}` : ""}</div>`
+      : "";
     return `
     <div class="run ${r.run_id === state.runId ? "active" : ""}" data-id="${esc(r.run_id)}">
       <div class="id">${esc(r.run_id)}</div>
@@ -911,6 +927,7 @@ function renderRuns() {
         ${r.seconds != null ? r.seconds + "s" : ""} · kv=${r.n_kv ?? "?"} · pages=${r.page_count ?? "?"}
       </div>
       ${evalLine}
+      ${agenticLine}
     </div>`;
   }).join("") || `<div class="empty" style="padding:16px">No runs in outputs/runs</div>`;
   el.querySelectorAll(".run").forEach(node => {
@@ -933,6 +950,9 @@ async function selectRun(runId) {
   state.agenticEvals = {};
   state.agenticEvalInflight = null;
   state.agenticEvalError = null;
+  state.evalOpenDetails = new Set();
+  state.batchJob = null;
+  stopBatchPoll();
   renderRuns();
   await renderDetail();
 }
@@ -1026,6 +1046,29 @@ function renderHandoffBox(title, payload) {
     <h3 style="margin:0 0 4px">${esc(title)}</h3>
     <pre class="pretty">${esc(pretty(payload, 3500))}</pre>
   </div>`;
+}
+
+function renderMasterPrompts(prompts) {
+  if (!prompts) return "";
+  const sys = prompts.system;
+  const user = prompts.user;
+  if (!sys && !user) return "";
+  return `<details class="tree-node master-prompts" open>
+    <summary>
+      <span class="title">Master prompts</span>
+      <span class="tree-badge">system + user</span>
+    </summary>
+    <div class="tree-body">
+      ${sys ? `<div class="flow-item system" style="margin-bottom:8px">
+        <div class="label">System prompt</div>
+        <pre class="pretty" style="max-height:320px;margin:4px 0 0">${esc(sys)}</pre>
+      </div>` : ""}
+      ${user ? `<div class="flow-item user">
+        <div class="label">User prompt</div>
+        <pre class="pretty" style="max-height:200px;margin:4px 0 0">${esc(user)}</pre>
+      </div>` : ""}
+    </div>
+  </details>`;
 }
 
 function renderSearchTurn(turn) {
@@ -1636,6 +1679,8 @@ function renderAgentHierarchy() {
     Multi-key batches share one ReAct loop; single-key searches show one session per handoff.
   </p><div class="tree">`;
 
+  html += renderMasterPrompts(tree.master_prompts);
+
   for (const mt of tree.master_turns) {
     const err = mt.error ? `<span class="tree-badge err">ERROR</span>` : "";
     const toolNames = (mt.tools || []).map(t => t.name).filter(Boolean);
@@ -1668,6 +1713,23 @@ function renderAgentHierarchy() {
   return html;
 }
 
+
+function evalDetailAttrs(kind, key) {
+  const id = `${kind}:${key}`;
+  const open = state.evalOpenDetails.has(id) ? " open" : "";
+  return ` data-eval-detail="${esc(id)}"${open}`;
+}
+
+function bindEvalDetailToggles(root) {
+  root.querySelectorAll("[data-eval-detail]").forEach(el => {
+    el.addEventListener("toggle", () => {
+      const id = el.getAttribute("data-eval-detail");
+      if (!id) return;
+      if (el.open) state.evalOpenDetails.add(id);
+      else state.evalOpenDetails.delete(id);
+    });
+  });
+}
 
 function renderEval() {
   if (state.evalLoading) {
@@ -1713,7 +1775,7 @@ function renderEval() {
       agenticCell = `
         <div class="agentic-eval-verdict ${verdictCls}">${esc(verdictLabel)}</div>
         ${summary ? `<div class="agentic-eval-summary">${esc(summary)}</div>` : ""}
-        ${detail ? `<div class="agentic-eval-detail"><details>
+        ${detail ? `<div class="agentic-eval-detail"><details${evalDetailAttrs("agentic", row.key)}>
           <summary>detail</summary>
           <div class="agentic-eval-text">${esc(detail)}</div>
         </details></div>` : ""}`;
@@ -1735,7 +1797,7 @@ function renderEval() {
       <td>
         <div><b>pred</b> ${esc(row.value?.pred ?? "")}</div>
         <div><b>gold</b> ${esc(row.value?.gold ?? "")}</div>
-        <details>
+        <details${evalDetailAttrs("evidence", row.key)}>
           <summary>VLM evidence · Search reasons</summary>
           <div class="ev-block">
             <span class="ev-label vlm">VLM evidence_quote</span>
@@ -1759,6 +1821,25 @@ function renderEval() {
     ? `<p class="hint" style="color:var(--err)">Agentic eval: ${esc(state.agenticEvalError)}</p>`
     : "";
 
+  const batch = state.batchJob;
+  const batchActive = batch && (batch.status === "queued" || batch.status === "running");
+  const batchForRun = batch && batch.run_ids && batch.run_ids.includes(state.runId);
+  let batchHtml = "";
+  if (batchForRun && batch) {
+    const pct = batch.progress_pct ?? (batch.total ? Math.round(100 * batch.completed / batch.total) : 0);
+    const cur = batch.current
+      ? ` · ${esc(batch.current.key)}`
+      : "";
+    batchHtml = `
+      <div class="hint" style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#152033">
+        Batch agentic eval: <b>${esc(batch.status)}</b>
+        ${batch.completed}/${batch.total} (${pct}%)${cur}
+        ${batchActive ? `<button type="button" class="tab" id="batchCancel" style="margin-left:8px">Cancel</button>` : ""}
+      </div>`;
+  }
+
+  const allKeysDisabled = !!state.agenticEvalInflight || batchActive;
+
   return `
     <p class="hint">
       Baseline metrics vs <code>dataset/answer_sheet.json</code>.
@@ -1766,7 +1847,10 @@ function renderEval() {
       Evid F1 uses <b>VLM evidence_quote</b> only; SearchAgent <b>page_reasons</b> are shown separately.
       Agentic-evaluation runs serially via the inference API and saves under <code>06_agentic_eval/</code>.
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
+      <button type="button" class="agentic-eval-btn" id="evalAllKeys"
+        style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Evaluate all keys</button>
     </p>
+    ${batchHtml}
     ${aeErr}
     <div class="score-grid">${cards}</div>
     <table class="eval-table">
@@ -1827,6 +1911,7 @@ async function ensureAgenticEvals() {
 
 async function runAgenticEval(key) {
   if (!state.runId || !key || state.agenticEvalInflight) return;
+  if (state.batchJob && (state.batchJob.status === "queued" || state.batchJob.status === "running")) return;
   state.agenticEvalInflight = key;
   state.agenticEvalError = null;
   state.agenticEvals = {
@@ -1859,6 +1944,95 @@ async function runAgenticEval(key) {
   } finally {
     state.agenticEvalInflight = null;
     await ensureAgenticEvals();
+    paintDetail();
+  }
+}
+
+async function apiPost(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+  if (!r.ok) throw new Error(data.detail || text || r.statusText);
+  return data;
+}
+
+function stopBatchPoll() {
+  if (state.batchPollTimer) {
+    clearInterval(state.batchPollTimer);
+    state.batchPollTimer = null;
+  }
+}
+
+async function pollInferenceBatchJob() {
+  if (!state.batchJob?.job_id) return;
+  try {
+    state.batchJob = await api(`/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}`);
+    await ensureAgenticEvals();
+    paintDetail();
+    if (state.batchJob.status === "running" || state.batchJob.status === "queued") return;
+    stopBatchPoll();
+    state.runs = await api("/api/runs");
+    renderRuns();
+  } catch (err) {
+    state.agenticEvalError = String(err.message || err);
+    stopBatchPoll();
+    paintDetail();
+  }
+}
+
+function startBatchPoll() {
+  stopBatchPoll();
+  state.batchPollTimer = setInterval(pollInferenceBatchJob, 2000);
+}
+
+async function resumeInferenceBatchJob() {
+  try {
+    const data = await api("/api/evaluation/batch-jobs/active");
+    if (data.active && data.job && (data.job.run_ids || []).includes(state.runId)) {
+      state.batchJob = data.job;
+      if (state.batchJob.status === "running" || state.batchJob.status === "queued") {
+        startBatchPoll();
+      }
+    }
+  } catch (_) {}
+}
+
+async function runAllAgenticEvals() {
+  if (!state.runId) return;
+  if (state.batchJob && (state.batchJob.status === "queued" || state.batchJob.status === "running")) return;
+  state.agenticEvalError = null;
+  try {
+    state.batchJob = await apiPost("/api/evaluation/batch-agentic-eval", {
+      run_ids: [state.runId],
+      skip_existing: true,
+    });
+    paintDetail();
+    if (state.batchJob.status === "running" || state.batchJob.status === "queued") {
+      startBatchPoll();
+    } else {
+      await ensureAgenticEvals();
+      paintDetail();
+    }
+  } catch (err) {
+    state.agenticEvalError = String(err.message || err);
+    paintDetail();
+  }
+}
+
+async function cancelInferenceBatch() {
+  if (!state.batchJob?.job_id) return;
+  try {
+    state.batchJob = await apiPost(
+      `/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}/cancel`, {}
+    );
+    paintDetail();
+  } catch (err) {
+    state.agenticEvalError = String(err.message || err);
     paintDetail();
   }
 }
@@ -1906,6 +2080,14 @@ function paintDetail() {
   detail.querySelectorAll("[data-agentic-key]").forEach(btn => {
     btn.onclick = () => runAgenticEval(btn.dataset.agenticKey);
   });
+  const evalAllBtn = document.getElementById("evalAllKeys");
+  if (evalAllBtn) evalAllBtn.onclick = () => runAllAgenticEvals();
+  const batchCancel = document.getElementById("batchCancel");
+  if (batchCancel) batchCancel.onclick = () => cancelInferenceBatch();
+  if (state.tab === "eval") {
+    bindEvalDetailToggles(detail);
+    resumeInferenceBatchJob();
+  }
   const chunkSearchBtn = document.getElementById("chunkSearchBtn");
   if (chunkSearchBtn) {
     const runFilter = async () => {
@@ -1990,7 +2172,15 @@ function paintDetail() {
 (async function init() {
   state.runs = await api("/api/runs");
   renderRuns();
-  if (state.runs[0]) selectRun(state.runs[0].run_id);
+  const params = new URLSearchParams(location.search);
+  const runParam = params.get("run");
+  const tabParam = params.get("tab");
+  if (runParam && state.runs.some(r => r.run_id === runParam)) {
+    if (tabParam) state.tab = tabParam;
+    await selectRun(runParam);
+  } else if (state.runs[0]) {
+    await selectRun(state.runs[0].run_id);
+  }
 })();
 </script>
 </body>
@@ -2001,6 +2191,11 @@ function paintDetail() {
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return INDEX_HTML
+
+
+@app.get("/evaluation", response_class=HTMLResponse)
+def evaluation_page() -> str:
+    return EVALUATION_HTML
 
 
 def main() -> None:

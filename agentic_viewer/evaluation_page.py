@@ -1,0 +1,727 @@
+"""Evaluation aggregation page."""
+
+EVALUATION_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agentic Evaluation</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --line: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #9aa8bc;
+      --accent: #3d9cf0;
+      --ok: #3ecf8e;
+      --err: #f07178;
+      --warn: #e0a45c;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: var(--sans); min-height: 100vh;
+    }
+    header {
+      padding: 14px 20px; border-bottom: 1px solid var(--line);
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header .meta { color: var(--muted); font-size: 13px; margin-left: auto; }
+    .topnav { display: flex; gap: 4px; }
+    .topnav a {
+      color: var(--muted); text-decoration: none; font-size: 13px;
+      padding: 6px 12px; border-radius: 999px; border: 1px solid transparent;
+    }
+    .topnav a:hover { color: var(--text); border-color: var(--line); }
+    .topnav a.active {
+      color: var(--text); background: var(--panel); border-color: var(--line);
+    }
+    main { display: grid; grid-template-columns: 300px 1fr; min-height: calc(100vh - 54px); }
+    aside {
+      border-right: 1px solid var(--line); overflow: auto; background: #121820;
+      padding: 10px;
+    }
+    section { overflow: auto; padding: 16px 20px; }
+    .toolbar {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: center;
+    }
+    .toolbar button, .toolbar label.btn {
+      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
+      background: #152033; color: var(--text); font-size: 12px; cursor: pointer;
+    }
+    .toolbar button:hover, .toolbar label.btn:hover { border-color: var(--accent); }
+    .toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toolbar button.primary {
+      background: #1a3a5c; border-color: #3d6a9a; color: #e7ecf3;
+    }
+    .toolbar button.danger {
+      background: #3a2024; border-color: #7a4048; color: #f0b0b4;
+    }
+    .toolbar label.btn { display: inline-flex; align-items: center; gap: 6px; }
+    .run-item {
+      border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+      margin-bottom: 8px; background: var(--panel); cursor: pointer;
+    }
+    .run-item:hover { border-color: #3d4f66; }
+    .run-item.selected { border-color: var(--accent); background: #1a2a40; }
+    .run-item .row1 { display: flex; gap: 8px; align-items: flex-start; }
+    .run-item input { margin-top: 3px; }
+    .run-item .id { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+    .run-item .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+    .badge {
+      display: inline-block; padding: 1px 6px; border-radius: 4px;
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .badge.ok { background: rgba(62, 207, 142, 0.15); color: var(--ok); }
+    .badge.error { background: rgba(240, 113, 120, 0.15); color: var(--err); }
+    .badge.warn { background: rgba(224, 164, 92, 0.15); color: var(--warn); }
+    .empty { color: var(--muted); padding: 40px 0; }
+    .warn-box {
+      border: 1px solid #6b5530; background: rgba(224, 164, 92, 0.1);
+      border-radius: 8px; padding: 10px 12px; color: #e0c090; font-size: 12px;
+      margin-bottom: 14px; line-height: 1.45;
+    }
+    .batch-panel {
+      border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+      padding: 12px 14px; margin-bottom: 16px;
+    }
+    .batch-panel.running { border-color: #3d6a9a; background: #152033; }
+    .batch-panel.clickable {
+      cursor: pointer; transition: border-color 0.15s ease;
+    }
+    .batch-panel.clickable:hover { border-color: var(--accent); }
+    .batch-panel.focused {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(61, 156, 240, 0.35);
+    }
+    .batch-panel .view-hint {
+      color: var(--accent); font-size: 11px; margin-top: 8px;
+    }
+    .run-item.batch-run { border-color: #3d6a9a; background: #1a2a40; }
+    .batch-panel .title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+    .batch-panel .line { font-family: var(--mono); font-size: 12px; color: var(--muted); margin: 4px 0; }
+    .batch-panel .line strong { color: var(--text); font-weight: 500; }
+    .progress-wrap {
+      height: 10px; background: #0f1419; border: 1px solid var(--line);
+      border-radius: 999px; overflow: hidden; margin: 10px 0 8px;
+    }
+    .progress-bar {
+      height: 100%; background: linear-gradient(90deg, #3d9cf0, #3ecf8e);
+      border-radius: 999px; min-width: 2px; transition: width 0.3s ease;
+    }
+    .matrix-wrap { overflow: auto; max-width: 100%; }
+    .matrix {
+      width: 100%; border-collapse: collapse; font-size: 12px; min-width: 640px;
+    }
+    .matrix th, .matrix td {
+      border: 1px solid var(--line); padding: 6px 8px; vertical-align: top;
+    }
+    .matrix th {
+      background: var(--panel); color: var(--muted); font-weight: 500;
+      position: sticky; top: 0; z-index: 1;
+    }
+    .matrix th.key-col, .matrix td.key-col {
+      position: sticky; left: 0; z-index: 2; background: #121820;
+      max-width: 220px; word-break: break-word; font-family: var(--mono); font-size: 11px;
+    }
+    .matrix th.key-col { z-index: 3; background: var(--panel); }
+    .matrix .run-head {
+      font-family: var(--mono); font-size: 11px; max-width: 140px; word-break: break-all;
+    }
+    .cell-em-y { color: var(--ok); }
+    .cell-em-n { color: var(--err); }
+    .cell-agent.correct { color: var(--ok); font-weight: 600; }
+    .cell-agent.incorrect { color: var(--err); font-weight: 600; }
+    .cell-agent.pending { color: var(--muted); }
+    .cell-agent.running { color: var(--warn); }
+    .cell-agent.error { color: var(--err); font-size: 11px; }
+    .cell-sub { color: var(--muted); font-size: 10px; margin-top: 2px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.45; margin: 0 0 14px; }
+    .run-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 16px; }
+    .run-table th, .run-table td {
+      text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+    }
+    .run-table th { color: var(--muted); font-weight: 500; }
+    .run-table td.mono { font-family: var(--mono); font-size: 11px; }
+    .err-text { color: var(--err); font-size: 12px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Agentic Viewer</h1>
+    <nav class="topnav">
+      <a href="/">Inference</a>
+      <a href="/evaluation" class="active">Evaluation</a>
+    </nav>
+    <div class="meta" id="headerMeta">Loading…</div>
+  </header>
+  <main>
+    <aside>
+      <div class="toolbar">
+        <button type="button" id="selectFinished">Select finished</button>
+        <button type="button" id="clearSelection">Clear</button>
+      </div>
+      <div id="runList"></div>
+    </aside>
+    <section id="content">
+      <div class="empty">Select one or more runs to compare evaluation results.</div>
+    </section>
+  </main>
+<script>
+const state = {
+  runs: [],
+  selected: new Set(),
+  summary: null,
+  loading: false,
+  error: null,
+  batchJob: null,
+  batchViewFocused: false,
+  skipExisting: true,
+  pollTimer: null,
+};
+
+function summaryRunIds() {
+  if (state.selected.size) return [...state.selected];
+  if (state.batchJob?.run_ids?.length) return [...state.batchJob.run_ids];
+  return [];
+}
+
+function batchRunSet() {
+  const ids = state.batchJob?.run_ids;
+  return ids?.length ? new Set(ids) : new Set();
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+}
+
+function fmtPct(v) {
+  if (v == null || Number.isNaN(Number(v))) return "—";
+  return Number(v).toFixed(2);
+}
+
+function parseSelectedFromUrl() {
+  const q = new URLSearchParams(location.search).get("runs");
+  if (!q) return new Set();
+  return new Set(q.split(",").map(s => s.trim()).filter(Boolean));
+}
+
+function syncUrl() {
+  const ids = summaryRunIds();
+  const params = new URLSearchParams();
+  if (ids.length) params.set("runs", ids.join(","));
+  if (state.batchJob?.job_id && state.batchViewFocused) {
+    params.set("job", state.batchJob.job_id);
+  }
+  const qs = params.toString();
+  const url = qs ? `/evaluation?${qs}` : "/evaluation";
+  history.replaceState(null, "", url);
+}
+
+function persistBatchJobId(jobId) {
+  try {
+    if (jobId) sessionStorage.setItem("agentic_eval_batch_job", jobId);
+    else sessionStorage.removeItem("agentic_eval_batch_job");
+  } catch (_) { /* ignore */ }
+}
+
+function readPersistedBatchJobId() {
+  try { return sessionStorage.getItem("agentic_eval_batch_job"); } catch (_) { return null; }
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function apiPost(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+  if (!r.ok) throw new Error(data.detail || text || r.statusText);
+  return data;
+}
+
+function batchIsActive() {
+  const j = state.batchJob;
+  return j && (j.status === "queued" || j.status === "running");
+}
+
+function renderBatchPanel() {
+  const j = state.batchJob;
+  if (!j) {
+    const disabled = !state.selected.size || batchIsActive();
+    return `
+      <div class="batch-panel">
+        <div class="title">Batch agentic-evaluation</div>
+        <div class="toolbar" style="margin:0">
+          <button type="button" class="primary" id="startBatch" ${disabled ? "disabled" : ""}>
+            Run all keys (selected runs)
+          </button>
+          <label class="btn"><input type="checkbox" id="skipExisting" ${state.skipExisting ? "checked" : ""} />
+            Skip existing</label>
+        </div>
+        <p class="hint" style="margin:8px 0 0">
+          Evaluates every gold key via the inference API (serial per run). Results save under
+          <code>06_agentic_eval/</code>.
+        </p>
+      </div>`;
+  }
+
+  const pct = j.progress_pct ?? (j.total ? Math.round(100 * j.completed / j.total) : 0);
+  const running = j.status === "queued" || j.status === "running";
+  const cur = j.current
+    ? `<div class="line">Current: <strong>${esc(j.current.run_id)}</strong> · ${esc(j.current.key)}</div>`
+    : "";
+  const errBlock = (j.errors || []).length
+    ? `<div class="err-text">${j.errors.length} error(s) — latest: ${esc(j.errors[j.errors.length - 1].error)}</div>`
+    : "";
+  const cancelBtn = running
+    ? `<button type="button" class="danger" id="cancelBatch">Cancel</button>`
+    : "";
+  const runList = (j.run_ids || []).map(id => esc(id)).join(", ");
+  const focused = state.batchViewFocused;
+  const viewHint = focused
+    ? `<div class="view-hint">Showing summary & matrix for ${(j.run_ids || []).length} run(s) in this job</div>`
+    : `<div class="view-hint">Click to view per-run summary and key × run matrix</div>`;
+
+  return `
+    <div class="batch-panel ${running ? "running" : ""} clickable ${focused ? "focused" : ""}"
+         id="batchJobPanel" role="button" tabindex="0"
+         title="View evaluation summary for batch runs">
+      <div class="title">Batch job · ${esc(j.status)}</div>
+      <div class="line">Runs: <strong>${runList || "—"}</strong></div>
+      <div class="line">
+        Progress: <strong>${j.completed}/${j.total}</strong>
+        · skipped ${j.skipped}
+        · failed ${j.failed}
+        ${pct != null ? ` · ${pct}%` : ""}
+      </div>
+      ${cur}
+      <div class="progress-wrap"><div class="progress-bar" style="width:${Math.max(0, Math.min(100, pct || 0))}%"></div></div>
+      <div class="line">${esc(j.message || "")}</div>
+      ${errBlock}
+      ${viewHint}
+      <div class="toolbar" style="margin:8px 0 0">${cancelBtn}</div>
+    </div>`;
+}
+
+function renderRunList() {
+  const el = document.getElementById("runList");
+  if (!state.runs.length) {
+    el.innerHTML = `<div class="empty">No runs found</div>`;
+    return;
+  }
+  el.innerHTML = state.runs.map(r => {
+    const checked = state.selected.has(r.run_id) ? "checked" : "";
+    const inBatch = batchRunSet().has(r.run_id);
+    const sel = state.selected.has(r.run_id) ? "selected" : "";
+    const batchCls = inBatch && state.batchViewFocused ? " batch-run" : "";
+    const es = r.eval_summary;
+    const ae = r.agentic_eval_summary;
+    const baseline = es
+      ? `EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)}`
+      : "no baseline eval";
+    const agentic = ae
+      ? `agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · acc ${fmtPct(ae.accuracy)}` : ""}`
+      : "agentic —";
+    const badgeCls = r.status === "ok" ? "ok" : (r.status === "error" ? "error" : "warn");
+    return `
+      <div class="run-item ${sel}${batchCls}" data-id="${esc(r.run_id)}">
+        <div class="row1">
+          <input type="checkbox" ${checked} data-run-check="${esc(r.run_id)}" ${batchIsActive() ? "disabled" : ""} />
+          <div>
+            <div class="id">${esc(r.run_id)}</div>
+            <div class="sub">
+              <span class="badge ${badgeCls}">${esc(r.status)}</span>
+              ${r.seconds != null ? `${r.seconds}s` : ""} · kv=${r.n_kv ?? "?"}
+            </div>
+            <div class="sub">${esc(baseline)}</div>
+            <div class="sub">${esc(agentic)}</div>
+          </div>
+        </div>
+      </div>`;
+  }).join("");
+
+  el.querySelectorAll("[data-run-check]").forEach(cb => {
+    cb.onclick = (e) => {
+      e.stopPropagation();
+      toggleRun(cb.dataset.runCheck, cb.checked);
+    };
+  });
+  el.querySelectorAll(".run-item").forEach(node => {
+    node.onclick = (e) => {
+      if (e.target.matches("input") || batchIsActive()) return;
+      const id = node.dataset.id;
+      toggleRun(id, !state.selected.has(id));
+    };
+  });
+}
+
+function toggleRun(runId, on) {
+  if (on) state.selected.add(runId);
+  else state.selected.delete(runId);
+  state.batchViewFocused = false;
+  syncUrl();
+  renderRunList();
+  loadSummary();
+}
+
+function focusBatchJob() {
+  if (!state.batchJob?.run_ids?.length) return;
+  state.selected = new Set(state.batchJob.run_ids);
+  state.batchViewFocused = true;
+  persistBatchJobId(state.batchJob.job_id);
+  syncUrl();
+  renderRunList();
+  loadSummary();
+}
+
+function renderSummaryBody() {
+  const s = state.summary;
+  if (!s) return `<div class="empty">Loading summary…</div>`;
+
+  const warn = s.document_warning
+    ? `<div class="warn-box">${esc(s.document_warning)}</div>` : "";
+
+  const runRows = (s.per_run || []).map(r => {
+    const b = r.baseline || {};
+    const a = r.agentic || {};
+    return `<tr>
+      <td class="mono"><a href="/?run=${encodeURIComponent(r.run_id)}&tab=eval">${esc(r.run_id)}</a></td>
+      <td>${esc(r.document || "—")}</td>
+      <td>${r.has_baseline_eval ? fmtPct(b.value_exact_match) : "—"}</td>
+      <td>${r.has_baseline_eval ? fmtPct(b.page_f1_macro) : "—"}</td>
+      <td>${r.has_baseline_eval ? fmtPct(b.evidence_token_f1) : "—"}</td>
+      <td>${a.n_done ?? 0}/${a.n_total ?? 0}</td>
+      <td>${a.accuracy != null ? fmtPct(a.accuracy) : "—"}</td>
+    </tr>`;
+  }).join("");
+
+  const runIds = s.run_ids || [];
+  const cur = state.batchJob?.current;
+  const headRuns = runIds.map(id =>
+    `<th class="run-head"><a href="/?run=${encodeURIComponent(id)}&tab=eval">${esc(id)}</a></th>`
+  ).join("");
+
+  const matrixRows = (s.per_key || []).map(row => {
+    const cells = runIds.map(runId => {
+      const cell = (row.by_run || {})[runId];
+      if (!cell) return `<td>—</td>`;
+      const emCls = cell.baseline_em ? "cell-em-y" : "cell-em-n";
+      const ae = cell.agentic || {};
+      const isCurrent = cur && cur.run_id === runId && cur.key === row.key && ae.status !== "done";
+      let agentHtml;
+      if (ae.status === "done") {
+        const v = String(ae.is_correct_answer || "").toLowerCase();
+        const cls = v === "correct" ? "correct" : (v === "incorrect" ? "incorrect" : "pending");
+        agentHtml = `<div class="cell-agent ${cls}">${esc(v || "?")}</div>`;
+      } else if (ae.status === "running" || isCurrent) {
+        agentHtml = `<div class="cell-agent running">running</div>`;
+      } else if (ae.status === "error") {
+        agentHtml = `<div class="cell-agent error">${esc(ae.error || "error")}</div>`;
+      } else {
+        agentHtml = `<div class="cell-agent pending">pending</div>`;
+      }
+      return `<td>
+        <div class="${emCls}">EM ${cell.baseline_em ? "Y" : "N"}</div>
+        <div class="cell-sub">pageF1 ${fmtPct(cell.page_f1)} · evid ${fmtPct(cell.evidence_f1)}</div>
+        ${agentHtml}
+      </td>`;
+    }).join("");
+    return `<tr>
+      <td class="key-col">${esc(row.key)}</td>
+      <td>${esc(row.gold_value ?? "")}</td>
+      ${cells}
+    </tr>`;
+  }).join("");
+
+  return `
+    <p class="hint">
+      Baseline metrics from <code>04_result.json</code> vs answer sheet.
+      Agentic verdicts from <code>06_agentic_eval/</code> (refreshes while batch runs).
+    </p>
+    ${warn}
+    <h2 style="font-size:14px;margin:0 0 10px">Per-run summary</h2>
+    <table class="run-table">
+      <thead>
+        <tr>
+          <th>Run</th><th>Document</th><th>Value EM</th><th>Page F1</th>
+          <th>Evid F1</th><th>Agentic done</th><th>Agentic acc</th>
+        </tr>
+      </thead>
+      <tbody>${runRows || `<tr><td colspan="7" class="empty">No runs</td></tr>`}</tbody>
+    </table>
+    <h2 style="font-size:14px;margin:16px 0 10px">Key × run matrix</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th class="key-col">Key</th>
+            <th>Gold value</th>
+            ${headRuns}
+          </tr>
+        </thead>
+        <tbody>${matrixRows || `<tr><td colspan="${2 + runIds.length}" class="empty">No keys</td></tr>`}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderSummary() {
+  const el = document.getElementById("content");
+  const batchHtml = renderBatchPanel();
+  const hasRuns = summaryRunIds().length > 0;
+
+  if (state.loading && !state.summary && hasRuns) {
+    el.innerHTML = batchHtml + `<div class="empty">Loading summary…</div>`;
+    bindBatchControls();
+    return;
+  }
+  if (state.error && !state.summary && hasRuns) {
+    el.innerHTML = batchHtml + `<div class="empty" style="color:var(--err)">${esc(state.error)}</div>`;
+    bindBatchControls();
+    return;
+  }
+  if (!hasRuns && !state.batchJob) {
+    el.innerHTML = `<div class="empty">Select one or more runs to compare evaluation results.</div>`;
+    return;
+  }
+  if (!hasRuns && state.batchJob) {
+    el.innerHTML = batchHtml + `<div class="empty">Click the batch job panel above to view summary and matrix.</div>`;
+    bindBatchControls();
+    return;
+  }
+
+  el.innerHTML = batchHtml + renderSummaryBody();
+  bindBatchControls();
+}
+
+function bindBatchControls() {
+  const startBtn = document.getElementById("startBatch");
+  if (startBtn) startBtn.onclick = startBatch;
+  const skipCb = document.getElementById("skipExisting");
+  if (skipCb) skipCb.onchange = () => { state.skipExisting = skipCb.checked; };
+  const cancelBtn = document.getElementById("cancelBatch");
+  if (cancelBtn) {
+    cancelBtn.onclick = (e) => {
+      e.stopPropagation();
+      cancelBatch();
+    };
+  }
+  const panel = document.getElementById("batchJobPanel");
+  if (panel) {
+    panel.onclick = (e) => {
+      if (e.target.closest("#cancelBatch")) return;
+      focusBatchJob();
+    };
+    panel.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        focusBatchJob();
+      }
+    };
+  }
+}
+
+async function loadSummary(silent=false) {
+  const runIds = summaryRunIds();
+  if (!runIds.length) {
+    state.summary = null;
+    if (!silent) state.error = null;
+    renderSummary();
+    return;
+  }
+  if (!silent) {
+    state.loading = true;
+    state.error = null;
+    renderSummary();
+  }
+  try {
+    const q = runIds.map(encodeURIComponent).join(",");
+    state.summary = await api(`/api/evaluation/summary?run_ids=${q}`);
+    state.error = null;
+  } catch (err) {
+    if (!silent) {
+      state.summary = null;
+      state.error = String(err.message || err);
+    }
+  } finally {
+    if (!silent) state.loading = false;
+    renderSummary();
+  }
+}
+
+async function refreshRuns() {
+  state.runs = await api("/api/runs");
+  renderRunList();
+}
+
+async function pollBatchJob() {
+  if (!state.batchJob?.job_id) return;
+  try {
+    state.batchJob = await api(`/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}`);
+    if (state.batchViewFocused && state.batchJob.run_ids?.length) {
+      state.selected = new Set(state.batchJob.run_ids);
+    }
+    renderSummary();
+    renderRunList();
+    if (state.batchJob.status === "running" || state.batchJob.status === "queued") {
+      if (state.batchViewFocused || summaryRunIds().length) {
+        await loadSummary(true);
+      }
+      return;
+    }
+    stopPolling();
+    persistBatchJobId(null);
+    await refreshRuns();
+    if (summaryRunIds().length) await loadSummary(true);
+  } catch (err) {
+    state.error = String(err.message || err);
+    stopPolling();
+    renderSummary();
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  state.pollTimer = setInterval(pollBatchJob, 2000);
+}
+
+function stopPolling() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+async function startBatch() {
+  if (!state.selected.size || batchIsActive()) return;
+  try {
+    state.batchJob = await apiPost("/api/evaluation/batch-agentic-eval", {
+      run_ids: [...state.selected],
+      skip_existing: state.skipExisting,
+    });
+    state.batchViewFocused = true;
+    persistBatchJobId(state.batchJob.job_id);
+    state.error = null;
+    syncUrl();
+    renderSummary();
+    renderRunList();
+    if (batchIsActive()) {
+      startPolling();
+      await loadSummary(true);
+    } else {
+      persistBatchJobId(null);
+      await loadSummary(true);
+    }
+  } catch (err) {
+    state.error = String(err.message || err);
+    renderSummary();
+  }
+}
+
+async function cancelBatch() {
+  if (!state.batchJob?.job_id) return;
+  try {
+    state.batchJob = await apiPost(
+      `/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}/cancel`,
+      {}
+    );
+    renderSummary();
+  } catch (err) {
+    state.error = String(err.message || err);
+    renderSummary();
+  }
+}
+
+async function loadBatchJobById(jobId) {
+  if (!jobId) return null;
+  try {
+    return await api(`/api/evaluation/batch-jobs/${encodeURIComponent(jobId)}`);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function resumeActiveJob() {
+  const params = new URLSearchParams(location.search);
+  const jobParam = params.get("job");
+  const wantFocus = params.has("job") || params.has("runs");
+
+  let job = null;
+  if (jobParam) {
+    job = await loadBatchJobById(jobParam);
+  }
+  if (!job) {
+    try {
+      const data = await api("/api/evaluation/batch-jobs/active");
+      if (data.active && data.job) job = data.job;
+    } catch (_) { /* ignore */ }
+  }
+  if (!job) {
+    const stored = readPersistedBatchJobId();
+    if (stored) job = await loadBatchJobById(stored);
+  }
+
+  if (!job) return;
+
+  state.batchJob = job;
+  persistBatchJobId(job.job_id);
+  if (wantFocus || batchIsActive()) {
+    state.selected = new Set(job.run_ids || []);
+    state.batchViewFocused = true;
+    syncUrl();
+  }
+  renderSummary();
+  renderRunList();
+  if (batchIsActive()) {
+    startPolling();
+    if (state.batchViewFocused) await loadSummary(true);
+  } else if (state.batchViewFocused) {
+    await loadSummary(true);
+  }
+}
+
+document.getElementById("selectFinished").onclick = () => {
+  if (batchIsActive()) return;
+  state.runs.filter(r => r.status === "ok").forEach(r => state.selected.add(r.run_id));
+  syncUrl();
+  renderRunList();
+  loadSummary();
+};
+
+document.getElementById("clearSelection").onclick = () => {
+  if (batchIsActive()) return;
+  state.selected.clear();
+  syncUrl();
+  renderRunList();
+  loadSummary();
+};
+
+(async function init() {
+  state.selected = parseSelectedFromUrl();
+  if (state.selected.size) state.batchViewFocused = true;
+  state.runs = await api("/api/runs");
+  document.getElementById("headerMeta").textContent =
+    `${state.runs.length} run(s) · ${location.origin}`;
+  renderRunList();
+  await resumeActiveJob();
+  if (summaryRunIds().length && !state.summary) await loadSummary();
+  else renderSummary();
+})();
+</script>
+</body>
+</html>
+"""

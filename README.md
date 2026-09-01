@@ -7,13 +7,13 @@ Korean Re agentic inference pipeline (parse / chunk / agent traces).
 
 ```bash
 # From this repo
-export AGENTIC_RUNS_DIR=/path/to/inference-pipeline/outputs/runs
+export AGENTIC_RUNS_DIR=/path/to/outputs/runs
 ./run.sh
 # → http://127.0.0.1:8099
 ```
 
-If `AGENTIC_RUNS_DIR` is unset and this repo sits next to `inference-pipeline/`,
-it defaults to `../inference-pipeline/outputs/runs`.
+If `AGENTIC_RUNS_DIR` is unset, defaults to shared `../outputs/runs`
+(legacy fallback: `../inference-pipeline/outputs/runs`). See `../outputs/README.md`.
 
 ## Tabs
 
@@ -34,7 +34,7 @@ it defaults to `../inference-pipeline/outputs/runs`.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `AGENTIC_RUNS_DIR` | sibling `inference-pipeline/outputs/runs` | runs root |
+| `AGENTIC_RUNS_DIR` | `../outputs/runs` | runs root |
 | `AGENTIC_ANSWER_SHEET` | `../dataset/answer_sheet.json` | gold labels for Eval |
 | `TRACE_VIEWER_HOST` | `0.0.0.0` | bind host |
 | `TRACE_VIEWER_PORT` | `8099` | bind port |

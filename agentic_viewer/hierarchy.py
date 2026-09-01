@@ -298,6 +298,71 @@ def _first_user_content(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def _first_system_content(messages: List[Dict[str, Any]]) -> str:
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            c = m.get("content")
+            return c if isinstance(c, str) else ""
+    return ""
+
+
+def _load_master_prompts(agent_dir: Path) -> Dict[str, Optional[str]]:
+    """
+    Initial MasterAgent system + user prompts for the hierarchy viewer.
+
+    Prefer conversation.jsonl (less truncated than step dumps). Fall back to the
+    first master step's request_messages for older runs.
+    """
+    out: Dict[str, Optional[str]] = {"system": None, "user": None}
+    conv_path = agent_dir / "conversation.jsonl"
+    if conv_path.is_file():
+        for line in conv_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if int(row.get("turn") or 0) != 0:
+                continue
+            kind = str(row.get("kind") or "")
+            if kind not in {"system", "user"}:
+                continue
+            content = row.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if out.get(kind) is None:
+                out[kind] = content
+            if out["system"] and out["user"]:
+                break
+
+    if out["system"] is not None and out["user"] is not None:
+        return out
+
+    if not agent_dir.is_dir():
+        return out
+
+    for path in sorted(agent_dir.glob("step_*.json")):
+        if not re.fullmatch(r"step_\d+\.json", path.name):
+            continue
+        data = _read_json(path) or {}
+        if data.get("label"):
+            continue
+        msgs = data.get("request_messages") or []
+        if out["system"] is None:
+            system = _first_system_content(msgs)
+            if system:
+                out["system"] = system
+        if out["user"] is None:
+            user = _first_user_content(msgs)
+            if user:
+                out["user"] = user
+        break
+
+    return out
+
+
 def _extract_prior_from_user(content: str) -> Optional[Dict[str, Any]]:
     """Parse prior_context JSON embedded in SearchAgent user prompt."""
     if not content or "Prior search session progress" not in content:
@@ -1187,6 +1252,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
     agent_dir = run_dir / "03_agent"
     tools_dir = agent_dir / "tools"
     master_steps, search_by_prefix = _load_steps(agent_dir)
+    master_prompts = _load_master_prompts(agent_dir)
     conversation_priors = _load_priors_from_conversation(agent_dir)
     tool_dumps = _load_tool_dumps(tools_dir)
     conversation_tools = _load_master_tool_results_from_conversation(agent_dir)
@@ -1566,6 +1632,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
 
     return {
         "master_turns": tree,
+        "master_prompts": master_prompts,
         "n_master_turns": len(tree),
         "n_search_page_calls": len(search_page_calls),
         "unassigned_search_steps": unassigned,
