@@ -65,6 +65,47 @@ def infer_pdf_path(run_dir: Path, result: Optional[Dict[str, Any]] = None) -> Op
     return None
 
 
+def infer_run_document(
+    run_dir: Path,
+    *,
+    eval_report: Optional[Dict[str, Any]] = None,
+    result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Human-readable source document name for a run."""
+    root = Path(run_dir).resolve()
+    if isinstance(eval_report, dict):
+        doc = eval_report.get("document")
+        if doc:
+            return str(doc)
+
+    if result is None:
+        result = _read_json(root / "04_result.json")
+    if isinstance(result, dict):
+        meta = result.get("meta") or {}
+        if isinstance(meta, dict):
+            for key in (
+                "source_file",
+                "file_name",
+                "filename",
+                "pdf_name",
+                "pdf_path",
+                "file_path",
+            ):
+                val = meta.get(key)
+                if val:
+                    return Path(str(val)).name
+
+    req = _read_json(root / "00_request.json") or {}
+    if isinstance(req, dict):
+        for key in ("pdf_path", "file_path"):
+            val = req.get(key)
+            if val:
+                return Path(str(val)).name
+
+    filename = pdf_info(root).get("filename")
+    return str(filename) if filename else None
+
+
 def pdf_info(run_dir: Path) -> Dict[str, Any]:
     """Metadata for the PDF viewer API."""
     root = Path(run_dir).resolve()

@@ -24,10 +24,17 @@ from agentic_viewer.evaluation.trace_paths import (
     resolve_agentic_eval_trace_dir,
 )
 from agentic_viewer.evaluation_page import EVALUATION_HTML
+from agentic_viewer.ground_truth import (
+    get_document_gt,
+    invalidate_eval_caches_for_document,
+    list_documents,
+    update_gt_key,
+)
+from agentic_viewer.ground_truth_page import GROUND_TRUTH_HTML
 from agentic_viewer.hierarchy import build_agent_tree
 from agentic_viewer.highlights import chunk_highlights
 from agentic_viewer.image_tokens import replace_base64_images
-from agentic_viewer.pdf_source import infer_pdf_path, pdf_info
+from agentic_viewer.pdf_source import infer_pdf_path, infer_run_document, pdf_info
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
 
 def default_runs_root() -> Path:
@@ -161,6 +168,9 @@ def list_runs() -> List[Dict[str, Any]]:
         rows.append(
             {
                 "run_id": child.name,
+                "document": infer_run_document(
+                    child, eval_report=eval_report, result=result
+                ),
                 "status": status,
                 "started_at": meta.get("started_at"),
                 "finished_at": meta.get("finished_at"),
@@ -179,13 +189,15 @@ def list_runs() -> List[Dict[str, Any]]:
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str) -> Dict[str, Any]:
     root = _run_dir(run_id)
+    result = _read_json(root / "04_result.json")
     return {
         "run_id": run_id,
+        "document": infer_run_document(root, result=result),
         "meta": _read_json(root / "meta.json"),
         "request": _read_json(root / "00_request.json"),
         "parse_summary": _read_json(root / "01_parse" / "summary.json"),
         "chunk_summary": _read_json(root / "02_chunk" / "summary.json"),
-        "result": _read_json(root / "04_result.json"),
+        "result": result,
         "error": _read_json(root / "04_error.json"),
     }
 
@@ -303,6 +315,55 @@ def get_agentic_evals(run_id: str) -> Dict[str, Any]:
     """List cached per-key agentic-evaluation results under 06_agentic_eval/."""
     _run_dir(run_id)
     return _list_agentic_evals(run_id)
+
+
+@app.get("/api/ground-truth")
+def get_ground_truth_index() -> Dict[str, Any]:
+    try:
+        documents = list_documents()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "path": str(answer_sheet_path()),
+        "documents": documents,
+    }
+
+
+@app.get("/api/ground-truth/document")
+def get_ground_truth_document(document: str) -> Dict[str, Any]:
+    try:
+        return get_document_gt(document)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/ground-truth/key")
+def put_ground_truth_key(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    document = str(body.get("document") or "").strip()
+    key = str(body.get("key") or "").strip()
+    if not document or not key:
+        raise HTTPException(status_code=400, detail="document and key are required")
+    entry = {
+        "value": body.get("value"),
+        "evidences": body.get("evidences"),
+        "evidence_pages": body.get("evidence_pages"),
+    }
+    try:
+        result = update_gt_key(document, key, entry)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    invalidated = invalidate_eval_caches_for_document(RUNS_ROOT, document)
+    return {**result, "invalidated_eval_caches": invalidated}
 
 
 @app.get("/api/evaluation/summary")
@@ -657,7 +718,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       padding: 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer;
     }
     .run:hover, .run.active { background: var(--panel); }
-    .run .id { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+    .run .id { font-size: 12px; word-break: break-all; }
+    .run-label { display: flex; flex-direction: column; gap: 2px; }
+    .run-doc { font-size: 13px; font-weight: 600; line-height: 1.3; word-break: break-word; }
+    .run-id { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
     .run .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
     .badge {
       display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px;
@@ -850,6 +914,47 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .agentic-eval-verdicts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
     .agentic-eval-err { color: var(--err); font-size: 11px; }
+    .gt-edit-btn {
+      margin-top: 6px; padding: 3px 10px; border-radius: 999px;
+      border: 1px solid var(--line); background: #152033; color: var(--text);
+      font-size: 11px; cursor: pointer;
+    }
+    .gt-edit-btn:hover { border-color: var(--accent); }
+    .gt-edit-btn.warn {
+      border-color: #7a5530; color: #e0c090; background: rgba(224, 164, 92, 0.12);
+    }
+    .gt-modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 200;
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .gt-modal {
+      width: min(720px, 100%); max-height: 90vh; overflow: auto;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 16px 18px;
+    }
+    .gt-modal h3 { margin: 0 0 8px; font-size: 15px; }
+    .gt-modal .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; word-break: break-word; }
+    .gt-modal label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+    .gt-modal input, .gt-modal textarea {
+      width: 100%; padding: 8px 10px; border-radius: 8px;
+      border: 1px solid var(--line); background: #0f1419; color: var(--text);
+      font-family: var(--mono); font-size: 12px; line-height: 1.4;
+    }
+    .gt-modal textarea { min-height: 120px; resize: vertical; }
+    .gt-modal-actions {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px;
+    }
+    .gt-modal-actions button {
+      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
+      background: #152033; color: var(--text); font-size: 12px; cursor: pointer;
+    }
+    .gt-modal-actions button.primary {
+      background: #1a3a5c; border-color: #3d6a9a;
+    }
+    .gt-modal-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .gt-modal-msg { font-size: 12px; margin-top: 8px; }
+    .gt-modal-msg.ok { color: var(--ok); }
+    .gt-modal-msg.err { color: var(--err); }
     .em-y { color: var(--ok); font-weight: 600; }
     .em-n { color: var(--err); font-weight: 600; }
     .run .eval-mini { color: var(--muted); font-size: 11px; margin-top: 3px; font-family: var(--mono); }
@@ -957,6 +1062,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <nav class="topnav">
       <a href="/" class="active">Inference</a>
       <a href="/evaluation">Evaluation</a>
+      <a href="/ground-truth">Ground Truth</a>
     </nav>
     <div class="meta" id="headerMeta">Loading runs…</div>
   </header>
@@ -974,6 +1080,7 @@ const state = {
   evalReport: null, evalError: null, evalLoading: false,
   agenticEvals: {}, agenticEvalInflight: [], agenticEvalError: null,
   evalOpenDetails: new Set(),
+  gtEdit: null,
   batchJob: null, batchPollTimer: null,
   evalKey: null, embed: false,
   evalHierarchyKeys: [], evalHierarchyKeysLoading: false,
@@ -1067,6 +1174,31 @@ function fmtPct(v) {
   return Number(v).toFixed(2);
 }
 
+function runRecord(id) {
+  if (id && typeof id === "object") return id;
+  return state.runs.find(r => r.run_id === id) || { run_id: String(id || "") };
+}
+
+function runDocument(runOrId) {
+  const r = runRecord(runOrId);
+  return r.document || (r.eval_summary && r.eval_summary.document) || null;
+}
+
+function runLabelHtml(runOrId) {
+  const r = runRecord(runOrId);
+  const id = esc(r.run_id);
+  const doc = runDocument(r);
+  if (!doc) return `<span class="run-id">${id}</span>`;
+  return `<span class="run-label"><span class="run-doc">${esc(doc)}</span><span class="run-id">${id}</span></span>`;
+}
+
+function runLabelText(runOrId) {
+  const r = runRecord(runOrId);
+  const doc = runDocument(r);
+  if (!doc) return r.run_id;
+  return `${doc} · ${r.run_id}`;
+}
+
 function renderRuns() {
   if (state.embed) return;
   const el = document.getElementById("runList");
@@ -1081,7 +1213,7 @@ function renderRuns() {
       : "";
     return `
     <div class="run ${r.run_id === state.runId ? "active" : ""}" data-id="${esc(r.run_id)}">
-      <div class="id">${esc(r.run_id)}</div>
+      <div class="id">${runLabelHtml(r)}</div>
       <div class="sub">
         <span class="badge ${r.status === "ok" ? "ok" : (r.status === "error" ? "error" : (r.status === "running" ? "warn" : ""))}">${esc(r.status)}</span>
         ${r.seconds != null ? r.seconds + "s" : ""} · kv=${r.n_kv ?? "?"} · pages=${r.page_count ?? "?"}
@@ -1251,7 +1383,7 @@ async function renderDetail(opts = {}) {
 
   if (state.embed) {
     if (runChanged || force || !state.info) {
-      detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
+      detail.innerHTML = `<div class="empty">Loading ${esc(runLabelText(state.runId))}…</div>`;
       state.info = await api(`/api/runs/${encodeURIComponent(state.runId)}`);
       state.loadedRunId = state.runId;
     }
@@ -1261,7 +1393,7 @@ async function renderDetail(opts = {}) {
   }
 
   if (runChanged || force || !state.info) {
-    detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
+    detail.innerHTML = `<div class="empty">Loading ${esc(runLabelText(state.runId))}…</div>`;
     state.info = await api(`/api/runs/${encodeURIComponent(state.runId)}`);
     state.loadedRunId = state.runId;
     if (runChanged) {
@@ -2546,7 +2678,7 @@ function renderAgentHierarchy() {
     html += renderEvalHierarchyKeyToolbar();
     if (state.evalKey) {
       html += `<p class="hint">Agentic evaluation trace for key <code>${esc(state.evalKey)}</code>
-        (parent run <code>${esc(state.runId)}</code>).</p>`;
+        (parent run ${runLabelHtml(state.runId)}).</p>`;
     }
   }
   html += `<div class="tree">`;
@@ -2604,6 +2736,150 @@ function bindEvalDetailToggles(root) {
   });
 }
 
+function parseGtPages(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+  return raw.split(/[,\s]+/).filter(Boolean).map(x => Number(x));
+}
+
+function parseGtEvidences(text) {
+  return String(text || "").split("\n").map(s => s.trim()).filter(Boolean);
+}
+
+function renderGtModal() {
+  const edit = state.gtEdit;
+  if (!edit) return "";
+  const saving = Boolean(edit.saving);
+  const msg = edit.message
+    ? `<div class="gt-modal-msg ${esc(edit.messageKind || "")}">${esc(edit.message)}</div>` : "";
+  return `
+    <div class="gt-modal-backdrop" id="gtModalBackdrop">
+      <div class="gt-modal" role="dialog" aria-labelledby="gtModalTitle">
+        <h3 id="gtModalTitle">Edit ground truth</h3>
+        <div class="sub">${esc(edit.document)} · ${esc(edit.key)}</div>
+        <label for="gtModalValue">Value</label>
+        <input id="gtModalValue" value="${esc(edit.value || "")}" ${saving ? "disabled" : ""} />
+        <label for="gtModalEvidences">Evidences (one per line)</label>
+        <textarea id="gtModalEvidences" ${saving ? "disabled" : ""}>${esc(edit.evidencesText || "")}</textarea>
+        <label for="gtModalPages">Evidence pages (comma-separated)</label>
+        <input id="gtModalPages" value="${esc(edit.pagesText || "")}" placeholder="1, 2, 3" ${saving ? "disabled" : ""} />
+        ${msg}
+        <div class="gt-modal-actions">
+          <button type="button" class="primary" id="gtModalSave" ${saving ? "disabled" : ""}>
+            ${saving ? "Saving…" : "Save"}
+          </button>
+          <button type="button" id="gtModalCancel" ${saving ? "disabled" : ""}>Cancel</button>
+          <a href="/ground-truth?document=${encodeURIComponent(edit.document || "")}" target="_blank">
+            Open in Ground Truth page
+          </a>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function openGtEditor(key, opts = {}) {
+  const document = state.evalReport?.document;
+  if (!document) {
+    alert("Document name is not available for this run.");
+    return;
+  }
+  state.gtEdit = {
+    document,
+    key,
+    value: "",
+    evidencesText: "",
+    pagesText: "",
+    loading: true,
+    saving: false,
+    message: null,
+    messageKind: null,
+    highlightInvalid: Boolean(opts.highlightInvalid),
+  };
+  paintDetail();
+  try {
+    const data = await api(`/api/ground-truth/document?document=${encodeURIComponent(document)}`);
+    const entry = (data.keys || []).find(row => row.key === key);
+    if (!entry) throw new Error(`GT key not found: ${key}`);
+    state.gtEdit = {
+      ...state.gtEdit,
+      loading: false,
+      value: entry.value || "",
+      evidencesText: (entry.evidences || []).join("\n"),
+      pagesText: (entry.evidence_pages || []).join(", "),
+    };
+  } catch (err) {
+    state.gtEdit = {
+      ...state.gtEdit,
+      loading: false,
+      message: String(err.message || err),
+      messageKind: "err",
+    };
+  }
+  paintDetail();
+}
+
+function closeGtEditor() {
+  state.gtEdit = null;
+  paintDetail();
+}
+
+async function saveGtEditor() {
+  const edit = state.gtEdit;
+  if (!edit || edit.loading || edit.saving) return;
+  const value = document.getElementById("gtModalValue")?.value ?? "";
+  const evidences = parseGtEvidences(document.getElementById("gtModalEvidences")?.value ?? "");
+  const pagesText = document.getElementById("gtModalPages")?.value ?? "";
+  let evidence_pages;
+  try {
+    evidence_pages = parseGtPages(pagesText);
+    if (pagesText.trim() && evidence_pages.some(n => Number.isNaN(n))) {
+      throw new Error("invalid page numbers");
+    }
+  } catch (err) {
+    edit.message = `Pages must be comma-separated integers (${err.message || err})`;
+    edit.messageKind = "err";
+    paintDetail();
+    return;
+  }
+  edit.saving = true;
+  edit.message = null;
+  paintDetail();
+  try {
+    const result = await apiPost("/api/ground-truth/key", {
+      document: edit.document,
+      key: edit.key,
+      value,
+      evidences,
+      evidence_pages,
+    });
+    edit.saving = false;
+    edit.message = `Saved` + (result.invalidated_eval_caches
+      ? ` · invalidated ${result.invalidated_eval_caches} eval cache(s)`
+      : "");
+    edit.messageKind = "ok";
+    paintDetail();
+    state.gtEdit = null;
+    await ensureEval(true);
+  } catch (err) {
+    edit.saving = false;
+    edit.message = String(err.message || err);
+    edit.messageKind = "err";
+    paintDetail();
+  }
+}
+
+function bindGtEditor(root) {
+  const backdrop = root.querySelector("#gtModalBackdrop");
+  if (!backdrop) return;
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop && !state.gtEdit?.saving) closeGtEditor();
+  });
+  const cancel = root.querySelector("#gtModalCancel");
+  if (cancel) cancel.onclick = () => closeGtEditor();
+  const save = root.querySelector("#gtModalSave");
+  if (save) save.onclick = () => saveGtEditor();
+}
+
 function renderEval() {
   if (state.evalLoading) {
     return `<div class="empty">Scoring against answer_sheet…</div>`;
@@ -2654,6 +2930,10 @@ function renderEval() {
     const keyInflight = inflightKeys.includes(row.key);
     const batchActiveForKey = batchActive && batch && batch.active
       && batch.active.some(x => x.key === row.key);
+    const goldVerdictForBtn = String((ae && ae.is_valid_gold) || "").toLowerCase();
+    const gtEditCls = goldVerdictForBtn === "invalid" ? " warn" : "";
+    const gtEditBtn = `<button type="button" class="gt-edit-btn${gtEditCls}" data-gt-edit="${esc(row.key)}">
+      Edit GT</button>`;
     let agenticCell;
     if (ae && ae.status === "done" && (ae.is_correct_answer || ae.is_valid_gold || ae.reason_summary || ae.reason || ae.text)) {
       const verdict = String(ae.is_correct_answer || "").toLowerCase();
@@ -2711,6 +2991,7 @@ function renderEval() {
             <div class="ev-text">${esc(et.gold || "(empty)")}</div>
           </div>
         </details>
+        ${gtEditBtn}
       </td>
       <td>${agenticCell}</td>
     </tr>`;
@@ -2745,6 +3026,7 @@ function renderEval() {
       Cached as <code>05_eval.json</code> in the run directory.
       Evid F1 uses <b>VLM evidence_quote</b> only; SearchAgent <b>page_reasons</b> are shown separately.
       Agentic-evaluation runs up to 8 keys in parallel via the inference API and saves under <code>06_agentic_eval/</code>.
+      Use <b>Edit GT</b> when agentic eval marks gold as invalid.
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
       <button type="button" class="agentic-eval-btn" id="evalAllKeys"
         style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Evaluate all keys</button>
@@ -2782,7 +3064,11 @@ async function ensureEval(refresh=false) {
       n_keys: state.evalReport?.n_keys,
       document: state.evalReport?.document,
     };
-    state.runs = state.runs.map(r => r.run_id === state.runId ? {...r, eval_summary: es} : r);
+    state.runs = state.runs.map(r => r.run_id === state.runId ? {
+      ...r,
+      eval_summary: es,
+      document: state.evalReport?.document || r.document,
+    } : r);
     renderRuns();
     await ensureAgenticEvals();
   } catch (err) {
@@ -2945,14 +3231,14 @@ function paintDetail() {
   }
   detail.innerHTML = `
     ${state.embed ? "" : `<div class="meta" style="margin-bottom:10px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <code>${esc(state.runId)}</code>
+      ${runLabelHtml(state.runId)}
       ${state.tab === "hierarchy_eval" && state.evalKey ? `· eval key <code>${esc(state.evalKey)}</code>` : ""}
       · status=${esc(state.info?.meta?.status || (state.info?.meta?.finished_at ? "done" : "running"))}
       · ${esc(state.info?.meta?.seconds)}s
       <button type="button" id="runRefresh" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--text);font-size:12px;cursor:pointer">Refresh</button>
     </div>`}
     ${tabsHtml()}
-    ${body}`;
+    ${body}${renderGtModal()}`;
   detail.querySelectorAll(".tab").forEach(btn => {
     btn.onclick = () => {
       if (btn.dataset.pagesSub) {
@@ -2998,6 +3284,12 @@ function paintDetail() {
   if (batchCancel) batchCancel.onclick = () => cancelInferenceBatch();
   if (state.tab === "eval") {
     bindEvalDetailToggles(detail);
+    detail.querySelectorAll("[data-gt-edit]").forEach(btn => {
+      btn.onclick = () => openGtEditor(btn.dataset.gtEdit, {
+        highlightInvalid: btn.classList.contains("warn"),
+      });
+    });
+    bindGtEditor(detail);
     resumeInferenceBatchJob();
   }
   const chunkSearchBtn = document.getElementById("chunkSearchBtn");
@@ -3133,6 +3425,11 @@ def index() -> str:
 @app.get("/evaluation", response_class=HTMLResponse)
 def evaluation_page() -> str:
     return EVALUATION_HTML
+
+
+@app.get("/ground-truth", response_class=HTMLResponse)
+def ground_truth_page() -> str:
+    return GROUND_TRUTH_HTML
 
 
 def main() -> None:

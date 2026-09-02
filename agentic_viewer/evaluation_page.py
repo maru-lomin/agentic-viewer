@@ -70,7 +70,10 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .run-item.selected { border-color: var(--accent); background: #1a2a40; }
     .run-item .row1 { display: flex; gap: 8px; align-items: flex-start; }
     .run-item input { margin-top: 3px; }
-    .run-item .id { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+    .run-item .id { font-size: 12px; word-break: break-all; }
+    .run-label { display: flex; flex-direction: column; gap: 2px; }
+    .run-doc { font-size: 13px; font-weight: 600; line-height: 1.3; word-break: break-word; }
+    .run-id { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
     .run-item .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
     .badge {
       display: inline-block; padding: 1px 6px; border-radius: 4px;
@@ -196,6 +199,7 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     <nav class="topnav">
       <a href="/">Inference</a>
       <a href="/evaluation" class="active">Evaluation</a>
+      <a href="/ground-truth">Ground Truth</a>
     </nav>
     <div class="meta" id="headerMeta">Loading…</div>
   </header>
@@ -251,6 +255,31 @@ function esc(s) {
 function fmtPct(v) {
   if (v == null || Number.isNaN(Number(v))) return "—";
   return Number(v).toFixed(2);
+}
+
+function runRecord(id) {
+  if (id && typeof id === "object") return id;
+  return state.runs.find(r => r.run_id === id) || { run_id: String(id || "") };
+}
+
+function runDocument(runOrId) {
+  const r = runRecord(runOrId);
+  return r.document || (r.eval_summary && r.eval_summary.document) || null;
+}
+
+function runLabelHtml(runOrId) {
+  const r = runRecord(runOrId);
+  const id = esc(r.run_id);
+  const doc = runDocument(r);
+  if (!doc) return `<span class="run-id">${id}</span>`;
+  return `<span class="run-label"><span class="run-doc">${esc(doc)}</span><span class="run-id">${id}</span></span>`;
+}
+
+function runLabelText(runOrId) {
+  const r = runRecord(runOrId);
+  const doc = runDocument(r);
+  if (!doc) return r.run_id;
+  return `${doc} · ${r.run_id}`;
 }
 
 function formatLiveLabel(live) {
@@ -399,7 +428,7 @@ function renderHierarchyToolbar() {
     return `<div class="empty">Select one or more runs to inspect agentic-eval traces.</div>`;
   }
   const runOpts = runs.map(id =>
-    `<option value="${esc(id)}" ${id === state.hierarchyRunId ? "selected" : ""}>${esc(id)}</option>`
+    `<option value="${esc(id)}" ${id === state.hierarchyRunId ? "selected" : ""}>${esc(runLabelText(id))}</option>`
   ).join("");
   const keyOpts = state.hierarchyKeys.map(row => {
     const status = row.status || "pending";
@@ -674,7 +703,7 @@ function renderBatchPanel() {
   const running = j.status === "queued" || j.status === "running";
   const cur = j.current;
   const curHtml = cur
-    ? `<div class="line">Current: <strong>${esc(cur.run_id)}</strong> · ${esc(cur.key)}</div>
+    ? `<div class="line">Current: <strong>${runLabelHtml(cur.run_id)}</strong> · ${esc(cur.key)}</div>
        ${cur.live_label || formatLiveLabel(cur.live)
          ? `<div class="line live-progress">${esc(cur.live_label || formatLiveLabel(cur.live))}</div>` : ""}`
     : "";
@@ -690,7 +719,7 @@ function renderBatchPanel() {
   const dismissBtn = running
     ? ""
     : `<button type="button" class="btn" id="dismissBatch">Dismiss</button>`;
-  const runList = (j.run_ids || []).map(id => esc(id)).join(", ");
+  const runList = (j.run_ids || []).map(id => esc(runLabelText(id))).join(", ");
   const focused = state.batchViewFocused;
   const viewHint = focused
     ? `<div class="view-hint">Showing summary & matrix for ${(j.run_ids || []).length} run(s) in this job</div>`
@@ -744,7 +773,7 @@ function renderRunList() {
         <div class="row1">
           <input type="checkbox" ${checked} data-run-check="${esc(r.run_id)}" />
           <div>
-            <div class="id">${esc(r.run_id)}</div>
+            <div class="id">${runLabelHtml(r)}</div>
             <div class="sub">
               <span class="badge ${badgeCls}">${esc(r.status)}</span>
               ${r.seconds != null ? `${r.seconds}s` : ""} · kv=${r.n_kv ?? "?"}
@@ -800,8 +829,7 @@ function renderSummaryBody() {
     const b = r.baseline || {};
     const a = r.agentic || {};
     return `<tr>
-      <td class="mono"><a href="/?run=${encodeURIComponent(r.run_id)}&tab=eval">${esc(r.run_id)}</a></td>
-      <td>${esc(r.document || "—")}</td>
+      <td><a href="/?run=${encodeURIComponent(r.run_id)}&tab=eval">${runLabelHtml({ run_id: r.run_id, document: r.document })}</a></td>
       <td>${r.has_baseline_eval ? fmtPct(b.value_exact_match) : "—"}</td>
       <td>${r.has_baseline_eval ? fmtPct(b.page_f1_macro) : "—"}</td>
       <td>${r.has_baseline_eval ? fmtPct(b.evidence_token_f1) : "—"}</td>
@@ -814,7 +842,7 @@ function renderSummaryBody() {
   const runIds = s.run_ids || [];
   const cur = state.batchJob?.current;
   const headRuns = runIds.map(id =>
-    `<th class="run-head"><a href="/?run=${encodeURIComponent(id)}&tab=eval">${esc(id)}</a></th>`
+    `<th class="run-head"><a href="/?run=${encodeURIComponent(id)}&tab=eval">${runLabelHtml(id)}</a></th>`
   ).join("");
 
   const matrixRows = (s.per_key || []).map(row => {
@@ -877,11 +905,11 @@ function renderSummaryBody() {
     <table class="run-table">
       <thead>
         <tr>
-          <th>Run</th><th>Document</th><th>Value EM</th><th>Page F1</th>
+          <th>Run</th><th>Value EM</th><th>Page F1</th>
           <th>Evid F1</th><th>Agentic done</th><th>Pred acc</th><th>GT valid</th>
         </tr>
       </thead>
-      <tbody>${runRows || `<tr><td colspan="8" class="empty">No runs</td></tr>`}</tbody>
+      <tbody>${runRows || `<tr><td colspan="7" class="empty">No runs</td></tr>`}</tbody>
     </table>
     <h2 style="font-size:14px;margin:16px 0 10px">Key × run matrix</h2>
     <div class="matrix-wrap">
