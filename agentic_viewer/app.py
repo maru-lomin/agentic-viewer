@@ -921,7 +921,35 @@ const state = {
   batchJob: null, batchPollTimer: null,
   evalKey: null, embed: false,
   evalHierarchyKeys: [], evalHierarchyKeysLoading: false,
+  loadedRunId: null,
+  agentTreeCache: { runId: null, kv: null, eval: {} },
+  agentTreeLoading: false,
+  pagesChunksLoadedFor: null,
 };
+
+function resetAgentTreeCache(runId) {
+  state.agentTreeCache = { runId: runId, kv: null, eval: {} };
+}
+
+function getCachedAgentTree() {
+  if (state.agentTreeCache.runId !== state.runId) return null;
+  if (isEvalHierarchyView()) {
+    return state.evalKey ? state.agentTreeCache.eval[state.evalKey] : null;
+  }
+  return state.agentTreeCache.kv;
+}
+
+function storeCachedAgentTree(tree) {
+  if (!state.runId) return;
+  if (state.agentTreeCache.runId !== state.runId) {
+    resetAgentTreeCache(state.runId);
+  }
+  if (isEvalHierarchyView() && state.evalKey) {
+    state.agentTreeCache.eval[state.evalKey] = tree;
+  } else {
+    state.agentTreeCache.kv = tree;
+  }
+}
 
 function isEvalHierarchyView() {
   return state.tab === "hierarchy_eval" || (state.embed && state.evalKey);
@@ -1019,13 +1047,17 @@ async function selectRun(runId, opts = {}) {
   state.runId = runId;
   if (!state.embed && !keepTab) state.tab = "hierarchy_kv";
   state.pagesSubtab = "pages";
-  state.agentTree = null;
   state.pages = [];
   state.chunks = null;
   if (!keepEvalKey) {
     state.evalKey = null;
     state.evalHierarchyKeys = [];
   }
+  state.loadedRunId = null;
+  state.agentTree = null;
+  state.agentTreeLoading = false;
+  resetAgentTreeCache(runId);
+  state.pagesChunksLoadedFor = null;
   if (!state.embed) {
     state.evalReport = null;
     state.evalError = null;
@@ -1070,45 +1102,145 @@ async function loadAgentTree() {
   return api(`/api/runs/${encodeURIComponent(state.runId)}/agent-tree`);
 }
 
-async function renderDetail() {
+async function loadKvTreeCached() {
+  if (!state.runId) return null;
+  if (state.agentTreeCache.runId === state.runId && state.agentTreeCache.kv) {
+    return state.agentTreeCache.kv;
+  }
+  const tree = await api(`/api/runs/${encodeURIComponent(state.runId)}/agent-tree`);
+  if (state.agentTreeCache.runId !== state.runId) {
+    resetAgentTreeCache(state.runId);
+  }
+  state.agentTreeCache.kv = tree;
+  return tree;
+}
+
+async function loadPagesChunks() {
+  if (!state.runId || state.pagesChunksLoadedFor === state.runId) return;
+  const pagesPayload = await api(
+    `/api/runs/${encodeURIComponent(state.runId)}/pages`
+  );
+  state.pages = Array.isArray(pagesPayload)
+    ? pagesPayload
+    : (pagesPayload?.pages || []);
+  state.pagesMeta = Array.isArray(pagesPayload) ? null : pagesPayload;
+  state.chunks = await api(
+    `/api/runs/${encodeURIComponent(state.runId)}/chunks?limit=200`
+  );
+  state.pagesChunksLoadedFor = state.runId;
+}
+
+async function loadHierarchyTab() {
+  if (!state.runId) return;
+  if (state.tab === "hierarchy_eval") {
+    await loadEvalHierarchyKeys();
+    if (!state.evalKey && state.evalHierarchyKeys.length) {
+      const done = state.evalHierarchyKeys.find(k => k.status === "done");
+      state.evalKey = (done || state.evalHierarchyKeys[0]).key;
+    }
+    if (!state.evalKey) {
+      state.agentTree = null;
+      state.agentTreeLoading = false;
+      paintDetail();
+      return;
+    }
+  }
+
+  const cached = getCachedAgentTree();
+  if (cached) {
+    state.agentTree = cached;
+    state.agentTreeLoading = false;
+    paintDetail();
+    return;
+  }
+
+  state.agentTreeLoading = true;
+  paintDetail();
+  try {
+    state.agentTree = await loadAgentTree();
+    storeCachedAgentTree(state.agentTree);
+  } finally {
+    state.agentTreeLoading = false;
+    paintDetail();
+  }
+}
+
+async function loadTimingTab() {
+  if (!state.runId) return;
+  state.agentTreeLoading = true;
+  paintDetail();
+  try {
+    state.agentTree = await loadKvTreeCached();
+  } finally {
+    state.agentTreeLoading = false;
+    paintDetail();
+  }
+}
+
+async function renderDetail(opts = {}) {
+  const force = Boolean(opts.force);
   const detail = document.getElementById("detail");
   if (!state.runId) {
     detail.innerHTML = `<div class="empty">Select a run</div>`;
     return;
   }
   const keepTab = state.tab;
-  detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
-  if (!state.embed && state.tab === "hierarchy_eval") {
-    await loadEvalHierarchyKeys();
-    if (!state.evalKey && state.evalHierarchyKeys.length) {
-      const done = state.evalHierarchyKeys.find(k => k.status === "done");
-      state.evalKey = (done || state.evalHierarchyKeys[0]).key;
+  const runChanged = state.loadedRunId !== state.runId;
+
+  if (force) {
+    resetAgentTreeCache(state.runId);
+    state.pagesChunksLoadedFor = null;
+    state.agentTree = null;
+  }
+
+  if (state.embed) {
+    if (runChanged || force || !state.info) {
+      detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
+      state.info = await api(`/api/runs/${encodeURIComponent(state.runId)}`);
+      state.loadedRunId = state.runId;
+    }
+    state.tab = keepTab;
+    await loadHierarchyTab();
+    return;
+  }
+
+  if (runChanged || force || !state.info) {
+    detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
+    state.info = await api(`/api/runs/${encodeURIComponent(state.runId)}`);
+    state.loadedRunId = state.runId;
+    if (runChanged) {
+      resetAgentTreeCache(state.runId);
+      state.pagesChunksLoadedFor = null;
+      state.agentTree = null;
     }
   }
-  const reqs = [
-    api(`/api/runs/${encodeURIComponent(state.runId)}`),
-    loadAgentTree(),
-    api("/api/runs"),
-  ];
-  if (!state.embed) {
-    reqs.splice(1, 0,
-      api(`/api/runs/${encodeURIComponent(state.runId)}/pages`),
-      api(`/api/runs/${encodeURIComponent(state.runId)}/chunks?limit=200`),
-    );
-  }
-  const results = await Promise.all(reqs);
-  let idx = 0;
-  state.info = results[idx++];
-  if (!state.embed) {
-    const pagesPayload = results[idx++];
-    state.pages = Array.isArray(pagesPayload) ? pagesPayload : (pagesPayload?.pages || []);
-    state.pagesMeta = Array.isArray(pagesPayload) ? null : pagesPayload;
-    state.chunks = results[idx++];
-  }
-  state.agentTree = results[idx++];
-  state.runs = results[idx++];
+
   state.tab = keepTab;
-  renderRuns();
+
+  if (state.tab === "hierarchy_kv" || state.tab === "hierarchy_eval") {
+    await loadHierarchyTab();
+    return;
+  }
+
+  if (state.tab === "timing") {
+    await loadTimingTab();
+    return;
+  }
+
+  if (state.tab === "pages") {
+    if (state.pagesChunksLoadedFor !== state.runId) {
+      state.agentTreeLoading = true;
+      paintDetail();
+      try {
+        await loadPagesChunks();
+      } finally {
+        state.agentTreeLoading = false;
+      }
+    }
+    paintDetail();
+    return;
+  }
+
   paintDetail();
 }
 
@@ -1783,6 +1915,9 @@ function renderMasterTool(tool) {
 }
 
 function renderTiming() {
+  if (state.agentTreeLoading) {
+    return `<div class="empty">Timing 데이터 로딩 중…</div>`;
+  }
   const timing = state.agentTree?.timing;
   if (!timing) return `<div class="empty">No timing data for this run.</div>`;
 
@@ -1898,6 +2033,9 @@ function renderTiming() {
 }
 
 function renderPagesChunks() {
+  if (state.agentTreeLoading) {
+    return `<div class="empty">Pages / chunks 로딩 중…</div>`;
+  }
   const sub = state.pagesSubtab || "pages";
   const subTabs = `
     <div class="tabs" style="margin-bottom:10px">
@@ -2068,6 +2206,10 @@ function renderEvalOutput() {
 
 function renderAgentHierarchy() {
   const isEval = isEvalHierarchyView();
+  if (state.agentTreeLoading) {
+    return `${isEval ? renderEvalHierarchyKeyToolbar() : ""}
+      <div class="empty">Hierarchy 로딩 중…</div>`;
+  }
   if (isEval && !state.embed && !state.evalKey) {
     return `${renderEvalHierarchyKeyToolbar()}
       <div class="empty">Select an eval key, or run agentic-evaluation from the Eval tab.</div>`;
@@ -2359,6 +2501,9 @@ async function runAgenticEval(key) {
       throw new Error(data.detail || text || r.statusText);
     }
     state.agenticEvals = { ...state.agenticEvals, [key]: data };
+    if (state.agentTreeCache.runId === state.runId) {
+      delete state.agentTreeCache.eval[key];
+    }
   } catch (err) {
     state.agenticEvalError = String(err.message || err);
     state.agenticEvals = {
@@ -2492,6 +2637,10 @@ function paintDetail() {
       }
       state.tab = btn.dataset.tab;
       if (state.tab === "hierarchy_kv" || state.tab === "hierarchy_eval") {
+        loadHierarchyTab();
+      } else if (state.tab === "timing") {
+        loadTimingTab();
+      } else if (state.tab === "pages") {
         renderDetail();
       } else {
         paintDetail();
@@ -2503,11 +2652,11 @@ function paintDetail() {
   if (evalKeySel) {
     evalKeySel.onchange = () => {
       state.evalKey = evalKeySel.value || null;
-      renderDetail();
+      loadHierarchyTab();
     };
   }
   const runRefresh = document.getElementById("runRefresh");
-  if (runRefresh) runRefresh.onclick = () => renderDetail();
+  if (runRefresh) runRefresh.onclick = () => renderDetail({ force: true });
   const refreshBtn = document.getElementById("evalRefresh");
   if (refreshBtn) refreshBtn.onclick = () => ensureEval(true);
   if (state.tab === "eval" && !state.evalReport && !state.evalLoading && !state.evalError) {

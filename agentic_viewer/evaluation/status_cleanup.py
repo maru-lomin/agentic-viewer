@@ -24,6 +24,12 @@ def mark_running_eval_status_cancelled(run_dir: Path) -> int:
         data["status"] = "cancelled"
         data["finished_at"] = now
         data["error"] = "cancelled by user"
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        n += 1
+        try:
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            n += 1
+        except OSError:
+            # Docker-owned status files may be unwritable from the viewer process.
+            continue
     return n
