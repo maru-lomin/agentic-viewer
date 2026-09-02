@@ -242,6 +242,7 @@ def _extract_submit_output(tool_results: List[Dict[str, Any]]) -> Optional[Dict[
                 parsed = {
                     "pages": args.get("pages") or [],
                     "page_reasons": args.get("page_reasons") or {},
+                    "page_chunk_id": args.get("page_chunk_id") or {},
                     "reason": args.get("reason") or "",
                 }
         if parsed is not None:
@@ -593,6 +594,17 @@ def _normalize_page_reasons(result: Dict[str, Any]) -> Dict[str, str]:
     return {}
 
 
+def _normalize_page_chunk_ids(result: Dict[str, Any]) -> Dict[str, str]:
+    """Accept page_chunk_id dict from search_pages dumps."""
+    pc = result.get("page_chunk_id")
+    if isinstance(pc, dict) and pc:
+        return {str(k): str(v) for k, v in pc.items() if str(v or "").strip()}
+    chunk_ids = result.get("chunk_ids")
+    if isinstance(chunk_ids, dict):
+        return {str(k): str(v) for k, v in chunk_ids.items() if str(v or "").strip()}
+    return {}
+
+
 def _load_timeline_search_links(run_dir: Path) -> List[Dict[str, Any]]:
     """
     Map each search_pages completion to SearchAgent step labels.
@@ -870,6 +882,9 @@ def _group_search_sessions(
         page_reasons = meta.get("page_reasons")
         if page_reasons is None:
             page_reasons = meta.get("reasons")
+        page_chunk_id = meta.get("page_chunk_id")
+        if not isinstance(page_chunk_id, dict):
+            page_chunk_id = {}
 
         # Legacy: final blobs only on last session.
         if sess == session_ids[-1]:
@@ -894,6 +909,7 @@ def _group_search_sessions(
                 "pages": pages if pages is not None else [],
                 "page_reasons": page_reasons if page_reasons is not None else {},
                 "reasons": page_reasons if page_reasons is not None else {},
+                "page_chunk_id": page_chunk_id,
                 "prior_context_in": prior_in,
                 "prior_context_out": prior_out,
                 "handoff_summary": handoff_summary,
@@ -1276,6 +1292,11 @@ def _build_batch_search_agent(
             page_reasons = (call.get("output") or {}).get("page_reasons")
         if not isinstance(page_reasons, dict):
             page_reasons = {}
+        page_chunk_id = item.get("page_chunk_id")
+        if page_chunk_id is None and call:
+            page_chunk_id = (call.get("output") or {}).get("page_chunk_id")
+        if not isinstance(page_chunk_id, dict):
+            page_chunk_id = {}
         status = item.get("status")
         if not status and call:
             status = (call.get("output") or {}).get("status") or (
@@ -1291,6 +1312,7 @@ def _build_batch_search_agent(
                 "pages": pages if pages is not None else [],
                 "page_reasons": page_reasons,
                 "reasons": page_reasons,
+                "page_chunk_id": page_chunk_id,
                 "reason": item.get("reason")
                 or ((call or {}).get("output") or {}).get("reason")
                 or "",
@@ -1323,6 +1345,7 @@ def _build_batch_search_agent(
             sess.pop("key", None)
             sess.pop("pages", None)
             sess.pop("page_reasons", None)
+            sess.pop("page_chunk_id", None)
             sess.pop("reasons", None)
     elif n_keys == 1 and key_results and shared_sessions:
         kr = key_results[0]
@@ -1330,6 +1353,7 @@ def _build_batch_search_agent(
         shared_sessions[0]["pages"] = kr.get("pages") or []
         shared_sessions[0]["page_reasons"] = kr.get("page_reasons") or {}
         shared_sessions[0]["reasons"] = kr.get("page_reasons") or {}
+        shared_sessions[0]["page_chunk_id"] = kr.get("page_chunk_id") or {}
         shared_sessions[0]["status"] = kr.get("status") or default_status
         shared_sessions[0]["reason"] = kr.get("reason") or ""
 
@@ -1357,6 +1381,7 @@ def _build_batch_search_agent(
             "status": batch_status,
             "pages": [],
             "page_reasons": {},
+            "page_chunk_id": {},
             "n_keys": n_keys,
             "n_resolved": n_resolved,
         },
@@ -1468,6 +1493,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
         consumed = call.get("search_steps") or []
         n_sessions = int(call["result"].get("n_search_sessions") or 0)
         page_reasons = _normalize_page_reasons(call["result"])
+        page_chunk_id = _normalize_page_chunk_ids(call["result"])
 
         meta_rows = call["result"].get("sessions") or []
         meta_by_session: Dict[int, Dict[str, Any]] = {}
@@ -1491,6 +1517,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
         call["output"] = {
             "pages": call["result"].get("pages") or [],
             "page_reasons": page_reasons,
+            "page_chunk_id": page_chunk_id,
             "status": call["result"].get("status"),
             "reason": call["result"].get("reason") or "",
         }
@@ -1703,6 +1730,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                                 "result": {
                                     "pages": output.get("pages"),
                                     "page_reasons": output.get("page_reasons"),
+                                    "page_chunk_id": output.get("page_chunk_id"),
                                     "reasons": output.get("page_reasons"),
                                     "status": output.get("status")
                                     or call["result"].get("status"),
@@ -1738,6 +1766,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                             "result": {
                                 "pages": output.get("pages"),
                                 "page_reasons": output.get("page_reasons"),
+                                "page_chunk_id": output.get("page_chunk_id"),
                                 "reasons": output.get("page_reasons"),
                                 "status": output.get("status")
                                 or call["result"].get("status"),

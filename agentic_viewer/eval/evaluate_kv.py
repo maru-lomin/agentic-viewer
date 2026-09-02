@@ -66,6 +66,26 @@ def _format_search_reasons(reasons: Any) -> str:
     return str(reasons).strip()
 
 
+def _format_page_chunk_ids(chunk_ids: Any) -> str:
+    """Format SearchAgent page_chunk_id as ``pN: chunk_id`` lines."""
+    if not chunk_ids:
+        return ""
+    if isinstance(chunk_ids, str):
+        return chunk_ids.strip()
+    if isinstance(chunk_ids, dict):
+        def _page_key(item: Any) -> tuple:
+            key = str(item)
+            return (0, int(key)) if key.isdigit() else (1, key)
+
+        lines: List[str] = []
+        for page, cid in sorted(chunk_ids.items(), key=lambda kv: _page_key(kv[0])):
+            text = str(cid or "").strip()
+            if text:
+                lines.append(f"p{page}: {text}")
+        return "\n".join(lines)
+    return str(chunk_ids).strip()
+
+
 def resolve_document_name(
     pred: Dict[str, Any],
     answer_sheet: Dict[str, Any],
@@ -154,6 +174,7 @@ def evaluate_document(
         search_reasons = _format_search_reasons(
             pred.get("search_reasons") or pred.get("page_reasons") or {}
         )
+        page_chunk_id = _format_page_chunk_ids(pred.get("page_chunk_id") or {})
 
         em_flags.append(1.0 if em else 0.0)
         page_p.append(p_prec)
@@ -187,6 +208,11 @@ def evaluate_document(
                     # SearchAgent submit_pages page_reasons (page selection rationale).
                     "pred": search_reasons,
                     "source": "search_agent_page_reasons",
+                },
+                "page_chunk_id": {
+                    "pred": page_chunk_id,
+                    "pred_map": pred.get("page_chunk_id") or {},
+                    "source": "search_agent_page_chunk_id",
                 },
             }
         )

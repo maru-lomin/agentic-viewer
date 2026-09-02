@@ -25,7 +25,9 @@ from agentic_viewer.evaluation.trace_paths import (
 )
 from agentic_viewer.evaluation_page import EVALUATION_HTML
 from agentic_viewer.hierarchy import build_agent_tree
+from agentic_viewer.highlights import chunk_highlights
 from agentic_viewer.image_tokens import replace_base64_images
+from agentic_viewer.pdf_source import infer_pdf_path, pdf_info
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
 
 def default_runs_root() -> Path:
@@ -521,6 +523,35 @@ def get_chunk(run_id: str, chunk_id: str) -> Dict[str, Any]:
     raise HTTPException(status_code=404, detail=f"chunk not found: {chunk_id}")
 
 
+@app.get("/api/runs/{run_id}/chunks/{chunk_id}/highlights")
+def get_chunk_highlights(run_id: str, chunk_id: str) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    try:
+        return chunk_highlights(root, chunk_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/pdf/info")
+def get_pdf_info(run_id: str) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    return pdf_info(root)
+
+
+@app.get("/api/runs/{run_id}/pdf")
+def get_pdf(run_id: str):
+    root = _run_dir(run_id)
+    path = infer_pdf_path(root)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="PDF not found for this run")
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=path.name,
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
 @app.get("/api/runs/{run_id}/conversation")
 def get_conversation(run_id: str) -> List[Dict[str, Any]]:
     """Chat-style message transcript (preferred) or reconstructed from step dumps."""
@@ -725,6 +756,31 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .kv-table th { color: var(--muted); font-weight: 500; }
     .kv-table th:first-child { width: 180px; }
+    .pdf-chunk-viewer { margin: 8px 0 12px; }
+    .pdf-chunk-viewer .pdf-toolbar {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      margin-bottom: 8px; font-size: 12px; color: var(--muted);
+    }
+    .pdf-chunk-viewer .pdf-pages { display: flex; flex-direction: column; gap: 14px; }
+    .pdf-page-wrap {
+      border: 1px solid var(--line); border-radius: 8px; padding: 8px;
+      background: #0b1016; max-width: 100%; overflow: auto;
+    }
+    .pdf-page-label {
+      font-size: 11px; color: var(--muted); font-family: var(--mono);
+      margin-bottom: 6px;
+    }
+    .pdf-canvas-wrap { position: relative; display: inline-block; line-height: 0; }
+    .pdf-canvas-wrap canvas { display: block; max-width: 100%; height: auto; }
+    .pdf-overlay {
+      position: absolute; left: 0; top: 0; pointer-events: none;
+    }
+    .hl-box {
+      position: absolute; box-sizing: border-box;
+      border: 2px solid rgba(61, 156, 240, 0.95);
+      background: rgba(61, 156, 240, 0.18);
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25) inset;
+    }
     .score-grid {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
       gap: 10px; margin: 0 0 16px;
@@ -1544,31 +1600,282 @@ function renderSearchSession(session, opts = {}) {
   </details>`;
 }
 
-function renderPageReasonsTable(reasons, title = "page_reasons") {
-  if (!reasons || typeof reasons !== "object") return "";
-  const entries = Object.entries(reasons);
-  if (!entries.length) return "";
-  const reasonRows = entries.map(([page, reason]) =>
-    `<tr><td>${esc(page)}</td><td>${esc(reason)}</td></tr>`
-  ).join("");
+function renderPageReasonsTable(reasons, chunkIds = null, title = "page_reasons") {
+  if (!reasons || typeof reasons !== "object") reasons = {};
+  const chunks = (chunkIds && typeof chunkIds === "object") ? chunkIds : {};
+  const pages = new Set([
+    ...Object.keys(reasons || {}),
+    ...Object.keys(chunks || {}),
+  ]);
+  if (!pages.size) return "";
+  const reasonRows = [...pages].sort((a, b) => {
+    const ai = parseInt(a, 10), bi = parseInt(b, 10);
+    if (!Number.isNaN(ai) && !Number.isNaN(bi)) return ai - bi;
+    return String(a).localeCompare(String(b));
+  }).map(page => {
+    const cid = chunks[page] || "";
+    const chunkCell = cid
+      ? `<button type="button" class="chunk-jump" data-chunk-id="${esc(cid)}" style="padding:2px 8px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--accent);font-size:11px;cursor:pointer">${esc(cid)}</button>`
+      : "";
+    return `<tr>
+      <td>${esc(page)}</td>
+      <td>${chunkCell}</td>
+      <td>${esc(reasons[page] || "")}</td>
+    </tr>`;
+  }).join("");
   return `<div class="viz-section" style="margin-top:6px">
     <h3 style="margin:0 0 4px">${esc(title)}</h3>
     <table class="kv-table">
-      <thead><tr><th>Page</th><th>Reason</th></tr></thead>
+      <thead><tr><th>Page</th><th>chunk_id</th><th>Reason</th></tr></thead>
       <tbody>${reasonRows}</tbody>
     </table>
   </div>`;
+}
+
+let _pdfJsPromise = null;
+const _pdfDocCache = {};
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[data-src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === "1") resolve();
+      else existing.addEventListener("load", () => resolve(), { once: true });
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = src;
+    s.dataset.src = src;
+    s.onload = () => { s.dataset.loaded = "1"; resolve(); };
+    s.onerror = () => reject(new Error(`failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+async function ensurePdfJs() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  if (!_pdfJsPromise) {
+    const ver = "3.11.174";
+    const base = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${ver}`;
+    _pdfJsPromise = loadScriptOnce(`${base}/pdf.min.js`).then(() => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = `${base}/pdf.worker.min.js`;
+      return window.pdfjsLib;
+    });
+  }
+  return _pdfJsPromise;
+}
+
+function regionToPctStyle(region) {
+  let x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  if (Array.isArray(region.bbox_norm) && region.bbox_norm.length === 4) {
+    [x0, y0, x1, y1] = region.bbox_norm.map(Number);
+  } else if (Array.isArray(region.bbox) && region.bbox.length === 4) {
+    const w = Number(region.width || 0);
+    const h = Number(region.height || 0);
+    if (w > 0 && h > 0) {
+      const bb = region.bbox.map(Number);
+      x0 = bb[0] / w; y0 = bb[1] / h; x1 = bb[2] / w; y1 = bb[3] / h;
+    } else {
+      return null;
+    }
+  } else {
+    return null;
+  }
+  if (![x0, y0, x1, y1].every(n => Number.isFinite(n))) return null;
+  const left = Math.min(x0, x1);
+  const top = Math.min(y0, y1);
+  const width = Math.abs(x1 - x0);
+  const height = Math.abs(y1 - y0);
+  if (width <= 0 || height <= 0) return null;
+  return {
+    left: `${left * 100}%`,
+    top: `${top * 100}%`,
+    width: `${width * 100}%`,
+    height: `${height * 100}%`,
+  };
+}
+
+async function getPdfDocument(runId) {
+  if (!_pdfDocCache[runId]) {
+    const pdfjs = await ensurePdfJs();
+    const url = `/api/runs/${encodeURIComponent(runId)}/pdf`;
+    _pdfDocCache[runId] = pdfjs.getDocument(url).promise;
+  }
+  return _pdfDocCache[runId];
+}
+
+async function mountChunkPdfViewer(host, runId, regions) {
+  if (!host || !runId) return;
+  const grouped = {};
+  for (const r of (regions || [])) {
+    const page = Number(r.page);
+    if (!Number.isFinite(page) || page <= 0) continue;
+    if (!grouped[page]) grouped[page] = [];
+    grouped[page].push(r);
+  }
+  const pages = Object.keys(grouped).map(Number).sort((a, b) => a - b);
+  if (!pages.length) {
+    host.innerHTML = `<div class="empty">No highlight regions for PDF overlay.</div>`;
+    return;
+  }
+
+  host.innerHTML = `<div class="empty">Loading PDF…</div>`;
+  let info = null;
+  try {
+    info = await api(`/api/runs/${encodeURIComponent(runId)}/pdf/info`);
+  } catch (_) {
+    info = null;
+  }
+  if (!info || !info.available) {
+    host.innerHTML = `<div class="empty">PDF not available for this run.</div>`;
+    return;
+  }
+
+  const shell = document.createElement("div");
+  shell.className = "pdf-chunk-viewer";
+  shell.innerHTML = `<div class="pdf-toolbar">
+    <span>Source: ${esc(info.filename || "document.pdf")}</span>
+    <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank">open full PDF</a>
+  </div><div class="pdf-pages"></div>`;
+  host.innerHTML = "";
+  host.appendChild(shell);
+  const pagesHost = shell.querySelector(".pdf-pages");
+
+  try {
+    const pdf = await getPdfDocument(runId);
+    const scale = 1.35;
+    for (const pageNum of pages) {
+      const page = await pdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale });
+      const wrap = document.createElement("div");
+      wrap.className = "pdf-page-wrap";
+
+      const label = document.createElement("div");
+      label.className = "pdf-page-label";
+      label.textContent = `Page ${pageNum}`;
+
+      const canvasWrap = document.createElement("div");
+      canvasWrap.className = "pdf-canvas-wrap";
+      canvasWrap.style.width = `${Math.round(viewport.width)}px`;
+      canvasWrap.style.height = `${Math.round(viewport.height)}px`;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      const overlay = document.createElement("div");
+      overlay.className = "pdf-overlay";
+      overlay.style.width = `${Math.round(viewport.width)}px`;
+      overlay.style.height = `${Math.round(viewport.height)}px`;
+
+      for (const region of grouped[pageNum]) {
+        const style = regionToPctStyle(region);
+        if (!style) continue;
+        const box = document.createElement("div");
+        box.className = "hl-box";
+        Object.assign(box.style, style);
+        overlay.appendChild(box);
+      }
+
+      canvasWrap.appendChild(canvas);
+      canvasWrap.appendChild(overlay);
+      wrap.appendChild(label);
+      wrap.appendChild(canvasWrap);
+      pagesHost.appendChild(wrap);
+    }
+    if (!pagesHost.children.length) {
+      pagesHost.innerHTML = `<div class="empty">Could not render PDF pages for highlights.</div>`;
+    }
+  } catch (err) {
+    host.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)}</div>`;
+  }
+}
+
+async function openChunkPreview(chunkId, anchorEl) {
+  const id = String(chunkId || "").trim();
+  if (!id || !state.runId) return;
+  const detail = document.getElementById("detail");
+  if (!detail) return;
+  detail.querySelectorAll(".chunk-preview-inline").forEach(r => r.remove());
+  const host = anchorEl && anchorEl.closest
+    ? (anchorEl.closest(".ev-block, .tree-body, td, .viz-section") || anchorEl.parentElement)
+    : detail;
+  const box = document.createElement("div");
+  box.className = "chunk-preview-inline";
+  box.style.cssText = "margin-top:8px;padding:8px 10px;background:#121820;border:1px solid var(--line);border-radius:8px";
+  box.innerHTML = `<div class="empty">Loading ${esc(id)}…</div>`;
+  if (host && host.appendChild) host.appendChild(box);
+  else detail.appendChild(box);
+  try {
+    const [row, hl] = await Promise.all([
+      api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}`),
+      api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}/highlights`).catch(() => null),
+    ]);
+    const regions = (hl && hl.regions) || row.regions || [];
+    const regionRows = regions.length
+      ? regions.map(r => {
+          const bbox = Array.isArray(r.bbox) ? r.bbox.map(n => Number(n).toFixed(1)).join(", ") : "";
+          const norm = Array.isArray(r.bbox_norm)
+            ? r.bbox_norm.map(n => Number(n).toFixed(3)).join(", ")
+            : "";
+          const layout = (hl && hl.layout_paths && hl.layout_paths[String(r.page)]) || "";
+          return `<tr>
+            <td>${esc(String(r.page))}</td>
+            <td><code>${esc(bbox)}</code></td>
+            <td>${norm ? `<code>${esc(norm)}</code>` : "—"}</td>
+            <td>${esc(String(r.n_elements || (r.element_ids || []).length || ""))}</td>
+            <td>${layout ? `<a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(layout)}" target="_blank">layout</a>` : "—"}</td>
+          </tr>`;
+        }).join("")
+      : `<tr><td colspan="5" class="empty">No highlight regions (layout missing or no match).</td></tr>`;
+    const source = hl && hl.source ? ` · regions=${esc(hl.source)}` : "";
+    box.innerHTML = `<details class="tree-node" open style="margin:0">
+      <summary><span class="title">${esc(row.chunk_id)}</span>
+        <span class="tree-badge">${esc((row.pages || [row.page]).join(","))}</span>
+        <span class="tree-kv">${esc(row.heading_path || "")}${source}</span>
+      </summary>
+      <div class="tree-body">
+        <div class="viz-section" style="margin:6px 0">
+          <h3 style="margin:0 0 4px">PDF highlight</h3>
+          <div class="pdf-chunk-host"></div>
+        </div>
+        <div class="viz-section" style="margin:6px 0">
+          <h3 style="margin:0 0 4px">Highlight regions</h3>
+          <table class="kv-table">
+            <thead><tr><th>Page</th><th>bbox (px)</th><th>bbox (norm)</th><th>#el</th><th>layout</th></tr></thead>
+            <tbody>${regionRows}</tbody>
+          </table>
+        </div>
+        <pre class="pretty">${esc(row.text || "")}</pre>
+      </div>
+    </details>`;
+    const pdfHost = box.querySelector(".pdf-chunk-host");
+    if (pdfHost && regions.length) {
+      mountChunkPdfViewer(pdfHost, state.runId, regions);
+    }
+  } catch (err) {
+    box.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)}</div>`;
+  }
+}
+
+function bindChunkJumpButtons(root) {
+  (root || document).querySelectorAll(".chunk-jump").forEach(btn => {
+    btn.onclick = () => openChunkPreview(btn.dataset.chunkId, btn);
+  });
 }
 
 function renderSearchOutput(output) {
   if (!output) return "";
   const pages = output.pages || [];
   const reasons = output.page_reasons || {};
+  const chunkIds = output.page_chunk_id || {};
   return `<div class="viz-section" style="margin:8px 0">
     <h3 style="margin:0 0 6px">SearchAgent output</h3>
     <div class="tree-kv">status=${esc(output.status || "?")} · pages=${pages.length ? esc(pages.join(", ")) : "∅"}</div>
     ${output.reason ? `<div class="tree-kv">reason=${esc(output.reason)}</div>` : ""}
-    ${renderPageReasonsTable(reasons) || (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 1200))}</pre>` : `<div class="tree-kv">No pages returned.</div>`)}
+    ${renderPageReasonsTable(reasons, chunkIds) || (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 1200))}</pre>` : `<div class="tree-kv">No pages returned.</div>`)}
   </div>`;
 }
 
@@ -1578,6 +1885,7 @@ function renderKeyResultRow(kr) {
   const statusCls = status === "complete" ? "ok"
     : (status === "not_found" || String(status).startsWith("handoff") ? "warn" : "");
   const reasons = kr.page_reasons || kr.reasons || {};
+  const chunkIds = kr.page_chunk_id || {};
   return `<details class="tree-node key-result">
     <summary>
       <span class="tree-kv">${esc(kr.key)}</span>
@@ -1586,7 +1894,7 @@ function renderKeyResultRow(kr) {
     </summary>
     <div class="tree-body">
       ${kr.reason ? `<div class="tree-kv">reason=${esc(kr.reason)}</div>` : ""}
-      ${renderPageReasonsTable(reasons) || (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 800))}</pre>` : "")}
+      ${renderPageReasonsTable(reasons, chunkIds) || (pages.length ? `<pre class="pretty">${esc(pretty({pages}, 800))}</pre>` : "")}
       ${kr.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(kr.filename)}">open per-key dump</a></div>` : ""}
     </div>
   </details>`;
@@ -1612,6 +1920,7 @@ function renderSearchAgent(node) {
   const output = node.output || {
     pages: res.pages || [],
     page_reasons: res.page_reasons || res.reasons || {},
+    page_chunk_id: res.page_chunk_id || {},
     status: res.status,
   };
   const shared = !!(node.shared || (node.batch && (node.key_results || []).length > 1));
@@ -1694,6 +2003,7 @@ function renderExtractKvVlm(tool) {
   const keys = args.keys || result.keys || [];
   const hints = args.hints;
   const pageReasons = args.page_reasons || result.page_reasons || {};
+  const pageChunkIds = args.page_chunk_id || result.page_chunk_id || {};
   const parsed = result.result || {};
   const extractions = Array.isArray(parsed.extractions) ? parsed.extractions : [];
   const covered = result.all_keys_covered;
@@ -1718,12 +2028,13 @@ function renderExtractKvVlm(tool) {
     <div class="tree-kv">
       pages=${esc(JSON.stringify(pages))} · keys=${esc(JSON.stringify(keys))}
       ${nReasons ? ` · page_reasons=${esc(nReasons)}` : ""}
+      ${Object.keys(pageChunkIds || {}).length ? ` · page_chunk_id=${esc(Object.keys(pageChunkIds).length)}` : ""}
       ${result.input_tokens != null || result.output_tokens != null
         ? ` · VLM in=${esc(result.input_tokens ?? "—")} out=${esc(result.output_tokens ?? "—")}` : ""}
       ${covered === true ? `<span class="tree-badge ok">all_keys_covered</span>` : ""}
       ${covered === false ? `<span class="tree-badge warn">partial</span>` : ""}
     </div>
-    ${renderPageReasonsTable(pageReasons)}
+    ${renderPageReasonsTable(pageReasons, pageChunkIds)}
     ${hintsHtml}
     ${rows ? `<table class="kv-table" style="margin-top:8px">
       <thead><tr><th>Key</th><th>Value</th><th>Evidence</th></tr></thead>
@@ -2326,6 +2637,15 @@ function renderEval() {
     const sp = row.search_pages || {};
     const et = row.evidence_text || {};
     const sr = row.search_reasons || {};
+    const pc = row.page_chunk_id || {};
+    const chunkMap = (pc.pred_map && typeof pc.pred_map === "object") ? pc.pred_map : {};
+    const chunkJumpRows = Object.entries(chunkMap).map(([page, cid]) => {
+      const id = String(cid || "").trim();
+      if (!id) return "";
+      return `<div class="ev-chunk-row">p${esc(page)}:
+        <button type="button" class="chunk-jump" data-chunk-id="${esc(id)}">${esc(id)}</button>
+      </div>`;
+    }).filter(Boolean).join("");
     const ae = (state.agenticEvals || {})[row.key];
     const inflight = state.agenticEvalInflight;
     let agenticCell;
@@ -2376,6 +2696,10 @@ function renderEval() {
             <span class="ev-label search">SearchAgent page_reasons</span>
             <div class="ev-text">${esc(sr.pred || "(empty)")}</div>
           </div>
+          ${chunkJumpRows ? `<div class="ev-block">
+            <span class="ev-label search">SearchAgent chunks</span>
+            <div class="ev-text">${chunkJumpRows}</div>
+          </div>` : ""}
           <div class="ev-block">
             <span class="ev-label gold">gold evidences</span>
             <div class="ev-text">${esc(et.gold || "(empty)")}</div>
@@ -2693,7 +3017,10 @@ function paintDetail() {
     btn.onclick = async () => {
       const id = btn.dataset.chunkId;
       const dataRow = btn.closest("tr.chunk-row");
-      if (!dataRow) return;
+      if (!dataRow) {
+        openChunkPreview(id, btn);
+        return;
+      }
       // Toggle closed if same preview already open under this row.
       const existing = dataRow.nextElementSibling;
       if (existing && existing.classList.contains("chunk-preview-row")
@@ -2724,6 +3051,7 @@ function paintDetail() {
       }
     };
   });
+  bindChunkJumpButtons(detail);
   const openJsonDump = async (relPath) => {
     const data = await api(runFileUrl(relPath));
     const w = window.open("", "_blank");
