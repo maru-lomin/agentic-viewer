@@ -140,6 +140,7 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .cell-agent.invalid { color: var(--err); font-weight: 600; }
     .cell-agent.pending { color: var(--muted); }
     .cell-agent.running { color: var(--warn); }
+    .live-progress { color: var(--warn); font-size: 12px; }
     .cell-agent.error { color: var(--err); font-size: 11px; }
     .cell-sub { color: var(--muted); font-size: 10px; margin-top: 2px; }
     a { color: var(--accent); text-decoration: none; }
@@ -220,7 +221,6 @@ const state = {
   batchJob: null,
   batchViewFocused: false,
   skipExisting: true,
-  pollTimer: null,
   contentTab: "summary",
   hierarchyRunId: null,
   hierarchyKey: null,
@@ -232,10 +232,11 @@ const state = {
   agenticEvalError: null,
 };
 
-function summaryRunIds() {
-  if (state.selected.size) return [...state.selected];
-  if (state.batchJob?.run_ids?.length) return [...state.batchJob.run_ids];
-  return [];
+function viewRunIds() {
+  if (state.batchViewFocused && state.batchJob?.run_ids?.length) {
+    return [...state.batchJob.run_ids];
+  }
+  return [...state.selected];
 }
 
 function batchRunSet() {
@@ -252,6 +253,27 @@ function fmtPct(v) {
   return Number(v).toFixed(2);
 }
 
+function formatLiveLabel(live) {
+  if (!live) return "";
+  if (live.live_label) return live.live_label;
+  const parts = [];
+  if (live.master_turn != null) parts.push(`EvalMaster turn ${live.master_turn}`);
+  if (live.search_session != null) {
+    if (live.search_turn != null) {
+      parts.push(`Search session ${live.search_session} turn ${live.search_turn}`);
+    } else {
+      parts.push(`Search session ${live.search_session}`);
+    }
+  }
+  const activity = String(live.activity || "");
+  if (activity === "waiting_llm") {
+    parts.push(live.active_agent === "search" ? "waiting Search LLM" : "waiting EvalMaster LLM");
+  } else if (activity.startsWith("tool:")) {
+    parts.push(activity.replace("tool:", "tool "));
+  }
+  return parts.join(" · ");
+}
+
 function parseSelectedFromUrl() {
   const q = new URLSearchParams(location.search).get("runs");
   if (!q) return new Set();
@@ -264,9 +286,8 @@ function parseContentTabFromUrl() {
 }
 
 function syncUrl() {
-  const ids = summaryRunIds();
   const params = new URLSearchParams();
-  if (ids.length) params.set("runs", ids.join(","));
+  if (state.selected.size) params.set("runs", [...state.selected].join(","));
   if (state.batchJob?.job_id && state.batchViewFocused) {
     params.set("job", state.batchJob.job_id);
   }
@@ -281,7 +302,7 @@ function syncUrl() {
 }
 
 function hierarchyRunCandidates() {
-  return summaryRunIds();
+  return viewRunIds();
 }
 
 function ensureHierarchySelection() {
@@ -612,31 +633,38 @@ function batchIsActive() {
   return j && (j.status === "queued" || j.status === "running");
 }
 
+function renderBatchStartControls() {
+  const disabled = !state.selected.size || batchIsActive();
+  return `
+    <div class="batch-panel">
+      <div class="title">Batch agentic-evaluation</div>
+      <div class="toolbar" style="margin:0">
+        <button type="button" class="primary" id="startBatch" ${disabled ? "disabled" : ""}>
+          Run all keys (selected runs)
+        </button>
+        <label class="btn"><input type="checkbox" id="skipExisting" ${state.skipExisting ? "checked" : ""} />
+          Skip existing</label>
+      </div>
+      <p class="hint" style="margin:8px 0 0">
+        Evaluates every gold key via the inference API (serial per run). Results save under
+        <code>06_agentic_eval/</code>.
+      </p>
+    </div>`;
+}
+
 function renderBatchPanel() {
   const j = state.batchJob;
   if (!j) {
-    const disabled = !state.selected.size || batchIsActive();
-    return `
-      <div class="batch-panel">
-        <div class="title">Batch agentic-evaluation</div>
-        <div class="toolbar" style="margin:0">
-          <button type="button" class="primary" id="startBatch" ${disabled ? "disabled" : ""}>
-            Run all keys (selected runs)
-          </button>
-          <label class="btn"><input type="checkbox" id="skipExisting" ${state.skipExisting ? "checked" : ""} />
-            Skip existing</label>
-        </div>
-        <p class="hint" style="margin:8px 0 0">
-          Evaluates every gold key via the inference API (serial per run). Results save under
-          <code>06_agentic_eval/</code>.
-        </p>
-      </div>`;
+    return renderBatchStartControls();
   }
 
   const pct = j.progress_pct ?? (j.total ? Math.round(100 * j.completed / j.total) : 0);
   const running = j.status === "queued" || j.status === "running";
-  const cur = j.current
-    ? `<div class="line">Current: <strong>${esc(j.current.run_id)}</strong> · ${esc(j.current.key)}</div>`
+  const cur = j.current;
+  const curHtml = cur
+    ? `<div class="line">Current: <strong>${esc(cur.run_id)}</strong> · ${esc(cur.key)}</div>
+       ${cur.live_label || formatLiveLabel(cur.live)
+         ? `<div class="line live-progress">${esc(cur.live_label || formatLiveLabel(cur.live))}</div>` : ""}`
     : "";
   const errBlock = (j.errors || []).length
     ? `<div class="err-text">${j.errors.length} error(s) — latest: ${esc(j.errors[j.errors.length - 1].error)}</div>`
@@ -644,13 +672,19 @@ function renderBatchPanel() {
   const cancelBtn = running
     ? `<button type="button" class="danger" id="cancelBatch">Cancel</button>`
     : "";
+  const refreshBtn = running
+    ? `<button type="button" class="btn" id="refreshBatch">Refresh</button>`
+    : "";
+  const dismissBtn = running
+    ? ""
+    : `<button type="button" class="btn" id="dismissBatch">Dismiss</button>`;
   const runList = (j.run_ids || []).map(id => esc(id)).join(", ");
   const focused = state.batchViewFocused;
   const viewHint = focused
     ? `<div class="view-hint">Showing summary & matrix for ${(j.run_ids || []).length} run(s) in this job</div>`
     : `<div class="view-hint">Click to view per-run summary and key × run matrix</div>`;
 
-  return `
+  const statusHtml = `
     <div class="batch-panel ${running ? "running" : ""} clickable ${focused ? "focused" : ""}"
          id="batchJobPanel" role="button" tabindex="0"
          title="View evaluation summary for batch runs">
@@ -662,13 +696,15 @@ function renderBatchPanel() {
         · failed ${j.failed}
         ${pct != null ? ` · ${pct}%` : ""}
       </div>
-      ${cur}
+      ${curHtml}
       <div class="progress-wrap"><div class="progress-bar" style="width:${Math.max(0, Math.min(100, pct || 0))}%"></div></div>
       <div class="line">${esc(j.message || "")}</div>
       ${errBlock}
-      ${viewHint}
-      <div class="toolbar" style="margin:8px 0 0">${cancelBtn}</div>
+      ${running ? `<div class="view-hint">Progress updates manually — click Refresh</div>` : viewHint}
+      <div class="toolbar" style="margin:8px 0 0">${cancelBtn}${refreshBtn}${dismissBtn}</div>
     </div>`;
+
+  return running ? statusHtml : `${statusHtml}${renderBatchStartControls()}`;
 }
 
 function renderRunList() {
@@ -694,7 +730,7 @@ function renderRunList() {
     return `
       <div class="run-item ${sel}${batchCls}" data-id="${esc(r.run_id)}">
         <div class="row1">
-          <input type="checkbox" ${checked} data-run-check="${esc(r.run_id)}" ${batchIsActive() ? "disabled" : ""} />
+          <input type="checkbox" ${checked} data-run-check="${esc(r.run_id)}" />
           <div>
             <div class="id">${esc(r.run_id)}</div>
             <div class="sub">
@@ -716,7 +752,7 @@ function renderRunList() {
   });
   el.querySelectorAll(".run-item").forEach(node => {
     node.onclick = (e) => {
-      if (e.target.matches("input") || batchIsActive()) return;
+      if (e.target.matches("input")) return;
       const id = node.dataset.id;
       toggleRun(id, !state.selected.has(id));
     };
@@ -734,7 +770,6 @@ function toggleRun(runId, on) {
 
 function focusBatchJob() {
   if (!state.batchJob?.run_ids?.length) return;
-  state.selected = new Set(state.batchJob.run_ids);
   state.batchViewFocused = true;
   persistBatchJobId(state.batchJob.job_id);
   syncUrl();
@@ -788,7 +823,11 @@ function renderSummaryBody() {
         const goldHtml = gv ? `<div class="cell-agent ${goldCls}">GT: ${esc(gv)}</div>` : "";
         agentHtml = `${predHtml}${goldHtml}`;
       } else if (ae.status === "running" || isCurrent) {
-        agentHtml = `<div class="cell-agent running">running</div>`;
+        const liveLabel = ae.live_label || formatLiveLabel(ae.live)
+          || (isCurrent ? formatLiveLabel(cur?.live) : "");
+        agentHtml = liveLabel
+          ? `<div class="cell-agent running">running</div><div class="cell-sub">${esc(liveLabel)}</div>`
+          : `<div class="cell-agent running">running</div>`;
       } else if (ae.status === "error") {
         agentHtml = `<div class="cell-agent error">${esc(ae.error || "error")}</div>`;
       } else {
@@ -850,7 +889,7 @@ function renderSummaryBody() {
 function renderContent() {
   const el = document.getElementById("content");
   const batchHtml = renderBatchPanel();
-  const hasRuns = summaryRunIds().length > 0;
+  const hasRuns = viewRunIds().length > 0;
   const tabs = contentTabsHtml();
 
   if (!hasRuns && !state.batchJob) {
@@ -912,10 +951,24 @@ function bindBatchControls() {
       cancelBatch();
     };
   }
+  const dismissBtn = document.getElementById("dismissBatch");
+  if (dismissBtn) {
+    dismissBtn.onclick = (e) => {
+      e.stopPropagation();
+      dismissBatchJob();
+    };
+  }
+  const refreshBtn = document.getElementById("refreshBatch");
+  if (refreshBtn) {
+    refreshBtn.onclick = (e) => {
+      e.stopPropagation();
+      refreshBatchJob();
+    };
+  }
   const panel = document.getElementById("batchJobPanel");
   if (panel) {
     panel.onclick = (e) => {
-      if (e.target.closest("#cancelBatch")) return;
+      if (e.target.closest("#cancelBatch, #dismissBatch, #refreshBatch")) return;
       focusBatchJob();
     };
     panel.onkeydown = (e) => {
@@ -927,8 +980,18 @@ function bindBatchControls() {
   }
 }
 
+function dismissBatchJob() {
+  if (batchIsActive()) return;
+  state.batchJob = null;
+  state.batchViewFocused = false;
+  persistBatchJobId(null);
+  syncUrl();
+  renderSummary();
+  renderRunList();
+}
+
 async function loadSummary(silent=false) {
-  const runIds = summaryRunIds();
+  const runIds = viewRunIds();
   if (!runIds.length) {
     state.summary = null;
     if (!silent) state.error = null;
@@ -960,42 +1023,26 @@ async function refreshRuns() {
   renderRunList();
 }
 
-async function pollBatchJob() {
+async function refreshBatchJob() {
   if (!state.batchJob?.job_id) return;
   try {
     state.batchJob = await api(`/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}`);
-    if (state.batchViewFocused && state.batchJob.run_ids?.length) {
-      state.selected = new Set(state.batchJob.run_ids);
-    }
     renderSummary();
     renderRunList();
     maybeFollowBatchHierarchy();
-    if (state.batchJob.status === "running" || state.batchJob.status === "queued") {
-      if (state.batchViewFocused || summaryRunIds().length) {
-        await loadSummary(true);
-      }
-      return;
+    const running = state.batchJob.status === "running" || state.batchJob.status === "queued";
+    if (!running) {
+      persistBatchJobId(null);
     }
-    stopPolling();
-    persistBatchJobId(null);
-    await refreshRuns();
-    if (summaryRunIds().length) await loadSummary(true);
+    if (viewRunIds().length) {
+      await loadSummary(true);
+    }
+    if (!running) {
+      await refreshRuns();
+    }
   } catch (err) {
     state.error = String(err.message || err);
-    stopPolling();
     renderSummary();
-  }
-}
-
-function startPolling() {
-  stopPolling();
-  state.pollTimer = setInterval(pollBatchJob, 2000);
-}
-
-function stopPolling() {
-  if (state.pollTimer) {
-    clearInterval(state.pollTimer);
-    state.pollTimer = null;
   }
 }
 
@@ -1013,8 +1060,7 @@ async function startBatch() {
     renderSummary();
     renderRunList();
     if (batchIsActive()) {
-      startPolling();
-      await loadSummary(true);
+      await refreshBatchJob();
     } else {
       persistBatchJobId(null);
       await loadSummary(true);
@@ -1032,7 +1078,7 @@ async function cancelBatch() {
       `/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}/cancel`,
       {}
     );
-    renderSummary();
+    await refreshBatchJob();
   } catch (err) {
     state.error = String(err.message || err);
     renderSummary();
@@ -1051,7 +1097,6 @@ async function loadBatchJobById(jobId) {
 async function resumeActiveJob() {
   const params = new URLSearchParams(location.search);
   const jobParam = params.get("job");
-  const wantFocus = params.has("job") || params.has("runs");
 
   let job = null;
   if (jobParam) {
@@ -1074,38 +1119,39 @@ async function resumeActiveJob() {
   }
 
   const running = job.status === "queued" || job.status === "running";
-  if (!running) {
+  if (!running && !jobParam) {
     persistBatchJobId(null);
+    return;
   }
 
   state.batchJob = job;
-  persistBatchJobId(job.job_id);
-  if (wantFocus || batchIsActive()) {
-    state.selected = new Set(job.run_ids || []);
+  if (running) {
+    persistBatchJobId(job.job_id);
+  } else {
+    persistBatchJobId(null);
+  }
+  if (jobParam) {
     state.batchViewFocused = true;
     syncUrl();
   }
   renderSummary();
   renderRunList();
-  if (batchIsActive()) {
-    startPolling();
-    if (state.batchViewFocused) await loadSummary(true);
-  } else if (state.batchViewFocused) {
+  if (state.batchViewFocused) {
     await loadSummary(true);
   }
 }
 
 document.getElementById("selectFinished").onclick = () => {
-  if (batchIsActive()) return;
   state.runs.filter(r => r.status === "ok").forEach(r => state.selected.add(r.run_id));
+  state.batchViewFocused = false;
   syncUrl();
   renderRunList();
   loadSummary();
 };
 
 document.getElementById("clearSelection").onclick = () => {
-  if (batchIsActive()) return;
   state.selected.clear();
+  state.batchViewFocused = false;
   syncUrl();
   renderRunList();
   loadSummary();
@@ -1114,7 +1160,7 @@ document.getElementById("clearSelection").onclick = () => {
 (async function init() {
   const params = new URLSearchParams(location.search);
   state.selected = parseSelectedFromUrl();
-  if (state.selected.size) state.batchViewFocused = true;
+  if (params.get("job")) state.batchViewFocused = true;
   state.contentTab = parseContentTabFromUrl();
   state.hierarchyRunId = params.get("hrun");
   state.hierarchyKey = params.get("hkey");
@@ -1127,7 +1173,7 @@ document.getElementById("clearSelection").onclick = () => {
     ensureHierarchySelection();
     await loadHierarchyKeys();
   }
-  if (summaryRunIds().length && !state.summary) await loadSummary();
+  if (viewRunIds().length && !state.summary) await loadSummary();
   else renderContent();
 })();
 </script>

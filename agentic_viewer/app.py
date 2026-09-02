@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from agentic_viewer.eval.paths import answer_sheet_path
 from agentic_viewer.evaluation.agentic_client import AgenticEvalError, invoke_agentic_eval
-from agentic_viewer.evaluation.batch import make_batch_manager
+from agentic_viewer.evaluation.batch import enrich_batch_job_dict, make_batch_manager
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
 from agentic_viewer.evaluation.summary import (
     agentic_eval_summary,
@@ -319,7 +319,10 @@ def get_active_batch_job() -> Dict[str, Any]:
     job = _BATCH_MANAGER.get_active_job()
     if job is None:
         return {"active": False, "job": None}
-    return {"active": True, "job": job.to_dict()}
+    return {
+        "active": True,
+        "job": enrich_batch_job_dict(job.to_dict(), RUNS_ROOT),
+    }
 
 
 @app.get("/api/evaluation/batch-jobs/{job_id}")
@@ -327,7 +330,7 @@ def get_batch_job(job_id: str) -> Dict[str, Any]:
     job = _BATCH_MANAGER.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
-    return job.to_dict()
+    return enrich_batch_job_dict(job.to_dict(), RUNS_ROOT)
 
 
 @app.post("/api/evaluation/batch-agentic-eval")
@@ -343,7 +346,7 @@ def post_batch_agentic_eval(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     skip_existing = bool(body.get("skip_existing", True))
     try:
         job = _BATCH_MANAGER.start(run_ids, skip_existing=skip_existing)
-        return job.to_dict()
+        return enrich_batch_job_dict(job.to_dict(), RUNS_ROOT)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
@@ -356,7 +359,7 @@ def post_batch_agentic_eval(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 def cancel_batch_job(job_id: str) -> Dict[str, Any]:
     try:
         job = _BATCH_MANAGER.cancel(job_id)
-        return job.to_dict()
+        return enrich_batch_job_dict(job.to_dict(), RUNS_ROOT)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

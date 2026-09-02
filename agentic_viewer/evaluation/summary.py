@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
+from agentic_viewer.evaluation.live_progress import format_live_progress, read_eval_live_progress
 
 
 def _read_json(path: Path) -> Any:
@@ -39,12 +40,20 @@ def read_agentic_evals(run_dir: Path) -> Dict[str, Any]:
         if not key:
             continue
         key = str(key)
-        if key not in by_key and status.get("status") == "running":
+        if status.get("status") == "running":
+            # Running status always wins over stale cancelled/error result files.
+            by_key[key] = status
+        elif key not in by_key:
             by_key[key] = status
     return by_key
 
 
-def _agentic_cell(by_key: Dict[str, Any], key: str) -> Dict[str, Any]:
+def _agentic_cell(
+    by_key: Dict[str, Any],
+    key: str,
+    *,
+    run_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
     ae = by_key.get(key)
     if not ae:
         return {"status": "pending"}
@@ -63,7 +72,13 @@ def _agentic_cell(by_key: Dict[str, Any], key: str) -> Dict[str, Any]:
     if status == "cancelled":
         return {"status": "error", "error": ae.get("error") or "cancelled"}
     if status == "running":
-        return {"status": "running"}
+        cell: Dict[str, Any] = {"status": "running"}
+        if run_dir is not None:
+            live = read_eval_live_progress(run_dir, key)
+            if live:
+                cell["live"] = live
+                cell["live_label"] = format_live_progress(live)
+        return cell
     return {"status": status}
 
 
@@ -222,7 +237,7 @@ def build_evaluation_summary(
                 "page_f1": (row.get("search_pages") or {}).get("f1"),
                 "evidence_f1": (row.get("evidence_text") or {}).get("token_f1"),
                 "pred_value": value.get("pred"),
-                "agentic": _agentic_cell(by_key_agentic, key),
+                "agentic": _agentic_cell(by_key_agentic, key, run_dir=run_dir),
             }
 
     unique_docs = sorted(set(documents))

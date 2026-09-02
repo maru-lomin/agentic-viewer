@@ -11,8 +11,32 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agentic_viewer.evaluation.agentic_client import invoke_agentic_eval_safe, cancel_agentic_eval_safe
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
+from agentic_viewer.evaluation.live_progress import format_live_progress, read_eval_live_progress
 from agentic_viewer.evaluation.status_cleanup import mark_running_eval_status_cancelled
 from agentic_viewer.evaluation.summary import read_agentic_evals
+
+
+def enrich_batch_job_dict(
+    job_dict: Dict[str, Any],
+    runs_root: Path,
+) -> Dict[str, Any]:
+    """Attach live EvalMaster / SearchAgent progress for the current batch key."""
+    if job_dict.get("status") not in {"running", "queued"}:
+        return job_dict
+    current = job_dict.get("current")
+    if not isinstance(current, dict):
+        return job_dict
+    run_id = str(current.get("run_id") or "").strip()
+    key = str(current.get("key") or "").strip()
+    if not run_id or not key:
+        return job_dict
+    live = read_eval_live_progress(runs_root / run_id, key)
+    if not live:
+        return job_dict
+    enriched = dict(current)
+    enriched["live"] = live
+    enriched["live_label"] = format_live_progress(live)
+    return {**job_dict, "current": enriched}
 
 
 def _utc_now() -> str:
