@@ -136,6 +136,8 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .cell-em-n { color: var(--err); }
     .cell-agent.correct { color: var(--ok); font-weight: 600; }
     .cell-agent.incorrect { color: var(--err); font-weight: 600; }
+    .cell-agent.valid { color: var(--ok); font-weight: 600; }
+    .cell-agent.invalid { color: var(--err); font-weight: 600; }
     .cell-agent.pending { color: var(--muted); }
     .cell-agent.running { color: var(--warn); }
     .cell-agent.error { color: var(--err); font-size: 11px; }
@@ -177,6 +179,14 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .matrix .open-hierarchy {
       display: block; margin-top: 4px; font-size: 10px; color: var(--accent);
     }
+    .cell-eval-btn {
+      display: block; margin-top: 6px; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--line); background: #152033; color: var(--text);
+      font-size: 10px; cursor: pointer;
+    }
+    .cell-eval-btn:hover:not(:disabled) { border-color: var(--accent); }
+    .cell-eval-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .cell-eval-btn.subtle { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -218,6 +228,8 @@ const state = {
   hierarchyKeysLoading: false,
   hierarchyFollowBatch: true,
   hierarchyIframeSrc: null,
+  agenticInflight: null,
+  agenticEvalError: null,
 };
 
 function summaryRunIds() {
@@ -290,9 +302,19 @@ function hierarchyIframeSrc() {
   if (!state.hierarchyRunId || !state.hierarchyKey) return "";
   const q = new URLSearchParams({
     run: state.hierarchyRunId,
-    tab: "hierarchy",
+    tab: "hierarchy_eval",
     eval_key: state.hierarchyKey,
     embed: "1",
+  });
+  return `/?${q.toString()}`;
+}
+
+function hierarchyFullPageHref() {
+  if (!state.hierarchyRunId || !state.hierarchyKey) return "";
+  const q = new URLSearchParams({
+    run: state.hierarchyRunId,
+    tab: "hierarchy_eval",
+    eval_key: state.hierarchyKey,
   });
   return `/?${q.toString()}`;
 }
@@ -345,7 +367,7 @@ function maybeFollowBatchHierarchy() {
 function contentTabsHtml() {
   return `<div class="content-tabs">
     <button type="button" data-content-tab="summary" class="${state.contentTab === "summary" ? "active" : ""}">Summary</button>
-    <button type="button" data-content-tab="hierarchy" class="${state.contentTab === "hierarchy" ? "active" : ""}">Agent hierarchy</button>
+    <button type="button" data-content-tab="hierarchy" class="${state.contentTab === "hierarchy" ? "active" : ""}">Eval hierarchy</button>
   </div>`;
 }
 
@@ -360,8 +382,9 @@ function renderHierarchyToolbar() {
   ).join("");
   const keyOpts = state.hierarchyKeys.map(row => {
     const status = row.status || "pending";
-    const verdict = row.is_correct_answer ? ` · ${row.is_correct_answer}` : "";
-    return `<option value="${esc(row.key)}" ${row.key === state.hierarchyKey ? "selected" : ""}>${esc(row.key)} (${esc(status)}${esc(verdict)})</option>`;
+    const verdict = row.is_correct_answer ? ` · pred ${row.is_correct_answer}` : "";
+    const goldVerdict = row.is_valid_gold ? ` · GT ${row.is_valid_gold}` : "";
+    return `<option value="${esc(row.key)}" ${row.key === state.hierarchyKey ? "selected" : ""}>${esc(row.key)} (${esc(status)}${esc(verdict)}${esc(goldVerdict)})</option>`;
   }).join("");
   const follow = state.hierarchyFollowBatch
     ? `<label class="btn" style="font-size:12px"><input type="checkbox" id="followBatch" checked />
@@ -371,7 +394,7 @@ function renderHierarchyToolbar() {
   return `
     <p class="hint">
       EvalMaster → SearchAgent trace for one key under <code>06_agentic_eval/</code>.
-      Reuses the inference hierarchy viewer in embed mode.
+      Embedded from the Inference page <b>Eval hierarchy</b> tab.
     </p>
     <div class="hierarchy-toolbar">
       <label>Run
@@ -384,7 +407,7 @@ function renderHierarchyToolbar() {
       </label>
       ${follow}
       ${state.hierarchyRunId && state.hierarchyKey
-        ? `<a href="/?run=${encodeURIComponent(state.hierarchyRunId)}&tab=hierarchy&eval_key=${encodeURIComponent(state.hierarchyKey)}" target="_blank">Open full page</a>`
+        ? `<a href="${esc(hierarchyFullPageHref())}" target="_blank">Open full page</a>`
         : ""}
     </div>`;
 }
@@ -400,7 +423,7 @@ function updateHierarchyFrame() {
   }
   if (state.hierarchyIframeSrc === src) return;
   state.hierarchyIframeSrc = src;
-  host.innerHTML = `<iframe class="hierarchy-frame" src="${esc(src)}" title="Agentic eval hierarchy"></iframe>`;
+  host.innerHTML = `<iframe class="hierarchy-frame" src="${esc(src)}" title="Eval hierarchy"></iframe>`;
 }
 
 function renderHierarchyBody() {
@@ -474,9 +497,19 @@ function bindHierarchyControls() {
     };
   }
   document.querySelectorAll("td[data-matrix-cell]").forEach(td => {
-    td.onclick = () => {
+    td.onclick = (e) => {
+      if (e.target.closest("[data-run-eval]")) return;
       if (!td.dataset.runId || !td.dataset.key) return;
       openHierarchy(td.dataset.runId, td.dataset.key);
+    };
+  });
+}
+
+function bindMatrixControls() {
+  document.querySelectorAll("[data-run-eval]").forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      runAgenticEval(btn.dataset.runId, btn.dataset.key);
     };
   });
 }
@@ -487,7 +520,7 @@ function bindContentTabs() {
       const next = btn.dataset.contentTab;
       if (next === state.contentTab) return;
       state.contentTab = next;
-      if (state.contentTab === "hierarchy") {
+      if (next === "hierarchy") {
         ensureHierarchySelection();
         loadHierarchyKeys().then(() => {
           syncUrl();
@@ -530,6 +563,48 @@ async function apiPost(path, body) {
   try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
   if (!r.ok) throw new Error(data.detail || text || r.statusText);
   return data;
+}
+
+async function runAgenticEval(runId, key) {
+  if (!runId || !key) return;
+  if (state.agenticInflight) return;
+  if (batchIsActive()) return;
+  state.agenticInflight = { runId, key };
+  state.agenticEvalError = null;
+  renderContent();
+  try {
+    await apiPost(`/api/runs/${encodeURIComponent(runId)}/agentic-eval`, { key });
+    await loadSummary(true);
+    await refreshRuns();
+  } catch (err) {
+    state.agenticEvalError = String(err.message || err);
+    await loadSummary(true);
+  } finally {
+    state.agenticInflight = null;
+    renderContent();
+  }
+}
+
+function renderMatrixEvalAction(runId, key, ae, isCurrent) {
+  const inflight = state.agenticInflight;
+  const isInflight = inflight && inflight.runId === runId && inflight.key === key;
+  const batchDisabled = batchIsActive();
+  if (ae.status === "running" || isCurrent || isInflight) {
+    return `<button type="button" class="cell-eval-btn" disabled>Running…</button>`;
+  }
+  if (ae.status === "error") {
+    return `<button type="button" class="cell-eval-btn" data-run-eval="1"
+      data-run-id="${esc(runId)}" data-key="${esc(key)}"
+      ${batchDisabled ? "disabled" : ""}>Retry</button>`;
+  }
+  if (ae.status === "done") {
+    return `<button type="button" class="cell-eval-btn subtle" data-run-eval="1"
+      data-run-id="${esc(runId)}" data-key="${esc(key)}"
+      ${batchDisabled ? "disabled" : ""}>Re-run</button>`;
+  }
+  return `<button type="button" class="cell-eval-btn" data-run-eval="1"
+    data-run-id="${esc(runId)}" data-key="${esc(key)}"
+    ${batchDisabled ? "disabled" : ""}>agentic-eval</button>`;
 }
 
 function batchIsActive() {
@@ -613,7 +688,7 @@ function renderRunList() {
       ? `EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)}`
       : "no baseline eval";
     const agentic = ae
-      ? `agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · acc ${fmtPct(ae.accuracy)}` : ""}`
+      ? `agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · pred acc ${fmtPct(ae.accuracy)}` : ""}${ae.gold_validity != null ? ` · GT valid ${fmtPct(ae.gold_validity)}` : ""}`
       : "agentic —";
     const badgeCls = r.status === "ok" ? "ok" : (r.status === "error" ? "error" : "warn");
     return `
@@ -685,6 +760,7 @@ function renderSummaryBody() {
       <td>${r.has_baseline_eval ? fmtPct(b.evidence_token_f1) : "—"}</td>
       <td>${a.n_done ?? 0}/${a.n_total ?? 0}</td>
       <td>${a.accuracy != null ? fmtPct(a.accuracy) : "—"}</td>
+      <td>${a.gold_validity != null ? fmtPct(a.gold_validity) : "—"}</td>
     </tr>`;
   }).join("");
 
@@ -705,8 +781,12 @@ function renderSummaryBody() {
       const canOpen = ae.status === "done" || ae.status === "error" || ae.status === "running";
       if (ae.status === "done") {
         const v = String(ae.is_correct_answer || "").toLowerCase();
-        const cls = v === "correct" ? "correct" : (v === "incorrect" ? "incorrect" : "pending");
-        agentHtml = `<div class="cell-agent ${cls}">${esc(v || "?")}</div>`;
+        const gv = String(ae.is_valid_gold || "").toLowerCase();
+        const predCls = v === "correct" ? "correct" : (v === "incorrect" ? "incorrect" : "pending");
+        const goldCls = gv === "valid" ? "valid" : (gv === "invalid" ? "invalid" : "pending");
+        const predHtml = v ? `<div class="cell-agent ${predCls}">pred: ${esc(v)}</div>` : "";
+        const goldHtml = gv ? `<div class="cell-agent ${goldCls}">GT: ${esc(gv)}</div>` : "";
+        agentHtml = `${predHtml}${goldHtml}`;
       } else if (ae.status === "running" || isCurrent) {
         agentHtml = `<div class="cell-agent running">running</div>`;
       } else if (ae.status === "error") {
@@ -715,12 +795,14 @@ function renderSummaryBody() {
         agentHtml = `<div class="cell-agent pending">pending</div>`;
       }
       const openLink = canOpen
-        ? `<span class="open-hierarchy">view hierarchy</span>` : "";
+        ? `<span class="open-hierarchy">view eval hierarchy</span>` : "";
+      const evalAction = renderMatrixEvalAction(runId, row.key, ae, isCurrent);
       return `<td class="${canOpen ? "clickable" : ""}" data-matrix-cell="1"
         data-run-id="${esc(runId)}" data-key="${esc(row.key)}">
         <div class="${emCls}">EM ${cell.baseline_em ? "Y" : "N"}</div>
         <div class="cell-sub">pageF1 ${fmtPct(cell.page_f1)} · evid ${fmtPct(cell.evidence_f1)}</div>
         ${agentHtml}
+        ${evalAction}
         ${openLink}
       </td>`;
     }).join("");
@@ -735,17 +817,20 @@ function renderSummaryBody() {
     <p class="hint">
       Baseline metrics from <code>04_result.json</code> vs answer sheet.
       Agentic verdicts from <code>06_agentic_eval/</code> (refreshes while batch runs).
+      Use <b>agentic-eval</b> per cell for a single key, or batch run above for all keys.
     </p>
+    ${state.agenticEvalError
+      ? `<div class="err-text">Agentic eval: ${esc(state.agenticEvalError)}</div>` : ""}
     ${warn}
     <h2 style="font-size:14px;margin:0 0 10px">Per-run summary</h2>
     <table class="run-table">
       <thead>
         <tr>
           <th>Run</th><th>Document</th><th>Value EM</th><th>Page F1</th>
-          <th>Evid F1</th><th>Agentic done</th><th>Agentic acc</th>
+          <th>Evid F1</th><th>Agentic done</th><th>Pred acc</th><th>GT valid</th>
         </tr>
       </thead>
-      <tbody>${runRows || `<tr><td colspan="7" class="empty">No runs</td></tr>`}</tbody>
+      <tbody>${runRows || `<tr><td colspan="8" class="empty">No runs</td></tr>`}</tbody>
     </table>
     <h2 style="font-size:14px;margin:16px 0 10px">Key × run matrix</h2>
     <div class="matrix-wrap">
@@ -808,6 +893,7 @@ function renderContent() {
   bindBatchControls();
   bindContentTabs();
   bindHierarchyControls();
+  bindMatrixControls();
 }
 
 function renderSummary() {

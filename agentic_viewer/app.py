@@ -786,6 +786,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .agentic-eval-verdict.incorrect {
       color: var(--err); background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.35);
     }
+    .agentic-eval-verdict.valid {
+      color: var(--ok); background: rgba(61, 214, 140, 0.12); border: 1px solid rgba(61, 214, 140, 0.35);
+    }
+    .agentic-eval-verdict.invalid {
+      color: var(--err); background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.35);
+    }
+    .agentic-eval-verdicts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
     .agentic-eval-err { color: var(--err); font-size: 11px; }
     .em-y { color: var(--ok); font-weight: 600; }
     .em-n { color: var(--err); font-weight: 600; }
@@ -905,7 +912,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </main>
 <script>
 const state = {
-  runs: [], runId: null, tab: "hierarchy",
+  runs: [], runId: null, tab: "hierarchy_kv",
   pages: [], chunks: null, pagesSubtab: "pages",
   agentTree: null, info: null,
   evalReport: null, evalError: null, evalLoading: false,
@@ -913,12 +920,17 @@ const state = {
   evalOpenDetails: new Set(),
   batchJob: null, batchPollTimer: null,
   evalKey: null, embed: false,
+  evalHierarchyKeys: [], evalHierarchyKeysLoading: false,
 };
+
+function isEvalHierarchyView() {
+  return state.tab === "hierarchy_eval" || (state.embed && state.evalKey);
+}
 
 function runFileUrl(relPath) {
   const encRun = encodeURIComponent(state.runId);
   const encPath = encodeURIComponent(relPath);
-  if (state.evalKey) {
+  if (isEvalHierarchyView() && state.evalKey) {
     const encKey = encodeURIComponent(state.evalKey);
     return `/api/runs/${encRun}/agentic-eval/${encKey}/file?path=${encPath}`;
   }
@@ -981,7 +993,7 @@ function renderRuns() {
       : "";
     const ae = r.agentic_eval_summary;
     const agenticLine = ae && ae.n_total
-      ? `<div class="eval-mini">agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · acc ${fmtPct(ae.accuracy)}` : ""}</div>`
+      ? `<div class="eval-mini">agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · pred acc ${fmtPct(ae.accuracy)}` : ""}${ae.gold_validity != null ? ` · GT valid ${fmtPct(ae.gold_validity)}` : ""}</div>`
       : "";
     return `
     <div class="run ${r.run_id === state.runId ? "active" : ""}" data-id="${esc(r.run_id)}">
@@ -1001,13 +1013,19 @@ function renderRuns() {
     `${state.runs.length} run(s) · ${location.origin}`;
 }
 
-async function selectRun(runId) {
+async function selectRun(runId, opts = {}) {
+  const keepTab = Boolean(opts.keepTab);
+  const keepEvalKey = Boolean(opts.keepEvalKey);
   state.runId = runId;
-  if (!state.embed) state.tab = "hierarchy";
+  if (!state.embed && !keepTab) state.tab = "hierarchy_kv";
   state.pagesSubtab = "pages";
   state.agentTree = null;
   state.pages = [];
   state.chunks = null;
+  if (!keepEvalKey) {
+    state.evalKey = null;
+    state.evalHierarchyKeys = [];
+  }
   if (!state.embed) {
     state.evalReport = null;
     state.evalError = null;
@@ -1023,9 +1041,28 @@ async function selectRun(runId) {
   await renderDetail();
 }
 
+async function loadEvalHierarchyKeys() {
+  if (!state.runId) {
+    state.evalHierarchyKeys = [];
+    return;
+  }
+  state.evalHierarchyKeysLoading = true;
+  try {
+    const data = await api(
+      `/api/runs/${encodeURIComponent(state.runId)}/agentic-eval/keys`
+    );
+    state.evalHierarchyKeys = data.keys || [];
+  } catch (_) {
+    state.evalHierarchyKeys = [];
+  } finally {
+    state.evalHierarchyKeysLoading = false;
+  }
+}
+
 async function loadAgentTree() {
   if (!state.runId) return null;
-  if (state.evalKey) {
+  if (isEvalHierarchyView()) {
+    if (!state.evalKey) return null;
     return api(
       `/api/runs/${encodeURIComponent(state.runId)}/agentic-eval/${encodeURIComponent(state.evalKey)}/agent-tree`
     );
@@ -1041,12 +1078,19 @@ async function renderDetail() {
   }
   const keepTab = state.tab;
   detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
+  if (!state.embed && state.tab === "hierarchy_eval") {
+    await loadEvalHierarchyKeys();
+    if (!state.evalKey && state.evalHierarchyKeys.length) {
+      const done = state.evalHierarchyKeys.find(k => k.status === "done");
+      state.evalKey = (done || state.evalHierarchyKeys[0]).key;
+    }
+  }
   const reqs = [
     api(`/api/runs/${encodeURIComponent(state.runId)}`),
     loadAgentTree(),
     api("/api/runs"),
   ];
-  if (!state.embed && !state.evalKey) {
+  if (!state.embed) {
     reqs.splice(1, 0,
       api(`/api/runs/${encodeURIComponent(state.runId)}/pages`),
       api(`/api/runs/${encodeURIComponent(state.runId)}/chunks?limit=200`),
@@ -1055,7 +1099,7 @@ async function renderDetail() {
   const results = await Promise.all(reqs);
   let idx = 0;
   state.info = results[idx++];
-  if (!state.embed && !state.evalKey) {
+  if (!state.embed) {
     const pagesPayload = results[idx++];
     state.pages = Array.isArray(pagesPayload) ? pagesPayload : (pagesPayload?.pages || []);
     state.pagesMeta = Array.isArray(pagesPayload) ? null : pagesPayload;
@@ -1071,7 +1115,8 @@ async function renderDetail() {
 function tabsHtml() {
   if (state.embed) return "";
   const tabs = [
-    ["hierarchy", "Agent hierarchy"],
+    ["hierarchy_kv", "KV hierarchy"],
+    ["hierarchy_eval", "Eval hierarchy"],
     ["timing", "Timing"],
     ["pages", "Pages / Chunks"],
     ["eval", "Eval"],
@@ -1079,6 +1124,26 @@ function tabsHtml() {
   return `<div class="tabs">${tabs.map(([id, label]) =>
     `<button class="tab ${state.tab===id?"active":""}" data-tab="${id}">${label}</button>`
   ).join("")}</div>`;
+}
+
+function renderEvalHierarchyKeyToolbar() {
+  if (state.embed || state.tab !== "hierarchy_eval") return "";
+  const keyOpts = (state.evalHierarchyKeys || []).map(row => {
+    const status = row.status || "pending";
+    const verdict = row.is_correct_answer ? ` · pred ${row.is_correct_answer}` : "";
+    const goldVerdict = row.is_valid_gold ? ` · GT ${row.is_valid_gold}` : "";
+    return `<option value="${esc(row.key)}" ${row.key === state.evalKey ? "selected" : ""}>${esc(row.key)} (${esc(status)}${esc(verdict)}${esc(goldVerdict)})</option>`;
+  }).join("");
+  return `
+    <div class="hierarchy-toolbar" style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <label style="font-size:12px;color:var(--muted)">Eval key
+        <select id="evalHierarchyKey" style="min-width:220px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:#0f1419;color:var(--text);font-family:var(--mono);font-size:12px"
+          ${state.evalHierarchyKeysLoading ? "disabled" : ""}>
+          ${keyOpts || `<option value="">—</option>`}
+        </select>
+      </label>
+      ${state.evalHierarchyKeysLoading ? `<span class="tree-kv">Loading keys…</span>` : ""}
+    </div>`;
 }
 
 function masterAgentLabel() {
@@ -1540,11 +1605,14 @@ function renderSubmitEvaluation(tool) {
   const result = tool.result || {};
   const payload = result.result || result || args;
   const verdict = String(payload.is_correct_answer || payload.verdict || "").toLowerCase();
+  const goldVerdict = String(payload.is_valid_gold || "").toLowerCase();
   const cls = verdict === "correct" ? "ok" : (verdict === "incorrect" ? "warn" : "");
+  const goldCls = goldVerdict === "valid" ? "ok" : (goldVerdict === "invalid" ? "warn" : "");
   return `
     <div class="tree-kv">
       key=${esc(payload.key || args.key || state.evalKey || "?")}
-      ${verdict ? `<span class="tree-badge ${cls}">${esc(verdict)}</span>` : ""}
+      ${verdict ? `<span class="tree-badge ${cls}">pred: ${esc(verdict)}</span>` : ""}
+      ${goldVerdict ? `<span class="tree-badge ${goldCls}">GT: ${esc(goldVerdict)}</span>` : ""}
     </div>
     ${payload.reason_summary ? `<div class="tree-kv">${esc(payload.reason_summary)}</div>` : ""}
     ${payload.reason_detail || payload.text ? `<pre class="pretty" style="max-height:200px;margin-top:6px">${esc(payload.reason_detail || payload.text)}</pre>` : ""}
@@ -1969,10 +2037,12 @@ function renderMasterOutput() {
 function renderEvalOutput() {
   const er = state.agentTree?.eval_result || {};
   const verdict = String(er.is_correct_answer || "").toLowerCase();
+  const goldVerdict = String(er.is_valid_gold || "").toLowerCase();
   const cls = verdict === "correct" ? "ok" : (verdict === "incorrect" ? "warn" : "");
+  const goldCls = goldVerdict === "valid" ? "ok" : (goldVerdict === "invalid" ? "warn" : "");
   const summary = er.reason_summary || er.reason || "";
   const detail = er.reason_detail || er.text || "";
-  if (!verdict && !summary && !detail) {
+  if (!verdict && !goldVerdict && !summary && !detail) {
     return `<details class="tree-node output" open>
       <summary><span class="title">Eval output</span><span class="tree-badge warn">pending</span></summary>
       <div class="tree-body"><div class="tree-kv">No submit_evaluation verdict recorded yet.</div></div>
@@ -1981,7 +2051,8 @@ function renderEvalOutput() {
   return `<details class="tree-node output" open>
     <summary>
       <span class="title">Eval output</span>
-      ${verdict ? `<span class="tree-badge ${cls}">${esc(verdict)}</span>` : ""}
+      ${verdict ? `<span class="tree-badge ${cls}">pred: ${esc(verdict)}</span>` : ""}
+      ${goldVerdict ? `<span class="tree-badge ${goldCls}">GT: ${esc(goldVerdict)}</span>` : ""}
       ${state.evalKey ? `<span class="tree-kv">${esc(state.evalKey)}</span>` : ""}
     </summary>
     <div class="tree-body">
@@ -1996,19 +2067,34 @@ function renderEvalOutput() {
 }
 
 function renderAgentHierarchy() {
+  const isEval = isEvalHierarchyView();
+  if (isEval && !state.embed && !state.evalKey) {
+    return `${renderEvalHierarchyKeyToolbar()}
+      <div class="empty">Select an eval key, or run agentic-evaluation from the Eval tab.</div>`;
+  }
   const tree = state.agentTree;
   if (!tree || !(tree.master_turns || []).length) {
-    return `<div class="empty">No ${esc(masterAgentLabel().toLowerCase())} turns found for this run.</div>`;
+    return `${isEval ? renderEvalHierarchyKeyToolbar() : ""}
+      <div class="empty">No ${esc(masterAgentLabel().toLowerCase())} turns found for this run.</div>`;
   }
-  const isEval = tree.agent_kind === "eval";
-  let html = state.embed ? "" : `<p class="hint">
-    <b>Agent hierarchy</b> = ${esc(masterAgentLabel())} LLM turns → tools → nested SearchAgent sessions.<br/>
+  const treeIsEval = tree.agent_kind === "eval";
+  let html = state.embed ? "" : (isEval
+    ? `<p class="hint">
+      <b>Eval hierarchy</b> = EvalMaster LLM turns → tools → nested SearchAgent sessions
+      (<code>06_agentic_eval/</code>).
+    </p>`
+    : `<p class="hint">
+    <b>KV hierarchy</b> = Master LLM turns → tools → nested SearchAgent sessions
+    (<code>03_agent/</code>).<br/>
     Each <code>search_pages</code> call expands into a SearchAgent node.
     Multi-key batches share one ReAct loop; single-key searches show one session per handoff.
-  </p>`;
-  if (isEval && state.evalKey && !state.embed) {
-    html += `<p class="hint">Agentic evaluation trace for key <code>${esc(state.evalKey)}</code>
-      (parent run <code>${esc(state.runId)}</code>).</p>`;
+  </p>`);
+  if (isEval && !state.embed) {
+    html += renderEvalHierarchyKeyToolbar();
+    if (state.evalKey) {
+      html += `<p class="hint">Agentic evaluation trace for key <code>${esc(state.evalKey)}</code>
+        (parent run <code>${esc(state.runId)}</code>).</p>`;
+    }
   }
   html += `<div class="tree">`;
 
@@ -2042,7 +2128,7 @@ function renderAgentHierarchy() {
     </details>`;
   }
 
-  html += isEval ? renderEvalOutput() : renderMasterOutput();
+  html += treeIsEval ? renderEvalOutput() : renderMasterOutput();
   html += `</div>`;
   return html;
 }
@@ -2098,19 +2184,23 @@ function renderEval() {
     const ae = (state.agenticEvals || {})[row.key];
     const inflight = state.agenticEvalInflight;
     let agenticCell;
-    if (ae && ae.status === "done" && (ae.is_correct_answer || ae.reason_summary || ae.reason || ae.text)) {
+    if (ae && ae.status === "done" && (ae.is_correct_answer || ae.is_valid_gold || ae.reason_summary || ae.reason || ae.text)) {
       const verdict = String(ae.is_correct_answer || "").toLowerCase();
+      const goldVerdict = String(ae.is_valid_gold || "").toLowerCase();
       const verdictCls = verdict === "correct" ? "correct" : (verdict === "incorrect" ? "incorrect" : "");
-      const verdictLabel = verdict === "correct" || verdict === "incorrect"
-        ? verdict
-        : "(no verdict)";
+      const goldCls = goldVerdict === "valid" ? "valid" : (goldVerdict === "invalid" ? "invalid" : "");
       const summary = ae.reason_summary || ae.reason || "";
       const detail = ae.reason_detail || ae.text || "";
       agenticCell = `
-        <div class="agentic-eval-verdict ${verdictCls}">${esc(verdictLabel)}</div>
+        <div class="agentic-eval-verdicts">
+          ${verdict === "correct" || verdict === "incorrect"
+            ? `<div class="agentic-eval-verdict ${verdictCls}">pred: ${esc(verdict)}</div>` : ""}
+          ${goldVerdict === "valid" || goldVerdict === "invalid"
+            ? `<div class="agentic-eval-verdict ${goldCls}">GT: ${esc(goldVerdict)}</div>` : ""}
+        </div>
         ${summary ? `<div class="agentic-eval-summary">${esc(summary)}</div>` : ""}
         ${detail ? `<div class="agentic-eval-detail"><details${evalDetailAttrs("agentic", row.key)}>
-          <summary>detail</summary>
+          <summary>상세</summary>
           <div class="agentic-eval-text">${esc(detail)}</div>
         </details></div>` : ""}`;
     } else if (ae && ae.status === "error") {
@@ -2374,7 +2464,7 @@ async function cancelInferenceBatch() {
 function paintDetail() {
   const detail = document.getElementById("detail");
   let body = "";
-  if (state.tab === "hierarchy") {
+  if (state.tab === "hierarchy_kv" || state.tab === "hierarchy_eval") {
     body = renderAgentHierarchy();
   } else if (state.tab === "timing") {
     body = renderTiming();
@@ -2386,7 +2476,7 @@ function paintDetail() {
   detail.innerHTML = `
     ${state.embed ? "" : `<div class="meta" style="margin-bottom:10px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <code>${esc(state.runId)}</code>
-      ${state.evalKey ? `· eval key <code>${esc(state.evalKey)}</code>` : ""}
+      ${state.tab === "hierarchy_eval" && state.evalKey ? `· eval key <code>${esc(state.evalKey)}</code>` : ""}
       · status=${esc(state.info?.meta?.status || (state.info?.meta?.finished_at ? "done" : "running"))}
       · ${esc(state.info?.meta?.seconds)}s
       <button type="button" id="runRefresh" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--text);font-size:12px;cursor:pointer">Refresh</button>
@@ -2401,10 +2491,21 @@ function paintDetail() {
         return;
       }
       state.tab = btn.dataset.tab;
-      paintDetail();
+      if (state.tab === "hierarchy_kv" || state.tab === "hierarchy_eval") {
+        renderDetail();
+      } else {
+        paintDetail();
+      }
       if (state.tab === "eval") ensureEval(false);
     };
   });
+  const evalKeySel = document.getElementById("evalHierarchyKey");
+  if (evalKeySel) {
+    evalKeySel.onchange = () => {
+      state.evalKey = evalKeySel.value || null;
+      renderDetail();
+    };
+  }
   const runRefresh = document.getElementById("runRefresh");
   if (runRefresh) runRefresh.onclick = () => renderDetail();
   const refreshBtn = document.getElementById("evalRefresh");
@@ -2507,22 +2608,33 @@ function paintDetail() {
 (async function init() {
   const params = new URLSearchParams(location.search);
   state.embed = params.get("embed") === "1";
-  state.evalKey = params.get("eval_key") || null;
   const runParam = params.get("run");
+  const tabParam = params.get("tab");
+  const evalKeyParam = params.get("eval_key") || null;
+
   if (state.embed) {
     document.getElementById("appBody").classList.add("embed");
-    state.tab = "hierarchy";
+    state.tab = evalKeyParam ? "hierarchy_eval" : "hierarchy_kv";
+    state.evalKey = evalKeyParam;
     if (runParam) {
       const detail = document.getElementById("detail");
       if (detail) detail.innerHTML = `<div class="empty">Loading ${esc(runParam)}…</div>`;
     }
+  } else if (evalKeyParam) {
+    state.evalKey = evalKeyParam;
+    state.tab = "hierarchy_eval";
+  } else if (tabParam === "hierarchy_eval") {
+    state.tab = "hierarchy_eval";
+  } else if (tabParam === "hierarchy" || tabParam === "hierarchy_kv") {
+    state.tab = "hierarchy_kv";
+  } else if (tabParam) {
+    state.tab = tabParam;
   }
+
   state.runs = await api("/api/runs");
   if (!state.embed) renderRuns();
-  const tabParam = params.get("tab");
   if (runParam && (state.embed || state.runs.some(r => r.run_id === runParam))) {
-    if (tabParam) state.tab = tabParam;
-    await selectRun(runParam);
+    await selectRun(runParam, { keepTab: true, keepEvalKey: true });
   } else if (!state.embed && state.runs[0]) {
     await selectRun(state.runs[0].run_id);
   }

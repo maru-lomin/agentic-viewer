@@ -49,11 +49,13 @@ def _agentic_cell(by_key: Dict[str, Any], key: str) -> Dict[str, Any]:
     if not ae:
         return {"status": "pending"}
     status = str(ae.get("status") or "pending")
-    if status == "done" or ae.get("is_correct_answer"):
+    if status == "done" or ae.get("is_correct_answer") or ae.get("is_valid_gold"):
         verdict = str(ae.get("is_correct_answer") or "").lower()
+        gold_verdict = str(ae.get("is_valid_gold") or "").lower()
         return {
             "status": "done",
             "is_correct_answer": verdict or None,
+            "is_valid_gold": gold_verdict or None,
             "reason_summary": ae.get("reason_summary") or ae.get("reason") or "",
         }
     if status == "error":
@@ -74,6 +76,8 @@ def agentic_eval_summary(
     n_done = 0
     n_correct = 0
     n_incorrect = 0
+    n_gold_valid = 0
+    n_gold_invalid = 0
     n_error = 0
     n_running = 0
 
@@ -88,27 +92,37 @@ def agentic_eval_summary(
         if status == "error":
             n_error += 1
             continue
-        if status == "done" or ae.get("is_correct_answer"):
+        if status == "done" or ae.get("is_correct_answer") or ae.get("is_valid_gold"):
             n_done += 1
             verdict = str(ae.get("is_correct_answer") or "").lower()
             if verdict == "correct":
                 n_correct += 1
             elif verdict == "incorrect":
                 n_incorrect += 1
+            gold_verdict = str(ae.get("is_valid_gold") or "").lower()
+            if gold_verdict == "valid":
+                n_gold_valid += 1
+            elif gold_verdict == "invalid":
+                n_gold_invalid += 1
 
     n_pending = max(0, n_total - n_done - n_error - n_running)
     judged = n_correct + n_incorrect
     accuracy = round(n_correct / judged, 6) if judged else None
+    gold_judged = n_gold_valid + n_gold_invalid
+    gold_validity = round(n_gold_valid / gold_judged, 6) if gold_judged else None
 
     return {
         "n_total": n_total,
         "n_done": n_done,
         "n_correct": n_correct,
         "n_incorrect": n_incorrect,
+        "n_gold_valid": n_gold_valid,
+        "n_gold_invalid": n_gold_invalid,
         "n_error": n_error,
         "n_running": n_running,
         "n_pending": n_pending,
         "accuracy": accuracy,
+        "gold_validity": gold_validity,
     }
 
 

@@ -25,7 +25,7 @@ def agentic_key_is_done(data: Optional[Dict[str, Any]]) -> bool:
     status = str(data.get("status") or "")
     if status == "error":
         return False
-    if status == "done" or data.get("is_correct_answer"):
+    if status == "done" or data.get("is_correct_answer") or data.get("is_valid_gold"):
         return True
     return False
 

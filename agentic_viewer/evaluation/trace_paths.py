@@ -86,6 +86,7 @@ def list_agentic_eval_keys(run_dir: Path) -> List[Dict[str, Any]]:
                 "key": key,
                 "status": payload.get("status") or "pending",
                 "is_correct_answer": payload.get("is_correct_answer"),
+                "is_valid_gold": payload.get("is_valid_gold"),
                 "reason_summary": payload.get("reason_summary") or payload.get("reason"),
                 "error": payload.get("error"),
                 "trace_dir": payload.get("trace_dir"),
