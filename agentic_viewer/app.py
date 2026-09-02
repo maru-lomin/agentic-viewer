@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -55,8 +55,8 @@ RUNS_ROOT = default_runs_root()
 INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "http://127.0.0.1:8010").rstrip(
     "/"
 )
-# run_id -> currently evaluating key (serial per run in the viewer too)
-_AGENTIC_EVAL_INFLIGHT: Dict[str, str] = {}
+# run_id -> set of keys currently evaluating (up to AGENTIC_EVAL_MAX_PARALLEL per run)
+_AGENTIC_EVAL_INFLIGHT: Dict[str, Set[str]] = {}
 _BATCH_MANAGER = make_batch_manager(
     RUNS_ROOT,
     INFERENCE_API_URL,
@@ -68,9 +68,10 @@ app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0")
 
 def _list_agentic_evals(run_id: str) -> Dict[str, Any]:
     root = _run_dir(run_id)
+    inflight = _AGENTIC_EVAL_INFLIGHT.get(run_id)
     return {
         "by_key": read_agentic_evals(root),
-        "inflight": _AGENTIC_EVAL_INFLIGHT.get(run_id),
+        "inflight": sorted(inflight) if inflight else None,
     }
 
 
@@ -371,7 +372,7 @@ def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str
     """
     Trigger EvalMasterAgent for one key via the inference-pipeline API.
 
-    Keys for the same run_id are evaluated serially (409 if already running).
+    Up to AGENTIC_EVAL_MAX_PARALLEL keys may run concurrently per run_id.
     Status files under 06_agentic_eval/ are written by the inference API
     (container user); the viewer only tracks in-memory inflight state.
     """
@@ -380,13 +381,6 @@ def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str
     if not key:
         raise HTTPException(status_code=400, detail="key is required")
 
-    inflight = _AGENTIC_EVAL_INFLIGHT.get(run_id)
-    if inflight:
-        raise HTTPException(
-            status_code=409,
-            detail=f"agentic-evaluation already running for key={inflight!r}",
-        )
-
     active = _BATCH_MANAGER.get_active_job()
     if active and active.status == "running" and run_id in active.run_ids:
         raise HTTPException(
@@ -394,12 +388,15 @@ def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str
             detail=f"batch agentic-evaluation job {active.job_id} is running for this run",
         )
 
-    _AGENTIC_EVAL_INFLIGHT[run_id] = key
+    inflight = _AGENTIC_EVAL_INFLIGHT.setdefault(run_id, set())
+    inflight.add(key)
     try:
         result = _call_inference_agentic_eval(run_id, key)
         return result
     finally:
-        _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
+        inflight.discard(key)
+        if not inflight:
+            _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
 
 
 def _serve_run_file(root: Path, rel: str):
@@ -975,7 +972,7 @@ const state = {
   pages: [], chunks: null, pagesSubtab: "pages",
   agentTree: null, info: null,
   evalReport: null, evalError: null, evalLoading: false,
-  agenticEvals: {}, agenticEvalInflight: null, agenticEvalError: null,
+  agenticEvals: {}, agenticEvalInflight: [], agenticEvalError: null,
   evalOpenDetails: new Set(),
   batchJob: null, batchPollTimer: null,
   evalKey: null, embed: false,
@@ -1122,7 +1119,7 @@ async function selectRun(runId, opts = {}) {
     state.evalError = null;
     state.evalLoading = false;
     state.agenticEvals = {};
-    state.agenticEvalInflight = null;
+    state.agenticEvalInflight = [];
     state.agenticEvalError = null;
     state.evalOpenDetails = new Set();
     state.batchJob = null;
@@ -2632,6 +2629,10 @@ function renderEval() {
       <div class="sub">${esc(sub)}</div>
     </div>`).join("");
 
+  const batch = state.batchJob;
+  const batchActive = batch && (batch.status === "queued" || batch.status === "running");
+  const batchForRun = batch && batch.run_ids && batch.run_ids.includes(state.runId);
+
   const rows = (report.per_key || []).map(row => {
     const em = row.value?.exact_match;
     const sp = row.search_pages || {};
@@ -2647,7 +2648,12 @@ function renderEval() {
       </div>`;
     }).filter(Boolean).join("");
     const ae = (state.agenticEvals || {})[row.key];
-    const inflight = state.agenticEvalInflight;
+    const inflightKeys = Array.isArray(state.agenticEvalInflight)
+      ? state.agenticEvalInflight
+      : (state.agenticEvalInflight ? [state.agenticEvalInflight] : []);
+    const keyInflight = inflightKeys.includes(row.key);
+    const batchActiveForKey = batchActive && batch && batch.active
+      && batch.active.some(x => x.key === row.key);
     let agenticCell;
     if (ae && ae.status === "done" && (ae.is_correct_answer || ae.is_valid_gold || ae.reason_summary || ae.reason || ae.text)) {
       const verdict = String(ae.is_correct_answer || "").toLowerCase();
@@ -2671,12 +2677,12 @@ function renderEval() {
     } else if (ae && ae.status === "error") {
       agenticCell = `<div class="agentic-eval-err">${esc(ae.error || "error")}</div>
         <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
-          ${inflight ? "disabled" : ""}>Retry</button>`;
-    } else if (inflight === row.key || (ae && ae.status === "running")) {
+          ${batchActive ? "disabled" : ""}>Retry</button>`;
+    } else if (keyInflight || batchActiveForKey || (ae && ae.status === "running")) {
       agenticCell = `<button type="button" class="agentic-eval-btn" disabled>Running…</button>`;
     } else {
       agenticCell = `<button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
-        ${inflight ? "disabled" : ""}>agentic-evaluation</button>`;
+        ${batchActive ? "disabled" : ""}>agentic-evaluation</button>`;
     }
     return `<tr>
       <td class="key">${esc(row.key)}</td>
@@ -2714,31 +2720,31 @@ function renderEval() {
     ? `<p class="hint" style="color:var(--err)">Agentic eval: ${esc(state.agenticEvalError)}</p>`
     : "";
 
-  const batch = state.batchJob;
-  const batchActive = batch && (batch.status === "queued" || batch.status === "running");
-  const batchForRun = batch && batch.run_ids && batch.run_ids.includes(state.runId);
   let batchHtml = "";
   if (batchForRun && batch) {
     const pct = batch.progress_pct ?? (batch.total ? Math.round(100 * batch.completed / batch.total) : 0);
     const cur = batch.current
       ? ` · ${esc(batch.current.key)}`
       : "";
+    const activeN = Array.isArray(batch.active) ? batch.active.length : 0;
+    const activeHint = activeN > 1 ? ` (${activeN} parallel)` : "";
     batchHtml = `
       <div class="hint" style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#152033">
         Batch agentic eval: <b>${esc(batch.status)}</b>
-        ${batch.completed}/${batch.total} (${pct}%)${cur}
-        ${batchActive ? `<button type="button" class="tab" id="batchCancel" style="margin-left:8px">Cancel</button>` : ""}
+        ${batch.completed}/${batch.total} (${pct}%)${cur}${activeHint}
+        ${batchActive ? `<button type="button" class="tab" id="batchRefresh" style="margin-left:8px">Refresh status</button>
+        <button type="button" class="tab" id="batchCancel" style="margin-left:8px">Cancel</button>` : ""}
       </div>`;
   }
 
-  const allKeysDisabled = !!state.agenticEvalInflight || batchActive;
+  const allKeysDisabled = batchActive;
 
   return `
     <p class="hint">
       Baseline metrics vs <code>dataset/answer_sheet.json</code>.
       Cached as <code>05_eval.json</code> in the run directory.
       Evid F1 uses <b>VLM evidence_quote</b> only; SearchAgent <b>page_reasons</b> are shown separately.
-      Agentic-evaluation runs serially via the inference API and saves under <code>06_agentic_eval/</code>.
+      Agentic-evaluation runs up to 8 keys in parallel via the inference API and saves under <code>06_agentic_eval/</code>.
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
       <button type="button" class="agentic-eval-btn" id="evalAllKeys"
         style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Evaluate all keys</button>
@@ -2793,8 +2799,8 @@ async function ensureAgenticEvals() {
   try {
     const data = await api(`/api/runs/${encodeURIComponent(state.runId)}/agentic-eval`);
     state.agenticEvals = data.by_key || {};
-    if (!state.agenticEvalInflight) {
-      state.agenticEvalInflight = data.inflight || null;
+    if (!state.agenticEvalInflight || !state.agenticEvalInflight.length) {
+      state.agenticEvalInflight = data.inflight || [];
     }
     state.agenticEvalError = null;
   } catch (err) {
@@ -2803,9 +2809,11 @@ async function ensureAgenticEvals() {
 }
 
 async function runAgenticEval(key) {
-  if (!state.runId || !key || state.agenticEvalInflight) return;
+  if (!state.runId || !key) return;
   if (state.batchJob && (state.batchJob.status === "queued" || state.batchJob.status === "running")) return;
-  state.agenticEvalInflight = key;
+  const inflightKeys = Array.isArray(state.agenticEvalInflight) ? [...state.agenticEvalInflight] : [];
+  if (!inflightKeys.includes(key)) inflightKeys.push(key);
+  state.agenticEvalInflight = inflightKeys;
   state.agenticEvalError = null;
   state.agenticEvals = {
     ...state.agenticEvals,
@@ -2838,7 +2846,7 @@ async function runAgenticEval(key) {
       [key]: { key, status: "error", error: String(err.message || err) },
     };
   } finally {
-    state.agenticEvalInflight = null;
+    state.agenticEvalInflight = (state.agenticEvalInflight || []).filter(k => k !== key);
     await ensureAgenticEvals();
     paintDetail();
   }
@@ -2857,45 +2865,27 @@ async function apiPost(path, body) {
   return data;
 }
 
-function stopBatchPoll() {
-  if (state.batchPollTimer) {
-    clearInterval(state.batchPollTimer);
-    state.batchPollTimer = null;
-  }
-}
-
-async function pollInferenceBatchJob() {
+async function refreshInferenceBatchJob() {
   if (!state.batchJob?.job_id) return;
   try {
     state.batchJob = await api(`/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}`);
     await ensureAgenticEvals();
     paintDetail();
-    if (state.batchJob.status === "running" || state.batchJob.status === "queued") return;
-    stopBatchPoll();
-    state.runs = await api("/api/runs");
-    renderRuns();
+    if (state.batchJob.status !== "running" && state.batchJob.status !== "queued") {
+      state.runs = await api("/api/runs");
+      renderRuns();
+    }
   } catch (err) {
     state.agenticEvalError = String(err.message || err);
-    stopBatchPoll();
     paintDetail();
   }
 }
 
-function startBatchPoll() {
-  stopBatchPoll();
-  state.batchPollTimer = setInterval(pollInferenceBatchJob, 2000);
-}
-
-async function resumeInferenceBatchJob() {
-  try {
-    const data = await api("/api/evaluation/batch-jobs/active");
-    if (data.active && data.job && (data.job.run_ids || []).includes(state.runId)) {
-      state.batchJob = data.job;
-      if (state.batchJob.status === "running" || state.batchJob.status === "queued") {
-        startBatchPoll();
-      }
-    }
-  } catch (_) {}
+function stopBatchPoll() {
+  if (state.batchPollTimer) {
+    clearInterval(state.batchPollTimer);
+    state.batchPollTimer = null;
+  }
 }
 
 async function runAllAgenticEvals() {
@@ -2908,9 +2898,7 @@ async function runAllAgenticEvals() {
       skip_existing: true,
     });
     paintDetail();
-    if (state.batchJob.status === "running" || state.batchJob.status === "queued") {
-      startBatchPoll();
-    } else {
+    if (state.batchJob.status !== "running" && state.batchJob.status !== "queued") {
       await ensureAgenticEvals();
       paintDetail();
     }
@@ -2926,11 +2914,21 @@ async function cancelInferenceBatch() {
     state.batchJob = await apiPost(
       `/api/evaluation/batch-jobs/${encodeURIComponent(state.batchJob.job_id)}/cancel`, {}
     );
+    await ensureAgenticEvals();
     paintDetail();
   } catch (err) {
     state.agenticEvalError = String(err.message || err);
     paintDetail();
   }
+}
+
+async function resumeInferenceBatchJob() {
+  try {
+    const data = await api("/api/evaluation/batch-jobs/active");
+    if (data.active && data.job && (data.job.run_ids || []).includes(state.runId)) {
+      state.batchJob = data.job;
+    }
+  } catch (_) {}
 }
 
 function paintDetail() {
@@ -2994,6 +2992,8 @@ function paintDetail() {
   });
   const evalAllBtn = document.getElementById("evalAllKeys");
   if (evalAllBtn) evalAllBtn.onclick = () => runAllAgenticEvals();
+  const batchRefresh = document.getElementById("batchRefresh");
+  if (batchRefresh) batchRefresh.onclick = () => refreshInferenceBatchJob();
   const batchCancel = document.getElementById("batchCancel");
   if (batchCancel) batchCancel.onclick = () => cancelInferenceBatch();
   if (state.tab === "eval") {

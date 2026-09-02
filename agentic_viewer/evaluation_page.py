@@ -588,9 +588,13 @@ async function apiPost(path, body) {
 
 async function runAgenticEval(runId, key) {
   if (!runId || !key) return;
-  if (state.agenticInflight) return;
   if (batchIsActive()) return;
-  state.agenticInflight = { runId, key };
+  const prev = state.agenticInflight;
+  const keys = prev && prev.runId === runId && Array.isArray(prev.keys)
+    ? [...prev.keys]
+    : (prev && prev.runId === runId && prev.key ? [prev.key] : []);
+  if (!keys.includes(key)) keys.push(key);
+  state.agenticInflight = { runId, keys };
   state.agenticEvalError = null;
   renderContent();
   try {
@@ -601,14 +605,22 @@ async function runAgenticEval(runId, key) {
     state.agenticEvalError = String(err.message || err);
     await loadSummary(true);
   } finally {
-    state.agenticInflight = null;
+    const cur = state.agenticInflight;
+    if (cur && cur.runId === runId) {
+      const keys = (Array.isArray(cur.keys) ? cur.keys : (cur.key ? [cur.key] : []))
+        .filter(k => k !== key);
+      state.agenticInflight = keys.length ? { runId, keys } : null;
+    }
     renderContent();
   }
 }
 
 function renderMatrixEvalAction(runId, key, ae, isCurrent) {
   const inflight = state.agenticInflight;
-  const isInflight = inflight && inflight.runId === runId && inflight.key === key;
+  const inflightKeys = inflight && inflight.runId === runId
+    ? (Array.isArray(inflight.keys) ? inflight.keys : (inflight.key ? [inflight.key] : []))
+    : [];
+  const isInflight = inflightKeys.includes(key);
   const batchDisabled = batchIsActive();
   if (ae.status === "running" || isCurrent || isInflight) {
     return `<button type="button" class="cell-eval-btn" disabled>Running…</button>`;
@@ -646,7 +658,7 @@ function renderBatchStartControls() {
           Skip existing</label>
       </div>
       <p class="hint" style="margin:8px 0 0">
-        Evaluates every gold key via the inference API (serial per run). Results save under
+        Evaluates every gold key via the inference API (up to 8 keys in parallel per run). Results save under
         <code>06_agentic_eval/</code>.
       </p>
     </div>`;

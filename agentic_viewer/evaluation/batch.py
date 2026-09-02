@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from agentic_viewer.evaluation.agentic_client import invoke_agentic_eval_safe, cancel_agentic_eval_safe
+from agentic_viewer.evaluation.agentic_client import (
+    cancel_agentic_eval_safe,
+    invoke_agentic_eval_safe,
+)
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
 from agentic_viewer.evaluation.live_progress import format_live_progress, read_eval_live_progress
 from agentic_viewer.evaluation.status_cleanup import mark_running_eval_status_cancelled
 from agentic_viewer.evaluation.summary import read_agentic_evals
+
+
+def default_max_parallel_evals() -> int:
+    return max(1, int(os.environ.get("AGENTIC_EVAL_MAX_PARALLEL", "8") or 8))
 
 
 def enrich_batch_job_dict(
@@ -105,6 +114,7 @@ class BatchJob:
     failed: int = 0
     current_run_id: Optional[str] = None
     current_key: Optional[str] = None
+    active: List[Dict[str, str]] = field(default_factory=list)
     errors: List[Dict[str, Any]] = field(default_factory=list)
     cancel_requested: bool = False
     started_at: Optional[str] = None
@@ -128,6 +138,7 @@ class BatchJob:
             "skipped": self.skipped,
             "failed": self.failed,
             "current": current,
+            "active": list(self.active),
             "errors": list(self.errors),
             "cancel_requested": self.cancel_requested,
             "started_at": self.started_at,
@@ -143,11 +154,15 @@ class BatchJobManager:
         *,
         runs_root: Path,
         inference_api_url: str,
-        inflight_tracker: Dict[str, str],
+        inflight_tracker: Dict[str, Set[str]],
+        max_parallel_evals: Optional[int] = None,
     ) -> None:
         self.runs_root = runs_root
         self.inference_api_url = inference_api_url
         self.inflight_tracker = inflight_tracker
+        self.max_parallel_evals = max(
+            1, int(max_parallel_evals or default_max_parallel_evals())
+        )
         self._jobs: Dict[str, BatchJob] = {}
         self._lock = threading.Lock()
         self._active_job_id: Optional[str] = None
@@ -164,9 +179,13 @@ class BatchJobManager:
 
     def _any_run_busy(self, run_ids: Sequence[str]) -> Optional[str]:
         for run_id in run_ids:
-            key = self.inflight_tracker.get(run_id)
-            if key:
-                return f"agentic-evaluation already running for run_id={run_id} key={key!r}"
+            keys = self.inflight_tracker.get(run_id)
+            if keys:
+                sample = next(iter(keys))
+                return (
+                    f"agentic-evaluation already running for run_id={run_id} "
+                    f"key={sample!r}"
+                )
         with self._lock:
             if self._active_job_id:
                 active = self._jobs.get(self._active_job_id)
@@ -235,6 +254,58 @@ class BatchJobManager:
         with self._lock:
             return self._jobs[job_id]
 
+    def _track_inflight(self, run_id: str, key: str) -> None:
+        keys = self.inflight_tracker.setdefault(run_id, set())
+        keys.add(key)
+
+    def _untrack_inflight(self, run_id: str, key: str) -> None:
+        keys = self.inflight_tracker.get(run_id)
+        if not keys:
+            return
+        keys.discard(key)
+        if not keys:
+            self.inflight_tracker.pop(run_id, None)
+
+    def _set_active_task(
+        self,
+        job_id: str,
+        *,
+        run_id: str,
+        key: str,
+        add: bool,
+    ) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            entry = {"run_id": run_id, "key": key}
+            if add:
+                if entry not in job.active:
+                    job.active.append(entry)
+                job.current_run_id = run_id
+                job.current_key = key
+            else:
+                job.active = [x for x in job.active if x != entry]
+                if job.active:
+                    last = job.active[-1]
+                    job.current_run_id = last["run_id"]
+                    job.current_key = last["key"]
+                else:
+                    job.current_run_id = None
+                    job.current_key = None
+
+    def _eval_one(self, job_id: str, run_id: str, key: str) -> Tuple[bool, Dict[str, Any]]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.cancel_requested:
+                return False, {"error": "cancelled by user"}
+
+        self._track_inflight(run_id, key)
+        self._set_active_task(job_id, run_id=run_id, key=key, add=True)
+        try:
+            return invoke_agentic_eval_safe(self.inference_api_url, run_id, key)
+        finally:
+            self._untrack_inflight(run_id, key)
+            self._set_active_task(job_id, run_id=run_id, key=key, add=False)
+
     def _run_job(self, job_id: str, tasks: List[Tuple[str, str]]) -> None:
         with self._lock:
             job = self._jobs[job_id]
@@ -242,41 +313,44 @@ class BatchJobManager:
             job.started_at = _utc_now()
 
         try:
-            for run_id, key in tasks:
-                with self._lock:
-                    job = self._jobs[job_id]
-                    if job.cancel_requested:
-                        job.status = "cancelled"
-                        job.message = "cancelled by user"
-                        job.current_run_id = None
-                        job.current_key = None
-                        job.finished_at = _utc_now()
-                        return
-                    job.current_run_id = run_id
-                    job.current_key = key
+            workers = min(self.max_parallel_evals, max(1, len(tasks)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._eval_one, job_id, run_id, key): (run_id, key)
+                    for run_id, key in tasks
+                }
+                for fut in as_completed(futures):
+                    with self._lock:
+                        job = self._jobs[job_id]
+                        if job.cancel_requested:
+                            for pending in futures:
+                                pending.cancel()
+                            job.status = "cancelled"
+                            job.message = "cancelled by user"
+                            job.current_run_id = None
+                            job.current_key = None
+                            job.active = []
+                            job.finished_at = _utc_now()
+                            return
 
-                self.inflight_tracker[run_id] = key
-                try:
-                    ok, payload = invoke_agentic_eval_safe(
-                        self.inference_api_url, run_id, key
-                    )
-                finally:
-                    self.inflight_tracker.pop(run_id, None)
+                    run_id, key = futures[fut]
+                    try:
+                        ok, payload = fut.result()
+                    except Exception as exc:
+                        ok, payload = False, {"error": str(exc)}
 
-                with self._lock:
-                    job = self._jobs[job_id]
-                    job.completed += 1
-                    job.current_run_id = None
-                    job.current_key = None
-                    if not ok:
-                        job.failed += 1
-                        job.errors.append(
-                            {
-                                "run_id": run_id,
-                                "key": key,
-                                "error": payload.get("error") or "error",
-                            }
-                        )
+                    with self._lock:
+                        job = self._jobs[job_id]
+                        job.completed += 1
+                        if not ok:
+                            job.failed += 1
+                            job.errors.append(
+                                {
+                                    "run_id": run_id,
+                                    "key": key,
+                                    "error": payload.get("error") or "error",
+                                }
+                            )
 
             with self._lock:
                 job = self._jobs[job_id]
@@ -290,6 +364,9 @@ class BatchJobManager:
                         f"{job.failed} failed, {job.skipped} skipped"
                     )
                 job.finished_at = _utc_now()
+                job.current_run_id = None
+                job.current_key = None
+                job.active = []
         except Exception as exc:
             with self._lock:
                 job = self._jobs.get(job_id)
@@ -299,6 +376,7 @@ class BatchJobManager:
                     job.finished_at = _utc_now()
                     job.current_run_id = None
                     job.current_key = None
+                    job.active = []
         finally:
             with self._lock:
                 if self._active_job_id == job_id:
@@ -308,10 +386,13 @@ class BatchJobManager:
 def make_batch_manager(
     runs_root: Path,
     inference_api_url: str,
-    inflight_tracker: Dict[str, str],
+    inflight_tracker: Dict[str, Set[str]],
+    *,
+    max_parallel_evals: Optional[int] = None,
 ) -> BatchJobManager:
     return BatchJobManager(
         runs_root=runs_root,
         inference_api_url=inference_api_url,
         inflight_tracker=inflight_tracker,
+        max_parallel_evals=max_parallel_evals,
     )
