@@ -19,6 +19,10 @@ from agentic_viewer.evaluation.summary import (
     build_evaluation_summary,
     read_agentic_evals,
 )
+from agentic_viewer.evaluation.trace_paths import (
+    list_agentic_eval_keys,
+    resolve_agentic_eval_trace_dir,
+)
 from agentic_viewer.evaluation_page import EVALUATION_HTML
 from agentic_viewer.hierarchy import build_agent_tree
 from agentic_viewer.image_tokens import replace_base64_images
@@ -240,6 +244,45 @@ def get_agent_tree(run_id: str) -> Dict[str, Any]:
     return attach_timing_to_tree(tree, timing)
 
 
+@app.get("/api/runs/{run_id}/agentic-eval/keys")
+def list_agentic_eval_keys_api(run_id: str) -> Dict[str, Any]:
+    """Per-key agentic-eval status + trace availability for one extraction run."""
+    root = _run_dir(run_id)
+    return {"run_id": run_id, "keys": list_agentic_eval_keys(root)}
+
+
+@app.get("/api/runs/{run_id}/agentic-eval/{key}/agent-tree")
+def get_agentic_eval_tree(run_id: str, key: str) -> Dict[str, Any]:
+    """EvalMaster → tools → SearchAgent tree for one key under 06_agentic_eval/."""
+    root = _run_dir(run_id)
+    try:
+        trace_dir = resolve_agentic_eval_trace_dir(root, key)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    tree = build_agent_tree(trace_dir)
+    tree["agent_kind"] = "eval"
+    tree["eval_key"] = key
+    tree["parent_run_id"] = run_id
+    payload_path = trace_dir.parent / f"{trace_dir.name}.json"
+    tree["eval_result"] = _read_json(payload_path) if payload_path.is_file() else None
+    timing = build_timing_report(trace_dir)
+    return attach_timing_to_tree(tree, timing)
+
+
+@app.get("/api/runs/{run_id}/agentic-eval/{key}/file")
+def get_agentic_eval_file(run_id: str, key: str, path: str):
+    """Read a file under ``06_agentic_eval/<key>/`` (for hierarchy step dumps)."""
+    root = _run_dir(run_id)
+    try:
+        trace_dir = resolve_agentic_eval_trace_dir(root, key)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    rel = Path(path)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(status_code=400, detail="invalid path")
+    return _serve_run_file(trace_dir.resolve(), str(rel))
+
+
 @app.get("/api/runs/{run_id}/timing")
 def get_timing(run_id: str) -> Dict[str, Any]:
     """Agent / session / turn timing derived from timeline.jsonl."""
@@ -354,12 +397,11 @@ def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str
         _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
 
 
-@app.get("/api/runs/{run_id}/file")
-def get_file(run_id: str, path: str):
-    root = _run_dir(run_id)
-    rel = path.lstrip("/")
+def _serve_run_file(root: Path, rel: str):
+    """Serve a file under ``root`` (JSON as JSONResponse, text as HTML pre)."""
+    rel = rel.lstrip("/")
     target = (root / rel).resolve()
-    if not str(target).startswith(str(root)) or not target.is_file():
+    if not str(target).startswith(str(root.resolve())) or not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     if target.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
         return FileResponse(target)
@@ -390,6 +432,12 @@ def get_file(run_id: str, path: str):
             f"{_escape(text)}</pre>"
         )
     return FileResponse(target)
+
+
+@app.get("/api/runs/{run_id}/file")
+def get_file(run_id: str, path: str):
+    root = _run_dir(run_id)
+    return _serve_run_file(root.resolve(), path)
 
 
 @app.get("/api/runs/{run_id}/pages")
@@ -834,9 +882,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .timing-live .live-title { color: #e0a45c; font-weight: 600; font-size: 13px; }
     .timing-live .live-row { font-family: var(--mono); font-size: 12px; }
     .timing-live .live-row .sess { color: #e0a45c; }
+    body.embed header,
+    body.embed aside { display: none; }
+    body.embed main { grid-template-columns: 1fr; min-height: 100vh; }
+    body.embed section { padding: 12px 14px; }
   </style>
 </head>
-<body>
+<body id="appBody">
   <header>
     <h1>Agentic Viewer</h1>
     <nav class="topnav">
@@ -848,7 +900,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <main>
     <aside id="runList"></aside>
     <section id="detail">
-      <div class="empty">Select a run</div>
+      <div class="empty" id="detailPlaceholder">Select a run</div>
     </section>
   </main>
 <script>
@@ -860,7 +912,18 @@ const state = {
   agenticEvals: {}, agenticEvalInflight: null, agenticEvalError: null,
   evalOpenDetails: new Set(),
   batchJob: null, batchPollTimer: null,
+  evalKey: null, embed: false,
 };
+
+function runFileUrl(relPath) {
+  const encRun = encodeURIComponent(state.runId);
+  const encPath = encodeURIComponent(relPath);
+  if (state.evalKey) {
+    const encKey = encodeURIComponent(state.evalKey);
+    return `/api/runs/${encRun}/agentic-eval/${encKey}/file?path=${encPath}`;
+  }
+  return `/api/runs/${encRun}/file?path=${encPath}`;
+}
 
 async function api(path) {
   const r = await fetch(path);
@@ -909,6 +972,7 @@ function fmtPct(v) {
 }
 
 function renderRuns() {
+  if (state.embed) return;
   const el = document.getElementById("runList");
   el.innerHTML = state.runs.map(r => {
     const es = r.eval_summary;
@@ -939,22 +1003,34 @@ function renderRuns() {
 
 async function selectRun(runId) {
   state.runId = runId;
-  state.tab = "hierarchy";
+  if (!state.embed) state.tab = "hierarchy";
   state.pagesSubtab = "pages";
   state.agentTree = null;
   state.pages = [];
   state.chunks = null;
-  state.evalReport = null;
-  state.evalError = null;
-  state.evalLoading = false;
-  state.agenticEvals = {};
-  state.agenticEvalInflight = null;
-  state.agenticEvalError = null;
-  state.evalOpenDetails = new Set();
-  state.batchJob = null;
-  stopBatchPoll();
+  if (!state.embed) {
+    state.evalReport = null;
+    state.evalError = null;
+    state.evalLoading = false;
+    state.agenticEvals = {};
+    state.agenticEvalInflight = null;
+    state.agenticEvalError = null;
+    state.evalOpenDetails = new Set();
+    state.batchJob = null;
+    stopBatchPoll();
+  }
   renderRuns();
   await renderDetail();
+}
+
+async function loadAgentTree() {
+  if (!state.runId) return null;
+  if (state.evalKey) {
+    return api(
+      `/api/runs/${encodeURIComponent(state.runId)}/agentic-eval/${encodeURIComponent(state.evalKey)}/agent-tree`
+    );
+  }
+  return api(`/api/runs/${encodeURIComponent(state.runId)}/agent-tree`);
 }
 
 async function renderDetail() {
@@ -965,25 +1041,35 @@ async function renderDetail() {
   }
   const keepTab = state.tab;
   detail.innerHTML = `<div class="empty">Loading ${esc(state.runId)}…</div>`;
-  const [info, pagesPayload, agentTree, runs, chunksPayload] = await Promise.all([
+  const reqs = [
     api(`/api/runs/${encodeURIComponent(state.runId)}`),
-    api(`/api/runs/${encodeURIComponent(state.runId)}/pages`),
-    api(`/api/runs/${encodeURIComponent(state.runId)}/agent-tree`),
+    loadAgentTree(),
     api("/api/runs"),
-    api(`/api/runs/${encodeURIComponent(state.runId)}/chunks?limit=200`),
-  ]);
-  state.info = info;
-  state.pages = Array.isArray(pagesPayload) ? pagesPayload : (pagesPayload?.pages || []);
-  state.pagesMeta = Array.isArray(pagesPayload) ? null : pagesPayload;
-  state.chunks = chunksPayload;
-  state.agentTree = agentTree;
-  state.runs = runs;
+  ];
+  if (!state.embed && !state.evalKey) {
+    reqs.splice(1, 0,
+      api(`/api/runs/${encodeURIComponent(state.runId)}/pages`),
+      api(`/api/runs/${encodeURIComponent(state.runId)}/chunks?limit=200`),
+    );
+  }
+  const results = await Promise.all(reqs);
+  let idx = 0;
+  state.info = results[idx++];
+  if (!state.embed && !state.evalKey) {
+    const pagesPayload = results[idx++];
+    state.pages = Array.isArray(pagesPayload) ? pagesPayload : (pagesPayload?.pages || []);
+    state.pagesMeta = Array.isArray(pagesPayload) ? null : pagesPayload;
+    state.chunks = results[idx++];
+  }
+  state.agentTree = results[idx++];
+  state.runs = results[idx++];
   state.tab = keepTab;
   renderRuns();
   paintDetail();
 }
 
 function tabsHtml() {
+  if (state.embed) return "";
   const tabs = [
     ["hierarchy", "Agent hierarchy"],
     ["timing", "Timing"],
@@ -995,21 +1081,43 @@ function tabsHtml() {
   ).join("")}</div>`;
 }
 
+function masterAgentLabel() {
+  return state.agentTree?.agent_kind === "eval" ? "EvalMaster" : "Master";
+}
+
 function fmtSec(v) {
   if (v == null || Number.isNaN(Number(v))) return "—";
   const n = Number(v);
   return n >= 100 ? `${n.toFixed(0)}s` : `${n.toFixed(1)}s`;
 }
 
+function runClockBase() {
+  return state.agentTree?.timing?.run_started_at || state.info?.meta?.started_at;
+}
+
 function fmtRunClock(relativeSec) {
   if (relativeSec == null || Number.isNaN(Number(relativeSec))) return "—";
-  const started = state.info?.meta?.started_at;
+  const started = runClockBase();
   if (!started) {
     const n = Number(relativeSec);
     return n >= 100 ? `t+${n.toFixed(0)}s` : `t+${n.toFixed(1)}s`;
   }
   const ms = new Date(started).getTime() + Number(relativeSec) * 1000;
   return new Date(ms).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+}
+
+function fmtAbsDateTime(relativeSec) {
+  if (relativeSec == null || Number.isNaN(Number(relativeSec))) return "—";
+  const started = runClockBase();
+  if (!started) {
+    const n = Number(relativeSec);
+    return n >= 100 ? `t+${n.toFixed(0)}s` : `t+${n.toFixed(1)}s`;
+  }
+  const ms = new Date(started).getTime() + Number(relativeSec) * 1000;
+  return new Date(ms).toLocaleString([], {
+    year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
   });
 }
@@ -1024,6 +1132,30 @@ function masterTurnTimingBadge(timing) {
     ? ` · ${fmtRunClock(start)} → ${fmtRunClock(end)}`
     : "";
   return `<span class="tree-badge master">${fmtSec(wall)}${range}</span>`;
+}
+
+function renderMasterTurnTimingDetail(mt) {
+  const timing = mt.timing;
+  if (!timing) return "";
+  const wall = timing.wall_seconds ?? timing.llm_seconds;
+  const start = timing.start_t;
+  const end = timing.end_t;
+  const bits = [
+    wall != null ? `<div class="tree-kv"><b>Duration</b> ${esc(fmtSec(wall))}</div>` : "",
+    start != null ? `<div class="tree-kv"><b>Start</b> ${esc(fmtAbsDateTime(start))}</div>` : "",
+    end != null ? `<div class="tree-kv"><b>End</b> ${esc(fmtAbsDateTime(end))}</div>` : "",
+  ].filter(Boolean);
+  if (!bits.length) return "";
+  const extra = [
+    timing.llm_seconds != null ? `model ${fmtSec(timing.llm_seconds)}` : null,
+    timing.tool_seconds != null ? `tools/overhead ${fmtSec(timing.tool_seconds)}` : null,
+    timing.search_wall_seconds != null ? `search wall ${fmtSec(timing.search_wall_seconds)}` : null,
+  ].filter(Boolean);
+  return `<div class="viz-section" style="margin:0 0 10px">
+    <h3 style="margin:0 0 6px">Timing</h3>
+    ${bits.join("")}
+    ${extra.length ? `<div class="tree-kv" style="margin-top:4px;color:var(--muted)">${esc(extra.join(" · "))}</div>` : ""}
+  </div>`;
 }
 
 function timingBadge(timing, kind="") {
@@ -1374,7 +1506,7 @@ function renderExtractKvVlm(tool) {
   ).join("");
   const files = tool.extra_files || {};
   const fileLinks = Object.entries(files).map(([label, rel]) =>
-    `<a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(rel)}" target="_blank">${esc(label)}</a>`
+    `<a href="${runFileUrl(rel)}" target="_blank">${esc(label)}</a>`
   ).join(" · ");
   const hintsHtml = hints && String(hints).trim() ? `
     <div class="viz-section" style="margin-top:6px">
@@ -1399,6 +1531,37 @@ function renderExtractKvVlm(tool) {
     </table>` : ""}
     ${!rows ? `<pre class="pretty" style="margin-top:6px">${esc(pretty(result.result || result || tool.result_preview || {}, 4000))}</pre>` : ""}
     ${fileLinks ? `<div class="tree-kv" style="margin-top:6px">pages: ${fileLinks}</div>` : ""}
+    ${tool.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>` : ""}
+  `;
+}
+
+function renderSubmitEvaluation(tool) {
+  const args = tool.arguments || {};
+  const result = tool.result || {};
+  const payload = result.result || result || args;
+  const verdict = String(payload.is_correct_answer || payload.verdict || "").toLowerCase();
+  const cls = verdict === "correct" ? "ok" : (verdict === "incorrect" ? "warn" : "");
+  return `
+    <div class="tree-kv">
+      key=${esc(payload.key || args.key || state.evalKey || "?")}
+      ${verdict ? `<span class="tree-badge ${cls}">${esc(verdict)}</span>` : ""}
+    </div>
+    ${payload.reason_summary ? `<div class="tree-kv">${esc(payload.reason_summary)}</div>` : ""}
+    ${payload.reason_detail || payload.text ? `<pre class="pretty" style="max-height:200px;margin-top:6px">${esc(payload.reason_detail || payload.text)}</pre>` : ""}
+    ${tool.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>` : ""}
+  `;
+}
+
+function renderPageImageChatVlm(tool) {
+  const args = tool.arguments || {};
+  const result = tool.result || {};
+  const parsed = result.result || result.parsed || {};
+  return `
+    <div class="tree-kv">
+      page=${esc(args.page ?? "?")}
+      ${result.input_tokens != null ? ` · VLM in=${esc(result.input_tokens)} out=${esc(result.output_tokens ?? "—")}` : ""}
+    </div>
+    ${parsed.answer || parsed.summary ? `<pre class="pretty" style="max-height:200px;margin-top:6px">${esc(parsed.answer || parsed.summary)}</pre>` : ""}
     ${tool.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>` : ""}
   `;
 }
@@ -1541,6 +1704,10 @@ function renderMasterTool(tool) {
     inner += renderExtractKvVlm(tool);
   } else if (tool.name === "load_kv_schema") {
     inner += renderLoadKvSchema(tool);
+  } else if (tool.name === "submit_evaluation") {
+    inner += renderSubmitEvaluation(tool);
+  } else if (tool.name === "page_image_chat_vlm") {
+    inner += renderPageImageChatVlm(tool);
   } else {
     inner += renderGenericToolResult(tool);
   }
@@ -1799,16 +1966,51 @@ function renderMasterOutput() {
   </details>`;
 }
 
+function renderEvalOutput() {
+  const er = state.agentTree?.eval_result || {};
+  const verdict = String(er.is_correct_answer || "").toLowerCase();
+  const cls = verdict === "correct" ? "ok" : (verdict === "incorrect" ? "warn" : "");
+  const summary = er.reason_summary || er.reason || "";
+  const detail = er.reason_detail || er.text || "";
+  if (!verdict && !summary && !detail) {
+    return `<details class="tree-node output" open>
+      <summary><span class="title">Eval output</span><span class="tree-badge warn">pending</span></summary>
+      <div class="tree-body"><div class="tree-kv">No submit_evaluation verdict recorded yet.</div></div>
+    </details>`;
+  }
+  return `<details class="tree-node output" open>
+    <summary>
+      <span class="title">Eval output</span>
+      ${verdict ? `<span class="tree-badge ${cls}">${esc(verdict)}</span>` : ""}
+      ${state.evalKey ? `<span class="tree-kv">${esc(state.evalKey)}</span>` : ""}
+    </summary>
+    <div class="tree-body">
+      ${summary ? `<div class="tree-kv">${esc(summary)}</div>` : ""}
+      ${detail ? `<pre class="pretty" style="max-height:280px">${esc(detail)}</pre>` : ""}
+      <details style="margin-top:10px">
+        <summary class="tree-kv" style="cursor:pointer">raw JSON</summary>
+        <pre class="pretty">${esc(pretty(er, 12000))}</pre>
+      </details>
+    </div>
+  </details>`;
+}
+
 function renderAgentHierarchy() {
   const tree = state.agentTree;
   if (!tree || !(tree.master_turns || []).length) {
-    return `<div class="empty">No master turns found for this run.</div>`;
+    return `<div class="empty">No ${esc(masterAgentLabel().toLowerCase())} turns found for this run.</div>`;
   }
-  let html = `<p class="hint">
-    <b>Agent hierarchy</b> = Master LLM turns → tools → nested SearchAgent sessions.<br/>
+  const isEval = tree.agent_kind === "eval";
+  let html = state.embed ? "" : `<p class="hint">
+    <b>Agent hierarchy</b> = ${esc(masterAgentLabel())} LLM turns → tools → nested SearchAgent sessions.<br/>
     Each <code>search_pages</code> call expands into a SearchAgent node.
     Multi-key batches share one ReAct loop; single-key searches show one session per handoff.
-  </p><div class="tree">`;
+  </p>`;
+  if (isEval && state.evalKey && !state.embed) {
+    html += `<p class="hint">Agentic evaluation trace for key <code>${esc(state.evalKey)}</code>
+      (parent run <code>${esc(state.runId)}</code>).</p>`;
+  }
+  html += `<div class="tree">`;
 
   html += renderMasterPrompts(tree.master_prompts);
 
@@ -1817,13 +2019,14 @@ function renderAgentHierarchy() {
     const toolNames = (mt.tools || []).map(t => t.name).filter(Boolean);
     html += `<details class="tree-node master">
       <summary>
-        <span class="title">Master turn ${esc(mt.step)}</span>
+        <span class="title">${esc(masterAgentLabel())} turn ${esc(mt.step)}</span>
         ${err}
         ${masterTurnTimingBadge(mt.timing)}
         ${masterTurnTokenBadges(mt)}
         ${toolNames.map(n => `<span class="pill">${esc(n)}</span>`).join("")}
       </summary>
       <div class="tree-body">
+        ${renderMasterTurnTimingDetail(mt)}
         ${renderMasterTurnBody(mt)}
       </div>
     </details>`;
@@ -1839,7 +2042,7 @@ function renderAgentHierarchy() {
     </details>`;
   }
 
-  html += renderMasterOutput();
+  html += isEval ? renderEvalOutput() : renderMasterOutput();
   html += `</div>`;
   return html;
 }
@@ -2181,12 +2384,13 @@ function paintDetail() {
     body = renderEval();
   }
   detail.innerHTML = `
-    <div class="meta" style="margin-bottom:10px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    ${state.embed ? "" : `<div class="meta" style="margin-bottom:10px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <code>${esc(state.runId)}</code>
+      ${state.evalKey ? `· eval key <code>${esc(state.evalKey)}</code>` : ""}
       · status=${esc(state.info?.meta?.status || (state.info?.meta?.finished_at ? "done" : "running"))}
       · ${esc(state.info?.meta?.seconds)}s
       <button type="button" id="runRefresh" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--text);font-size:12px;cursor:pointer">Refresh</button>
-    </div>
+    </div>`}
     ${tabsHtml()}
     ${body}`;
   detail.querySelectorAll(".tab").forEach(btn => {
@@ -2268,7 +2472,7 @@ function paintDetail() {
     };
   });
   const openJsonDump = async (relPath) => {
-    const data = await api(`/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(relPath)}`);
+    const data = await api(runFileUrl(relPath));
     const w = window.open("", "_blank");
     if (!w) return;
     w.document.write(`<pre style="white-space:pre-wrap;font-family:ui-monospace,monospace">${esc(pretty(data, 50000))}</pre>`);
@@ -2289,7 +2493,7 @@ function paintDetail() {
   detail.querySelectorAll("[data-md]").forEach(async pre => {
     const path = pre.getAttribute("data-md");
     try {
-      const r = await fetch(`/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(path)}`);
+      const r = await fetch(runFileUrl(path));
       const html = await r.text();
       const tmp = document.createElement("div");
       tmp.innerHTML = html;
@@ -2301,15 +2505,25 @@ function paintDetail() {
 }
 
 (async function init() {
-  state.runs = await api("/api/runs");
-  renderRuns();
   const params = new URLSearchParams(location.search);
+  state.embed = params.get("embed") === "1";
+  state.evalKey = params.get("eval_key") || null;
   const runParam = params.get("run");
+  if (state.embed) {
+    document.getElementById("appBody").classList.add("embed");
+    state.tab = "hierarchy";
+    if (runParam) {
+      const detail = document.getElementById("detail");
+      if (detail) detail.innerHTML = `<div class="empty">Loading ${esc(runParam)}…</div>`;
+    }
+  }
+  state.runs = await api("/api/runs");
+  if (!state.embed) renderRuns();
   const tabParam = params.get("tab");
-  if (runParam && state.runs.some(r => r.run_id === runParam)) {
+  if (runParam && (state.embed || state.runs.some(r => r.run_id === runParam))) {
     if (tabParam) state.tab = tabParam;
     await selectRun(runParam);
-  } else if (state.runs[0]) {
+  } else if (!state.embed && state.runs[0]) {
     await selectRun(state.runs[0].run_id);
   }
 })();

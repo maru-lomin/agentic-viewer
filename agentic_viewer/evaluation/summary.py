@@ -58,6 +58,8 @@ def _agentic_cell(by_key: Dict[str, Any], key: str) -> Dict[str, Any]:
         }
     if status == "error":
         return {"status": "error", "error": ae.get("error") or "error"}
+    if status == "cancelled":
+        return {"status": "error", "error": ae.get("error") or "cancelled"}
     if status == "running":
         return {"status": "running"}
     return {"status": status}

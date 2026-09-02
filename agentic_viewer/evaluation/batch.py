@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from agentic_viewer.evaluation.agentic_client import invoke_agentic_eval_safe
+from agentic_viewer.evaluation.agentic_client import invoke_agentic_eval_safe, cancel_agentic_eval_safe
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
+from agentic_viewer.evaluation.status_cleanup import mark_running_eval_status_cancelled
 from agentic_viewer.evaluation.summary import read_agentic_evals
 
 
@@ -202,7 +203,13 @@ class BatchJobManager:
                 return job
             job.cancel_requested = True
             job.message = "cancel requested"
-            return job
+            run_ids = list(job.run_ids)
+        for run_id in run_ids:
+            cancel_agentic_eval_safe(self.inference_api_url, run_id)
+            mark_running_eval_status_cancelled(self.runs_root / run_id)
+            self.inflight_tracker.pop(run_id, None)
+        with self._lock:
+            return self._jobs[job_id]
 
     def _run_job(self, job_id: str, tasks: List[Tuple[str, str]]) -> None:
         with self._lock:

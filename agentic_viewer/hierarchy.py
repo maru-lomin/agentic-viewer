@@ -451,10 +451,14 @@ def _load_master_prompts(agent_dir: Path) -> Dict[str, Optional[str]]:
         return out
 
     for path in sorted(agent_dir.glob("step_*.json")):
-        if not re.fullmatch(r"step_\d+\.json", path.name):
+        name = path.name
+        if not (
+            re.fullmatch(r"step_\d+\.json", name)
+            or re.fullmatch(r"step_\d+_eval\.json", name)
+        ):
             continue
         data = _read_json(path) or {}
-        if data.get("label"):
+        if data.get("label") and not _is_eval_master_step(name, data.get("label")):
             continue
         msgs = data.get("request_messages") or []
         if out["system"] is None:
@@ -499,6 +503,20 @@ def _extract_prior_from_user(content: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _is_eval_master_step(filename: str, label: Any) -> bool:
+    if re.fullmatch(r"step_\d+_eval\.json", filename):
+        return True
+    return str(label or "").strip() == "eval"
+
+
+def _is_extraction_master_step(filename: str, label: Any) -> bool:
+    if _is_eval_master_step(filename, label):
+        return False
+    if label:
+        return False
+    return bool(re.fullmatch(r"step_\d+\.json", filename))
+
+
 def _load_steps(
     agent_dir: Path,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
@@ -515,6 +533,11 @@ def _load_steps(
         label = data.get("label")
         compact = _compact_step(data, filename=name)
 
+        if _is_eval_master_step(name, label):
+            compact["agent"] = "eval"
+            master.append(compact)
+            continue
+
         if label:
             key_prefix, session, turn, master_step = _parse_search_label(str(label))
             compact["search_key_prefix"] = key_prefix
@@ -522,7 +545,7 @@ def _load_steps(
             compact["search_turn"] = turn
             compact["master_step"] = master_step
             search_by_prefix.setdefault(key_prefix, []).append(compact)
-        elif re.fullmatch(r"step_\d+\.json", name):
+        elif _is_extraction_master_step(name, label):
             master.append(compact)
 
     master.sort(key=lambda s: int(s.get("step") or 0))
@@ -1484,6 +1507,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
         node: Dict[str, Any] = {
             "type": "master_turn",
             "step": mstep,
+            "agent": ms.get("agent"),
             "filename": ms.get("filename"),
             "prompt_est_tokens": ms.get("prompt_est_tokens"),
             "input_tokens": ms.get("input_tokens"),
@@ -1747,7 +1771,12 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
     if not isinstance(kv_results, list):
         kv_results = []
 
+    agent_kind = "eval" if any(
+        str(t.get("agent") or "") == "eval" for t in tree
+    ) else "extraction"
+
     return {
+        "agent_kind": agent_kind,
         "master_turns": tree,
         "master_prompts": master_prompts,
         "n_master_turns": len(tree),

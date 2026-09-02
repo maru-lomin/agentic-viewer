@@ -150,6 +150,33 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .run-table th { color: var(--muted); font-weight: 500; }
     .run-table td.mono { font-family: var(--mono); font-size: 11px; }
     .err-text { color: var(--err); font-size: 12px; margin-top: 6px; }
+    .content-tabs {
+      display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;
+    }
+    .content-tabs button {
+      background: transparent; border: 1px solid var(--line); color: var(--muted);
+      padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px;
+    }
+    .content-tabs button.active {
+      color: var(--text); border-color: var(--accent); background: #152033;
+    }
+    .hierarchy-toolbar {
+      display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px;
+    }
+    .hierarchy-toolbar select {
+      min-width: 220px; padding: 6px 10px; border-radius: 8px;
+      border: 1px solid var(--line); background: #0f1419; color: var(--text);
+      font-family: var(--mono); font-size: 12px;
+    }
+    .hierarchy-frame {
+      width: 100%; min-height: 72vh; border: 1px solid var(--line);
+      border-radius: 10px; background: #0f1419;
+    }
+    .matrix td.clickable { cursor: pointer; }
+    .matrix td.clickable:hover { background: rgba(61, 156, 240, 0.08); }
+    .matrix .open-hierarchy {
+      display: block; margin-top: 4px; font-size: 10px; color: var(--accent);
+    }
   </style>
 </head>
 <body>
@@ -184,6 +211,13 @@ const state = {
   batchViewFocused: false,
   skipExisting: true,
   pollTimer: null,
+  contentTab: "summary",
+  hierarchyRunId: null,
+  hierarchyKey: null,
+  hierarchyKeys: [],
+  hierarchyKeysLoading: false,
+  hierarchyFollowBatch: true,
+  hierarchyIframeSrc: null,
 };
 
 function summaryRunIds() {
@@ -212,6 +246,11 @@ function parseSelectedFromUrl() {
   return new Set(q.split(",").map(s => s.trim()).filter(Boolean));
 }
 
+function parseContentTabFromUrl() {
+  const tab = new URLSearchParams(location.search).get("tab");
+  return tab === "hierarchy" ? "hierarchy" : "summary";
+}
+
 function syncUrl() {
   const ids = summaryRunIds();
   const params = new URLSearchParams();
@@ -219,9 +258,248 @@ function syncUrl() {
   if (state.batchJob?.job_id && state.batchViewFocused) {
     params.set("job", state.batchJob.job_id);
   }
+  if (state.contentTab === "hierarchy") {
+    params.set("tab", "hierarchy");
+    if (state.hierarchyRunId) params.set("hrun", state.hierarchyRunId);
+    if (state.hierarchyKey) params.set("hkey", state.hierarchyKey);
+  }
   const qs = params.toString();
   const url = qs ? `/evaluation?${qs}` : "/evaluation";
   history.replaceState(null, "", url);
+}
+
+function hierarchyRunCandidates() {
+  return summaryRunIds();
+}
+
+function ensureHierarchySelection() {
+  const runs = hierarchyRunCandidates();
+  if (!runs.length) {
+    state.hierarchyRunId = null;
+    state.hierarchyKey = null;
+    state.hierarchyKeys = [];
+    return;
+  }
+  if (!state.hierarchyRunId || !runs.includes(state.hierarchyRunId)) {
+    state.hierarchyRunId = runs[0];
+    state.hierarchyKey = null;
+  }
+}
+
+function hierarchyIframeSrc() {
+  if (!state.hierarchyRunId || !state.hierarchyKey) return "";
+  const q = new URLSearchParams({
+    run: state.hierarchyRunId,
+    tab: "hierarchy",
+    eval_key: state.hierarchyKey,
+    embed: "1",
+  });
+  return `/?${q.toString()}`;
+}
+
+async function loadHierarchyKeys() {
+  if (!state.hierarchyRunId) {
+    state.hierarchyKeys = [];
+    return;
+  }
+  state.hierarchyKeysLoading = true;
+  try {
+    const data = await api(`/api/runs/${encodeURIComponent(state.hierarchyRunId)}/agentic-eval/keys`);
+    state.hierarchyKeys = data.keys || [];
+    if (!state.hierarchyKey && state.hierarchyKeys.length) {
+      const done = state.hierarchyKeys.find(k => k.status === "done");
+      state.hierarchyKey = (done || state.hierarchyKeys[0]).key;
+    } else if (state.hierarchyKey && !state.hierarchyKeys.some(k => k.key === state.hierarchyKey)) {
+      state.hierarchyKey = state.hierarchyKeys[0]?.key || null;
+    }
+  } catch (_) {
+    state.hierarchyKeys = [];
+  } finally {
+    state.hierarchyKeysLoading = false;
+  }
+}
+
+function openHierarchy(runId, key) {
+  state.contentTab = "hierarchy";
+  state.hierarchyRunId = runId;
+  state.hierarchyKey = key;
+  state.hierarchyFollowBatch = false;
+  state.hierarchyIframeSrc = null;
+  syncUrl();
+  renderContent();
+  loadHierarchyKeys().then(() => renderContent());
+}
+
+function maybeFollowBatchHierarchy() {
+  if (state.contentTab !== "hierarchy" || !state.hierarchyFollowBatch) return;
+  const cur = state.batchJob?.current;
+  if (!cur?.run_id || !cur?.key) return;
+  if (state.hierarchyRunId === cur.run_id && state.hierarchyKey === cur.key) return;
+  state.hierarchyRunId = cur.run_id;
+  state.hierarchyKey = cur.key;
+  state.hierarchyIframeSrc = null;
+  syncUrl();
+  loadHierarchyKeys().then(() => renderContent());
+}
+
+function contentTabsHtml() {
+  return `<div class="content-tabs">
+    <button type="button" data-content-tab="summary" class="${state.contentTab === "summary" ? "active" : ""}">Summary</button>
+    <button type="button" data-content-tab="hierarchy" class="${state.contentTab === "hierarchy" ? "active" : ""}">Agent hierarchy</button>
+  </div>`;
+}
+
+function renderHierarchyToolbar() {
+  ensureHierarchySelection();
+  const runs = hierarchyRunCandidates();
+  if (!runs.length) {
+    return `<div class="empty">Select one or more runs to inspect agentic-eval traces.</div>`;
+  }
+  const runOpts = runs.map(id =>
+    `<option value="${esc(id)}" ${id === state.hierarchyRunId ? "selected" : ""}>${esc(id)}</option>`
+  ).join("");
+  const keyOpts = state.hierarchyKeys.map(row => {
+    const status = row.status || "pending";
+    const verdict = row.is_correct_answer ? ` · ${row.is_correct_answer}` : "";
+    return `<option value="${esc(row.key)}" ${row.key === state.hierarchyKey ? "selected" : ""}>${esc(row.key)} (${esc(status)}${esc(verdict)})</option>`;
+  }).join("");
+  const follow = state.hierarchyFollowBatch
+    ? `<label class="btn" style="font-size:12px"><input type="checkbox" id="followBatch" checked />
+        Follow batch current key</label>`
+    : `<label class="btn" style="font-size:12px"><input type="checkbox" id="followBatch" />
+        Follow batch current key</label>`;
+  return `
+    <p class="hint">
+      EvalMaster → SearchAgent trace for one key under <code>06_agentic_eval/</code>.
+      Reuses the inference hierarchy viewer in embed mode.
+    </p>
+    <div class="hierarchy-toolbar">
+      <label>Run
+        <select id="hierarchyRun">${runOpts}</select>
+      </label>
+      <label>Key
+        <select id="hierarchyKey" ${state.hierarchyKeysLoading ? "disabled" : ""}>
+          ${keyOpts || `<option value="">—</option>`}
+        </select>
+      </label>
+      ${follow}
+      ${state.hierarchyRunId && state.hierarchyKey
+        ? `<a href="/?run=${encodeURIComponent(state.hierarchyRunId)}&tab=hierarchy&eval_key=${encodeURIComponent(state.hierarchyKey)}" target="_blank">Open full page</a>`
+        : ""}
+    </div>`;
+}
+
+function updateHierarchyFrame() {
+  const host = document.getElementById("hierarchyFrameHost");
+  if (!host) return;
+  const src = hierarchyIframeSrc();
+  if (!src) {
+    state.hierarchyIframeSrc = null;
+    host.innerHTML = `<div class="empty">${state.hierarchyKeysLoading ? "Loading keys…" : "No eval trace for this run/key yet."}</div>`;
+    return;
+  }
+  if (state.hierarchyIframeSrc === src) return;
+  state.hierarchyIframeSrc = src;
+  host.innerHTML = `<iframe class="hierarchy-frame" src="${esc(src)}" title="Agentic eval hierarchy"></iframe>`;
+}
+
+function renderHierarchyBody() {
+  return `${renderHierarchyToolbar()}<div id="hierarchyFrameHost"></div>`;
+}
+
+function renderHierarchyLayout(batchHtml, tabs) {
+  return `
+    <div id="evalBatchHost">${batchHtml}</div>
+    <div id="evalMainHost">
+      ${tabs}
+      ${renderHierarchyBody()}
+    </div>`;
+}
+
+function refreshHierarchyDom(batchHtml, tabs) {
+  const batchHost = document.getElementById("evalBatchHost");
+  const tabsHost = document.getElementById("evalHierarchyTabsHost");
+  const toolbarHost = document.getElementById("evalHierarchyToolbarHost");
+  if (batchHost) batchHost.innerHTML = batchHtml;
+  if (tabsHost) tabsHost.innerHTML = tabs;
+  if (toolbarHost) toolbarHost.innerHTML = renderHierarchyToolbar();
+  updateHierarchyFrame();
+  bindBatchControls();
+  bindContentTabs();
+  bindHierarchyControls();
+}
+
+function mountHierarchyView(el, batchHtml, tabs) {
+  el.innerHTML = `
+    <div id="evalBatchHost">${batchHtml}</div>
+    <div id="evalMainHost">
+      <div id="evalHierarchyTabsHost">${tabs}</div>
+      <div id="evalHierarchyToolbarHost">${renderHierarchyToolbar()}</div>
+      <div id="hierarchyFrameHost"></div>
+    </div>`;
+  updateHierarchyFrame();
+  bindBatchControls();
+  bindContentTabs();
+  bindHierarchyControls();
+}
+
+function bindHierarchyControls() {
+  const runSel = document.getElementById("hierarchyRun");
+  if (runSel) {
+    runSel.onchange = async () => {
+      state.hierarchyRunId = runSel.value;
+      state.hierarchyKey = null;
+      state.hierarchyFollowBatch = false;
+      state.hierarchyIframeSrc = null;
+      syncUrl();
+      await loadHierarchyKeys();
+      renderContent();
+    };
+  }
+  const keySel = document.getElementById("hierarchyKey");
+  if (keySel) {
+    keySel.onchange = () => {
+      state.hierarchyKey = keySel.value || null;
+      state.hierarchyFollowBatch = false;
+      state.hierarchyIframeSrc = null;
+      syncUrl();
+      renderContent();
+    };
+  }
+  const followCb = document.getElementById("followBatch");
+  if (followCb) {
+    followCb.onchange = () => {
+      state.hierarchyFollowBatch = followCb.checked;
+      if (state.hierarchyFollowBatch) maybeFollowBatchHierarchy();
+    };
+  }
+  document.querySelectorAll("td[data-matrix-cell]").forEach(td => {
+    td.onclick = () => {
+      if (!td.dataset.runId || !td.dataset.key) return;
+      openHierarchy(td.dataset.runId, td.dataset.key);
+    };
+  });
+}
+
+function bindContentTabs() {
+  document.querySelectorAll("[data-content-tab]").forEach(btn => {
+    btn.onclick = () => {
+      const next = btn.dataset.contentTab;
+      if (next === state.contentTab) return;
+      state.contentTab = next;
+      if (state.contentTab === "hierarchy") {
+        ensureHierarchySelection();
+        loadHierarchyKeys().then(() => {
+          syncUrl();
+          renderContent();
+        });
+      } else {
+        state.hierarchyIframeSrc = null;
+        syncUrl();
+        renderContent();
+      }
+    };
+  });
 }
 
 function persistBatchJobId(jobId) {
@@ -424,6 +702,7 @@ function renderSummaryBody() {
       const ae = cell.agentic || {};
       const isCurrent = cur && cur.run_id === runId && cur.key === row.key && ae.status !== "done";
       let agentHtml;
+      const canOpen = ae.status === "done" || ae.status === "error" || ae.status === "running";
       if (ae.status === "done") {
         const v = String(ae.is_correct_answer || "").toLowerCase();
         const cls = v === "correct" ? "correct" : (v === "incorrect" ? "incorrect" : "pending");
@@ -435,10 +714,14 @@ function renderSummaryBody() {
       } else {
         agentHtml = `<div class="cell-agent pending">pending</div>`;
       }
-      return `<td>
+      const openLink = canOpen
+        ? `<span class="open-hierarchy">view hierarchy</span>` : "";
+      return `<td class="${canOpen ? "clickable" : ""}" data-matrix-cell="1"
+        data-run-id="${esc(runId)}" data-key="${esc(row.key)}">
         <div class="${emCls}">EM ${cell.baseline_em ? "Y" : "N"}</div>
         <div class="cell-sub">pageF1 ${fmtPct(cell.page_f1)} · evid ${fmtPct(cell.evidence_f1)}</div>
         ${agentHtml}
+        ${openLink}
       </td>`;
     }).join("");
     return `<tr>
@@ -479,33 +762,56 @@ function renderSummaryBody() {
     </div>`;
 }
 
-function renderSummary() {
+function renderContent() {
   const el = document.getElementById("content");
   const batchHtml = renderBatchPanel();
   const hasRuns = summaryRunIds().length > 0;
+  const tabs = contentTabsHtml();
 
-  if (state.loading && !state.summary && hasRuns) {
-    el.innerHTML = batchHtml + `<div class="empty">Loading summary…</div>`;
-    bindBatchControls();
-    return;
-  }
-  if (state.error && !state.summary && hasRuns) {
-    el.innerHTML = batchHtml + `<div class="empty" style="color:var(--err)">${esc(state.error)}</div>`;
-    bindBatchControls();
-    return;
-  }
   if (!hasRuns && !state.batchJob) {
+    state.hierarchyIframeSrc = null;
     el.innerHTML = `<div class="empty">Select one or more runs to compare evaluation results.</div>`;
     return;
   }
   if (!hasRuns && state.batchJob) {
+    state.hierarchyIframeSrc = null;
     el.innerHTML = batchHtml + `<div class="empty">Click the batch job panel above to view summary and matrix.</div>`;
     bindBatchControls();
     return;
   }
 
-  el.innerHTML = batchHtml + renderSummaryBody();
+  if (state.contentTab === "hierarchy") {
+    if (document.getElementById("evalBatchHost")) {
+      refreshHierarchyDom(batchHtml, tabs);
+      return;
+    }
+    mountHierarchyView(el, batchHtml, tabs);
+    return;
+  }
+
+  state.hierarchyIframeSrc = null;
+
+  if (state.loading && !state.summary && hasRuns) {
+    el.innerHTML = batchHtml + tabs + `<div class="empty">Loading summary…</div>`;
+    bindBatchControls();
+    bindContentTabs();
+    return;
+  }
+  if (state.error && !state.summary && hasRuns) {
+    el.innerHTML = batchHtml + tabs + `<div class="empty" style="color:var(--err)">${esc(state.error)}</div>`;
+    bindBatchControls();
+    bindContentTabs();
+    return;
+  }
+
+  el.innerHTML = batchHtml + tabs + renderSummaryBody();
   bindBatchControls();
+  bindContentTabs();
+  bindHierarchyControls();
+}
+
+function renderSummary() {
+  renderContent();
 }
 
 function bindBatchControls() {
@@ -577,6 +883,7 @@ async function pollBatchJob() {
     }
     renderSummary();
     renderRunList();
+    maybeFollowBatchHierarchy();
     if (state.batchJob.status === "running" || state.batchJob.status === "queued") {
       if (state.batchViewFocused || summaryRunIds().length) {
         await loadSummary(true);
@@ -675,7 +982,15 @@ async function resumeActiveJob() {
     if (stored) job = await loadBatchJobById(stored);
   }
 
-  if (!job) return;
+  if (!job) {
+    persistBatchJobId(null);
+    return;
+  }
+
+  const running = job.status === "queued" || job.status === "running";
+  if (!running) {
+    persistBatchJobId(null);
+  }
 
   state.batchJob = job;
   persistBatchJobId(job.job_id);
@@ -711,15 +1026,23 @@ document.getElementById("clearSelection").onclick = () => {
 };
 
 (async function init() {
+  const params = new URLSearchParams(location.search);
   state.selected = parseSelectedFromUrl();
   if (state.selected.size) state.batchViewFocused = true;
+  state.contentTab = parseContentTabFromUrl();
+  state.hierarchyRunId = params.get("hrun");
+  state.hierarchyKey = params.get("hkey");
   state.runs = await api("/api/runs");
   document.getElementById("headerMeta").textContent =
     `${state.runs.length} run(s) · ${location.origin}`;
   renderRunList();
   await resumeActiveJob();
+  if (state.contentTab === "hierarchy") {
+    ensureHierarchySelection();
+    await loadHierarchyKeys();
+  }
   if (summaryRunIds().length && !state.summary) await loadSummary();
-  else renderSummary();
+  else renderContent();
 })();
 </script>
 </body>

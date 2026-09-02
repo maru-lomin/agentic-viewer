@@ -443,18 +443,30 @@ def _pipeline_progress(
     return None
 
 
+def _master_agent_label(events: List[Dict[str, Any]]) -> str:
+    """Master orchestrator agent name in timeline (``master`` or ``eval``)."""
+    for ev in events:
+        if ev.get("stage") == "agent" and ev.get("event") == "llm_request":
+            agent = str(ev.get("agent") or "master")
+            if agent == "eval":
+                return "eval"
+    return "master"
+
+
 def _master_turn_timings(
     events: List[Dict[str, Any]],
     llm_pairs: List[Dict[str, Any]],
     total: float,
     search_calls: Optional[List[Dict[str, Any]]] = None,
+    *,
+    master_agent: str = "master",
 ) -> List[Dict[str, Any]]:
     master_requests = [
         ev
         for ev in events
         if ev.get("stage") == "agent"
         and ev.get("event") == "llm_request"
-        and str(ev.get("agent") or "master") == "master"
+        and str(ev.get("agent") or "master") == master_agent
     ]
     if not master_requests:
         return []
@@ -462,7 +474,7 @@ def _master_turn_timings(
     llm_by_step = {
         int(p["step"]): p
         for p in llm_pairs
-        if p.get("agent") == "master"
+        if p.get("agent") == master_agent
     }
 
     # Async search_pages jobs are attributed to the master step that started
@@ -1376,21 +1388,38 @@ def build_timing_report(run_dir: Path) -> Dict[str, Any]:
     events = _read_timeline(run_dir)
     total = float(events[-1].get("t") or 0) if events else 0.0
     llm_pairs, open_reqs = _pair_llm_events(events)
+    master_agent = _master_agent_label(events)
+
+    meta_path = run_dir / "meta.json"
+    run_started_at = None
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                run_started_at = meta.get("started_at")
+        except (OSError, json.JSONDecodeError):
+            run_started_at = None
 
     completed = _search_call_timings(events, llm_pairs, total)
     running = _in_progress_search_calls(events, llm_pairs, open_reqs, total)
     # Running first so the Timing UI surfaces live work above completed history.
     search_calls = list(running) + list(completed)
 
-    master_llm = sum(float(p.get("llm_seconds") or 0) for p in llm_pairs if p.get("agent") == "master")
+    master_llm = sum(
+        float(p.get("llm_seconds") or 0)
+        for p in llm_pairs
+        if p.get("agent") == master_agent
+    )
     search_llm = sum(float(p.get("llm_seconds") or 0) for p in llm_pairs if p.get("agent") == "search")
 
     return {
         "total_seconds": _round_secs(total),
+        "run_started_at": run_started_at,
+        "master_agent": master_agent,
         "stages": _stage_timings(events, total),
         "pipeline_progress": _pipeline_progress(run_dir, events),
         "master_turns": _master_turn_timings(
-            events, llm_pairs, total, search_calls=search_calls
+            events, llm_pairs, total, search_calls=search_calls, master_agent=master_agent
         ),
         "search_calls": search_calls,
         "active_searches": running,
@@ -1398,7 +1427,12 @@ def build_timing_report(run_dir: Path) -> Dict[str, Any]:
             "master_llm_seconds": _round_secs(master_llm),
             "search_llm_seconds": _round_secs(search_llm),
             "master_turns": len(
-                [e for e in events if e.get("event") == "llm_request" and str(e.get("agent") or "master") == "master"]
+                [
+                    e
+                    for e in events
+                    if e.get("event") == "llm_request"
+                    and str(e.get("agent") or "master") == master_agent
+                ]
             ),
             "search_llm_calls": len([p for p in llm_pairs if p.get("agent") == "search"]),
             "search_page_calls": len(

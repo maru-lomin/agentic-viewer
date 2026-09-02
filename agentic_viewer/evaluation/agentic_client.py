@@ -75,3 +75,42 @@ def invoke_agentic_eval_safe(
             "error": str(exc),
             "status_code": exc.status_code,
         }
+
+
+def cancel_agentic_eval(api_url: str, run_id: str, *, timeout: float = 10) -> Dict[str, Any]:
+    """Request cancellation of the in-flight eval for one extraction run_id."""
+    payload = json.dumps({"run_id": run_id}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{api_url.rstrip('/')}/agentic-eval/cancel",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            data = json.loads(body)
+            if not isinstance(data, dict):
+                raise AgenticEvalError("invalid cancel response", status_code=502)
+            return data
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and "detail" in parsed:
+                detail = str(parsed["detail"])
+        except Exception:
+            pass
+        raise AgenticEvalError(detail, status_code=exc.code) from exc
+    except urllib.error.URLError as exc:
+        raise AgenticEvalError(
+            f"Cannot reach inference API at {api_url}/agentic-eval/cancel: {exc.reason}",
+            status_code=502,
+        ) from exc
+
+
+def cancel_agentic_eval_safe(api_url: str, run_id: str) -> None:
+    try:
+        cancel_agentic_eval(api_url, run_id)
+    except AgenticEvalError:
+        pass
