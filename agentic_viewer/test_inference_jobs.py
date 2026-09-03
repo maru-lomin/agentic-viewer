@@ -71,10 +71,15 @@ class InferenceJobManagerTests(unittest.TestCase):
             runs_root.mkdir()
 
             def fake_invoke(*_args, **kwargs):
-                run_id = "run-ds-1"
+                run_id = kwargs.get("request_id") or "run-ds-1"
                 dest = runs_root / run_id
-                dest.mkdir()
-                (dest / "meta.json").write_text("{}", encoding="utf-8")
+                dest.mkdir(parents=True, exist_ok=True)
+                path = dest / "meta.json"
+                meta = {}
+                if path.is_file():
+                    meta = json.loads(path.read_text(encoding="utf-8"))
+                meta["run_id"] = run_id
+                path.write_text(json.dumps(meta), encoding="utf-8")
                 return {"kv_results": [], "meta": {"run_id": run_id, "seconds": 0.5}}
 
             mock_invoke.side_effect = fake_invoke
@@ -95,9 +100,13 @@ class InferenceJobManagerTests(unittest.TestCase):
             else:
                 self.fail("job did not finish")
             self.assertEqual(job.status, "done")
-            meta = json.loads((runs_root / "run-ds-1" / "meta.json").read_text(encoding="utf-8"))
+            run_id = job.tasks[0].run_id
+            self.assertTrue(run_id)
+            meta = json.loads((runs_root / run_id / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["dataset_id"], "evaluation-v2")
             self.assertEqual(meta["source_filename"], "doc.pdf")
+            extra = mock_invoke.call_args.kwargs.get("extra") or {}
+            self.assertEqual(extra.get("dataset_id"), "evaluation-v2")
         finally:
             tmp.cleanup()
 

@@ -22,18 +22,24 @@ def annotate_run_meta(
     run_id: Optional[str],
     extra: Dict[str, Any],
 ) -> None:
-    """Merge viewer-owned fields into a run's meta.json after inference returns."""
+    """Merge viewer-owned fields into a run's meta.json (create the file if needed)."""
     if not runs_root or not run_id or not extra:
         return
-    path = Path(runs_root) / run_id / "meta.json"
-    if not path.is_file():
-        return
-    try:
-        meta = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(meta, dict):
+    dest = Path(runs_root) / run_id
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / "meta.json"
+    meta: Dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                meta = loaded
+        except Exception:
             meta = {}
-    except Exception:
-        meta = {}
+    if not meta.get("run_id"):
+        meta["run_id"] = run_id
+    if not meta.get("started_at"):
+        meta["started_at"] = _utc_now()
     meta.update({k: v for k, v in extra.items() if v is not None})
     path.write_text(
         json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
@@ -227,17 +233,20 @@ class InferenceJobManager:
             task.status = "running"
             request_id = f"agentic-{uuid.uuid4()}"
             task.run_id = request_id
+            extra_meta = self._run_meta(job, task)
             try:
                 if task.path:
                     file_bytes = Path(task.path).read_bytes()
                 else:
                     file_bytes = file_bytes_list[index] or b""
+                annotate_run_meta(self.runs_root, request_id, extra_meta)
                 result = invoke_inference(
                     self.inference_api_url,
                     filename=task.filename,
                     file_bytes=file_bytes,
                     hooks=job.hooks,
                     request_id=request_id,
+                    extra=extra_meta,
                 )
                 meta = result.get("meta") if isinstance(result, dict) else {}
                 task.run_id = (

@@ -1367,6 +1367,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </select>
         <div class="upload-actions">
           <button type="button" class="upload-btn" id="inferenceUploadBtn">Run extraction</button>
+          <button type="button" class="upload-btn" id="inferenceRefreshBtn">Refresh</button>
         </div>
         <div class="upload-status" id="inferenceUploadStatus"></div>
       </div>
@@ -1386,7 +1387,7 @@ const state = {
   evalOpenDetails: new Set(),
   gtEdit: null,
   batchJob: null, batchPollTimer: null,
-  inferenceJob: null, inferencePollTimer: null,
+  inferenceJob: null,
   datasets: [], inferSource: "files", inferDataset: "", collapsedGroups: new Set(),
   evalKey: null, embed: false,
   evalHierarchyKeys: [], evalHierarchyKeysLoading: false,
@@ -1622,18 +1623,6 @@ function renderUploadPanel() {
     ${job.message ? `<div>${esc(job.message)}</div>` : ""}`;
 }
 
-function stopInferencePoll() {
-  if (state.inferencePollTimer) {
-    clearInterval(state.inferencePollTimer);
-    state.inferencePollTimer = null;
-  }
-}
-
-function startInferencePoll() {
-  stopInferencePoll();
-  state.inferencePollTimer = setInterval(() => refreshInferenceUploadJob(), 3000);
-}
-
 async function refreshDatasets() {
   try {
     const ds = await api("/api/datasets");
@@ -1644,28 +1633,18 @@ async function refreshDatasets() {
 }
 
 async function refreshInferenceUploadJob() {
-  if (!state.inferenceJob?.job_id) return;
   try {
-    state.inferenceJob = await api(`/api/inference/jobs/${encodeURIComponent(state.inferenceJob.job_id)}`);
-    renderUploadPanel();
+    if (state.inferenceJob?.job_id) {
+      state.inferenceJob = await api(`/api/inference/jobs/${encodeURIComponent(state.inferenceJob.job_id)}`);
+    } else {
+      const data = await api("/api/inference/jobs/active");
+      state.inferenceJob = data.job || state.inferenceJob;
+    }
+    if (state.inferenceJob && (state.inferenceJob.status === "done" || state.inferenceJob.status === "partial" || state.inferenceJob.status === "error")) {
+      await refreshDatasets();
+    }
     state.runs = await api("/api/runs");
     renderRuns();
-    if (state.inferenceJob.status === "running" || state.inferenceJob.status === "queued") {
-      const top = state.runs[0];
-      const runIds = state.inferenceJob.run_ids || [];
-      if (top && top.run_id !== state.runId && (top.status === "running" || runIds.includes(top.run_id))) {
-        await selectRun(top.run_id, { keepTab: true });
-      } else if (state.runId) {
-        await renderDetail({ force: true });
-      }
-      return;
-    }
-    stopInferencePoll();
-    await refreshDatasets();
-    const lastRunId = (state.inferenceJob.run_ids || []).slice(-1)[0];
-    if (lastRunId) {
-      await selectRun(lastRunId, { keepTab: true });
-    }
   } catch (err) {
     const statusEl = document.getElementById("inferenceUploadStatus");
     if (statusEl) {
@@ -1681,9 +1660,6 @@ async function resumeInferenceUploadJob() {
     if (data.job) {
       state.inferenceJob = data.job;
       renderUploadPanel();
-      if (data.job.status === "queued" || data.job.status === "running") {
-        startInferencePoll();
-      }
     }
   } catch (_) { /* ignore */ }
 }
@@ -1744,7 +1720,6 @@ async function startInferenceUpload() {
       await refreshDatasets();
     }
     renderUploadPanel();
-    startInferencePoll();
   } catch (err) {
     if (statusEl) {
       statusEl.className = "upload-status error";
@@ -4065,6 +4040,8 @@ function paintDetail() {
     await resumeInferenceUploadJob();
     const uploadBtn = document.getElementById("inferenceUploadBtn");
     if (uploadBtn) uploadBtn.onclick = () => startInferenceUpload();
+    const refreshBtn = document.getElementById("inferenceRefreshBtn");
+    if (refreshBtn) refreshBtn.onclick = () => refreshInferenceUploadJob();
     document.querySelectorAll('input[name="inferSource"]').forEach(radio => {
       radio.onchange = () => {
         if (radio.checked) {

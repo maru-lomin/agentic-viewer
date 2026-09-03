@@ -56,20 +56,22 @@ def invoke_inference(
     hooks: str = "agentic_config",
     timeout: float = 7200,
     request_id: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Call POST /inference with a base64-encoded PDF (same as client.py --upload)."""
     req_id = request_id or f"agentic-{uuid.uuid4()}"
-    payload = json.dumps(
-        {
-            "x_request_id": req_id,
-            "protocol": "grpc",
-            "hooks": hooks,
-            "rotation_90n": False,
-            "rotation_fine": False,
-            "file_path": filename,
-            "file": base64.b64encode(file_bytes).decode("utf-8"),
-        }
-    ).encode("utf-8")
+    payload_obj: Dict[str, Any] = {
+        "x_request_id": req_id,
+        "protocol": "grpc",
+        "hooks": hooks,
+        "rotation_90n": False,
+        "rotation_fine": False,
+        "file_path": filename,
+        "file": base64.b64encode(file_bytes).decode("utf-8"),
+    }
+    if extra:
+        payload_obj.update({k: v for k, v in extra.items() if v is not None and v != ""})
+    payload = json.dumps(payload_obj).encode("utf-8")
     req = urllib.request.Request(
         f"{api_url.rstrip('/')}/inference",
         data=payload,
