@@ -134,14 +134,10 @@ def _compute_run_eval(run_id: str, *, refresh: bool = False) -> Dict[str, Any]:
     pred_path = root / "04_result.json"
     if not _read_json(pred_path):
         raise HTTPException(status_code=404, detail="04_result.json not found")
-
-    ans_path = answer_sheet_path()
-    if not ans_path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=f"answer sheet not found: {ans_path}",
-        )
-    raise HTTPException(status_code=400, detail="could not score run against answer sheet")
+    raise HTTPException(
+        status_code=400,
+        detail="could not build eval report (missing document name or predictions)",
+    )
 
 
 @app.get("/api/runs")
@@ -2755,7 +2751,7 @@ function renderGtModal() {
   return `
     <div class="gt-modal-backdrop" id="gtModalBackdrop">
       <div class="gt-modal" role="dialog" aria-labelledby="gtModalTitle">
-        <h3 id="gtModalTitle">Edit ground truth</h3>
+        <h3 id="gtModalTitle">${edit.isNew ? "Add ground truth" : "Edit ground truth"}</h3>
         <div class="sub">${esc(edit.document)} · ${esc(edit.key)}</div>
         <label for="gtModalValue">Value</label>
         <input id="gtModalValue" value="${esc(edit.value || "")}" ${saving ? "disabled" : ""} />
@@ -2778,19 +2774,23 @@ function renderGtModal() {
 }
 
 async function openGtEditor(key, opts = {}) {
-  const document = state.evalReport?.document;
+  const document = state.evalReport?.document || runDocument(state.runId);
   if (!document) {
     alert("Document name is not available for this run.");
     return;
   }
+  const predRows = state.info?.result?.kv_results || [];
+  const predRow = predRows.find(row => row && row.key === key);
+  const predValue = predRow && predRow.value != null ? String(predRow.value) : "";
   state.gtEdit = {
     document,
     key,
-    value: "",
+    value: predValue,
     evidencesText: "",
     pagesText: "",
     loading: true,
     saving: false,
+    isNew: false,
     message: null,
     messageKind: null,
     highlightInvalid: Boolean(opts.highlightInvalid),
@@ -2799,18 +2799,30 @@ async function openGtEditor(key, opts = {}) {
   try {
     const data = await api(`/api/ground-truth/document?document=${encodeURIComponent(document)}`);
     const entry = (data.keys || []).find(row => row.key === key);
-    if (!entry) throw new Error(`GT key not found: ${key}`);
-    state.gtEdit = {
-      ...state.gtEdit,
-      loading: false,
-      value: entry.value || "",
-      evidencesText: (entry.evidences || []).join("\n"),
-      pagesText: (entry.evidence_pages || []).join(", "),
-    };
+    if (entry) {
+      state.gtEdit = {
+        ...state.gtEdit,
+        loading: false,
+        value: entry.value || "",
+        evidencesText: (entry.evidences || []).join("\n"),
+        pagesText: (entry.evidence_pages || []).join(", "),
+      };
+    } else {
+      state.gtEdit = {
+        ...state.gtEdit,
+        loading: false,
+        isNew: true,
+        message: data.exists === false
+          ? "Document not in answer sheet yet — save to create GT."
+          : "No GT for this key yet — save to create.",
+        messageKind: "warn",
+      };
+    }
   } catch (err) {
     state.gtEdit = {
       ...state.gtEdit,
       loading: false,
+      isNew: true,
       message: String(err.message || err),
       messageKind: "err",
     };
@@ -2892,16 +2904,17 @@ function renderEval() {
   if (!report) {
     return `<div class="empty">No eval report yet.</div>`;
   }
+  const hasGt = report.has_gt !== false;
   const o = report.overall || {};
   const cards = [
-    ["Value EM", o.value_exact_match, `${report.n_keys ?? "—"} keys`],
-    ["Page F1 (macro)", o.page_f1_macro, `P ${fmtPct(o.page_precision_macro)} / R ${fmtPct(o.page_recall_macro)}`],
-    ["Page F1 (micro)", o.page_f1_micro, `P ${fmtPct(o.page_precision_micro)} / R ${fmtPct(o.page_recall_micro)}`],
-    ["Evidence token F1", o.evidence_token_f1, report.document || ""],
+    ["Value EM", hasGt ? o.value_exact_match : null, `${report.n_keys ?? "—"} keys`],
+    ["Page F1 (macro)", hasGt ? o.page_f1_macro : null, hasGt ? `P ${fmtPct(o.page_precision_macro)} / R ${fmtPct(o.page_recall_macro)}` : "no GT"],
+    ["Page F1 (micro)", hasGt ? o.page_f1_micro : null, hasGt ? `P ${fmtPct(o.page_precision_micro)} / R ${fmtPct(o.page_recall_micro)}` : "no GT"],
+    ["Evidence token F1", hasGt ? o.evidence_token_f1 : null, report.document || ""],
   ].map(([label, val, sub]) => `
     <div class="score-card">
       <div class="label">${esc(label)}</div>
-      <div class="value">${fmtPct(val)}</div>
+      <div class="value">${hasGt && val != null ? fmtPct(val) : "—"}</div>
       <div class="sub">${esc(sub)}</div>
     </div>`).join("");
 
@@ -2931,9 +2944,9 @@ function renderEval() {
     const batchActiveForKey = batchActive && batch && batch.active
       && batch.active.some(x => x.key === row.key);
     const goldVerdictForBtn = String((ae && ae.is_valid_gold) || "").toLowerCase();
-    const gtEditCls = goldVerdictForBtn === "invalid" ? " warn" : "";
+    const gtEditCls = goldVerdictForBtn === "invalid" ? " warn" : (hasGt ? "" : " warn");
     const gtEditBtn = `<button type="button" class="gt-edit-btn${gtEditCls}" data-gt-edit="${esc(row.key)}">
-      Edit GT</button>`;
+      ${hasGt ? "Edit GT" : "Add GT"}</button>`;
     let agenticCell;
     if (ae && ae.status === "done" && (ae.is_correct_answer || ae.is_valid_gold || ae.reason_summary || ae.reason || ae.text)) {
       const verdict = String(ae.is_correct_answer || "").toLowerCase();
@@ -2966,12 +2979,12 @@ function renderEval() {
     }
     return `<tr>
       <td class="key">${esc(row.key)}</td>
-      <td class="${em ? "em-y" : "em-n"}">${em ? "Y" : "N"}</td>
-      <td>${fmtPct(sp.f1)}<div class="sub">pred [${esc((sp.pred||[]).join(", "))}] · gold [${esc((sp.gold||[]).join(", "))}]</div></td>
-      <td>${fmtPct(et.token_f1)}</td>
+      <td class="${hasGt ? (em ? "em-y" : "em-n") : ""}">${hasGt ? (em ? "Y" : "N") : "—"}</td>
+      <td>${hasGt ? fmtPct(sp.f1) : "—"}<div class="sub">pred [${esc((sp.pred||[]).join(", "))}]${hasGt ? ` · gold [${esc((sp.gold||[]).join(", "))}]` : ""}</div></td>
+      <td>${hasGt ? fmtPct(et.token_f1) : "—"}</td>
       <td>
         <div><b>pred</b> ${esc(row.value?.pred ?? "")}</div>
-        <div><b>gold</b> ${esc(row.value?.gold ?? "")}</div>
+        <div><b>gold</b> ${hasGt ? esc(row.value?.gold ?? "") : `<span style="color:var(--muted)">(none)</span>`}</div>
         <details${evalDetailAttrs("evidence", row.key)}>
           <summary>VLM evidence · Search reasons</summary>
           <div class="ev-block">
@@ -3020,13 +3033,21 @@ function renderEval() {
 
   const allKeysDisabled = batchActive;
 
+  const noGtBanner = !hasGt
+    ? `<div class="hint" style="border:1px solid var(--warn);border-radius:8px;padding:10px 12px;background:#2a2218;margin-bottom:12px">
+        No ground truth in <code>answer_sheet.json</code> for <b>${esc(report.document)}</b>.
+        Predictions are shown below. Use <b>Add GT</b> to create gold entries.
+      </div>`
+    : "";
+
   return `
+    ${noGtBanner}
     <p class="hint">
       Baseline metrics vs <code>dataset/answer_sheet.json</code>.
       Cached as <code>05_eval.json</code> in the run directory.
       Evid F1 uses <b>VLM evidence_quote</b> only; SearchAgent <b>page_reasons</b> are shown separately.
       Agentic-evaluation runs up to 8 keys in parallel via the inference API and saves under <code>06_agentic_eval/</code>.
-      Use <b>Edit GT</b> when agentic eval marks gold as invalid.
+      Use <b>${hasGt ? "Edit GT" : "Add GT"}</b> when agentic eval marks gold as invalid or GT is missing.
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
       <button type="button" class="agentic-eval-btn" id="evalAllKeys"
         style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Evaluate all keys</button>

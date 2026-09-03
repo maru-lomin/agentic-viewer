@@ -58,6 +58,8 @@ class GroundTruthStoreTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(result["entry"]["value"], "new")
+                self.assertFalse(result["created_document"])
+                self.assertFalse(result["created_key"])
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(
                     saved["doc.pdf"]["Distance between GTG"]["value"],
@@ -66,6 +68,40 @@ class GroundTruthStoreTests(unittest.TestCase):
                 docs = list_documents()
                 self.assertEqual(docs[0]["document"], "doc.pdf")
                 self.assertEqual(docs[0]["n_keys"], 1)
+
+    def test_get_document_gt_missing_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "answer_sheet.json"
+            path.write_text(json.dumps({"existing.pdf": {}}), encoding="utf-8")
+            with mock.patch(
+                "agentic_viewer.ground_truth.store.answer_sheet_path",
+                return_value=path,
+            ):
+                data = get_document_gt("missing.pdf")
+                self.assertEqual(data["document"], "missing.pdf")
+                self.assertEqual(data["keys"], [])
+                self.assertFalse(data["exists"])
+
+    def test_update_gt_key_creates_document_and_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "answer_sheet.json"
+            path.write_text(json.dumps({}), encoding="utf-8")
+            with mock.patch(
+                "agentic_viewer.ground_truth.store.answer_sheet_path",
+                return_value=path,
+            ):
+                result = update_gt_key(
+                    "new.pdf",
+                    "Some key",
+                    {"value": "42", "evidences": ["line"], "evidence_pages": [3]},
+                )
+                self.assertTrue(result["created_document"])
+                self.assertTrue(result["created_key"])
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["new.pdf"]["Some key"]["value"], "42")
+                data = get_document_gt("new.pdf")
+                self.assertTrue(data["exists"])
+                self.assertEqual(data["keys"][0]["key"], "Some key")
 
 
 if __name__ == "__main__":

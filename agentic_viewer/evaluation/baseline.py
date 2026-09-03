@@ -6,8 +6,14 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from agentic_viewer.eval.evaluate_kv import build_report, load_json
+from agentic_viewer.eval.evaluate_kv import (
+    build_pred_only_report,
+    build_report,
+    infer_document_name_from_pred,
+    load_json,
+)
 from agentic_viewer.eval.paths import answer_sheet_path
+from agentic_viewer.pdf_source import infer_run_document
 
 
 def _read_json(path: Path) -> Any:
@@ -48,6 +54,15 @@ def load_or_compute_run_eval(
             and cached.get("overall")
             and eval_cache_has_reason_split(cached)
         ):
+            if cached.get("has_gt") is False:
+                fresh = load_or_compute_run_eval(
+                    run_dir,
+                    run_id=run_id,
+                    refresh=True,
+                    write_cache=write_cache,
+                )
+                if isinstance(fresh, dict) and fresh.get("has_gt") is not False:
+                    return fresh
             return cached
 
     pred_path = run_dir / "04_result.json"
@@ -56,21 +71,36 @@ def load_or_compute_run_eval(
         return None
 
     ans_path = answer_sheet_path()
-    if not ans_path.is_file():
-        return None
-    answer_sheet = load_json(ans_path)
-    if not isinstance(answer_sheet, dict):
-        return None
+    answer_sheet: Optional[Dict[str, Any]] = None
+    if ans_path.is_file():
+        loaded = load_json(ans_path)
+        if isinstance(loaded, dict):
+            answer_sheet = loaded
 
-    try:
-        report = build_report(
-            pred,
-            answer_sheet,
-            pred_path=str(pred_path),
-            answer_sheet_path=str(ans_path),
+    report: Optional[Dict[str, Any]] = None
+    if answer_sheet is not None:
+        try:
+            report = build_report(
+                pred,
+                answer_sheet,
+                pred_path=str(pred_path),
+                answer_sheet_path=str(ans_path),
+            )
+        except (KeyError, ValueError):
+            report = None
+
+    if report is None:
+        doc_name = infer_run_document(run_dir, result=pred) or infer_document_name_from_pred(
+            pred
         )
-    except (KeyError, ValueError):
-        return None
+        if not doc_name:
+            return None
+        report = build_pred_only_report(
+            pred,
+            doc_name,
+            pred_path=str(pred_path),
+            answer_sheet_path=str(ans_path) if ans_path.is_file() else None,
+        )
 
     if run_id:
         report["run_id"] = run_id

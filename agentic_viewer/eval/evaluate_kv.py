@@ -86,14 +86,8 @@ def _format_page_chunk_ids(chunk_ids: Any) -> str:
     return str(chunk_ids).strip()
 
 
-def resolve_document_name(
-    pred: Dict[str, Any],
-    answer_sheet: Dict[str, Any],
-    override: Optional[str] = None,
-) -> str:
-    if override:
-        return override
-
+def infer_document_name_from_pred(pred: Dict[str, Any]) -> Optional[str]:
+    """Best-effort document filename from prediction metadata (no answer sheet)."""
     meta = pred.get("meta") or {}
     candidates: List[str] = []
     for key in ("source_file", "file_name", "filename", "pdf_name"):
@@ -103,6 +97,21 @@ def resolve_document_name(
     pdf_path = meta.get("pdf_path") or meta.get("file_path")
     if pdf_path:
         candidates.append(Path(str(pdf_path)).name)
+    return candidates[0] if candidates else None
+
+
+def resolve_document_name(
+    pred: Dict[str, Any],
+    answer_sheet: Dict[str, Any],
+    override: Optional[str] = None,
+) -> str:
+    if override:
+        return override
+
+    candidates: List[str] = []
+    inferred = infer_document_name_from_pred(pred)
+    if inferred:
+        candidates.append(inferred)
 
     for name in candidates:
         if name in answer_sheet:
@@ -245,6 +254,29 @@ def evaluate_document(
     }
 
 
+def build_pred_only_report(
+    pred: Dict[str, Any],
+    document: str,
+    *,
+    pred_path: Optional[str] = None,
+    answer_sheet_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build an eval-shaped report from predictions when GT is missing."""
+    pred_rows = index_pred_by_key(pred.get("kv_results") or [])
+    empty_gold = {
+        k: {"value": "", "evidences": [], "evidence_pages": []}
+        for k in pred_rows
+    }
+    scored = evaluate_document(pred_rows, empty_gold)
+    return {
+        "document": document,
+        "has_gt": False,
+        "pred_path": pred_path,
+        "answer_sheet_path": answer_sheet_path,
+        **scored,
+    }
+
+
 def build_report(
     pred: Dict[str, Any],
     answer_sheet: Dict[str, Any],
@@ -262,6 +294,7 @@ def build_report(
     scored = evaluate_document(pred_rows, gold_doc)
     return {
         "document": doc_name,
+        "has_gt": True,
         "pred_path": pred_path,
         "answer_sheet_path": answer_sheet_path,
         **scored,

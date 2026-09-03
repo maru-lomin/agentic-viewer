@@ -89,14 +89,14 @@ def get_document_gt(document: str) -> Dict[str, Any]:
     sheet = load_answer_sheet()
     doc = sheet.get(doc_name)
     if not isinstance(doc, dict):
-        raise KeyError(f"document not found: {doc_name}")
+        return {"document": doc_name, "keys": [], "exists": False}
     keys: List[Dict[str, Any]] = []
     for key, entry in sorted(doc.items(), key=lambda kv: str(kv[0])):
         if not isinstance(entry, dict):
             continue
         normalized = normalize_gt_entry(entry)
         keys.append({"key": str(key), **normalized})
-    return {"document": doc_name, "keys": keys}
+    return {"document": doc_name, "keys": keys, "exists": True}
 
 
 def update_gt_key(document: str, key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -109,10 +109,10 @@ def update_gt_key(document: str, key: str, entry: Dict[str, Any]) -> Dict[str, A
 
     sheet = load_answer_sheet()
     doc = sheet.get(doc_name)
-    if not isinstance(doc, dict):
-        raise KeyError(f"document not found: {doc_name}")
-    if key_name not in doc:
-        raise KeyError(f"key not found: {key_name}")
+    created_document = not isinstance(doc, dict)
+    if created_document:
+        doc = {}
+    created_key = key_name not in doc
 
     normalized = normalize_gt_entry(entry)
     doc[key_name] = normalized
@@ -123,6 +123,8 @@ def update_gt_key(document: str, key: str, entry: Dict[str, Any]) -> Dict[str, A
         "key": key_name,
         "entry": normalized,
         "path": str(path),
+        "created_document": created_document,
+        "created_key": created_key,
     }
 
 
