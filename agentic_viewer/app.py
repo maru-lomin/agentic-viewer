@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from agentic_viewer.eval.paths import answer_sheet_path
@@ -32,6 +34,7 @@ from agentic_viewer.ground_truth import (
 )
 from agentic_viewer.ground_truth_page import GROUND_TRUTH_HTML
 from agentic_viewer.hierarchy import build_agent_tree
+from agentic_viewer.inference_jobs import make_inference_job_manager
 from agentic_viewer.highlights import chunk_highlights
 from agentic_viewer.image_tokens import replace_base64_images
 from agentic_viewer.pdf_source import infer_pdf_path, infer_run_document, pdf_info
@@ -69,6 +72,7 @@ _BATCH_MANAGER = make_batch_manager(
     INFERENCE_API_URL,
     _AGENTIC_EVAL_INFLIGHT,
 )
+_INFERENCE_JOB_MANAGER = make_inference_job_manager(INFERENCE_API_URL)
 
 app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0")
 
@@ -100,6 +104,35 @@ def _run_dir(run_id: str) -> Path:
     if not str(path).startswith(str(RUNS_ROOT)) or not path.is_dir():
         raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
     return path
+
+
+def _assert_run_deletable(run_id: str) -> None:
+    inflight = _AGENTIC_EVAL_INFLIGHT.get(run_id)
+    if inflight:
+        raise HTTPException(
+            status_code=409,
+            detail=f"agentic-evaluation is in progress for run {run_id}",
+        )
+
+    active_batch = _BATCH_MANAGER.get_active_job()
+    if (
+        active_batch
+        and active_batch.status in {"queued", "running"}
+        and run_id in active_batch.run_ids
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"batch job {active_batch.job_id} is using this run",
+        )
+
+    active_infer = _INFERENCE_JOB_MANAGER.get_active_job()
+    if active_infer and active_infer.status in {"queued", "running"}:
+        for task in active_infer.tasks:
+            if task.run_id == run_id and task.status in {"pending", "running"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="KV extraction is in progress for this run",
+                )
 
 
 def _read_json(path: Path) -> Any:
@@ -196,6 +229,16 @@ def get_run(run_id: str) -> Dict[str, Any]:
         "result": result,
         "error": _read_json(root / "04_error.json"),
     }
+
+
+@app.delete("/api/runs/{run_id}")
+def delete_run(run_id: str) -> Dict[str, Any]:
+    """Remove a run directory under outputs/runs/."""
+    root = _run_dir(run_id)
+    _assert_run_deletable(run_id)
+    shutil.rmtree(root)
+    _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
+    return {"ok": True, "run_id": run_id}
 
 
 @app.get("/api/runs/{run_id}/timeline")
@@ -422,6 +465,53 @@ def cancel_batch_job(job_id: str) -> Dict[str, Any]:
         return enrich_batch_job_dict(job.to_dict(), RUNS_ROOT)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/inference/jobs/active")
+def get_active_inference_job() -> Dict[str, Any]:
+    job = _INFERENCE_JOB_MANAGER.get_active_job()
+    return {"job": job.to_dict() if job else None}
+
+
+@app.get("/api/inference/jobs/{job_id}")
+def get_inference_job(job_id: str) -> Dict[str, Any]:
+    job = _INFERENCE_JOB_MANAGER.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+    return job.to_dict()
+
+
+@app.post("/api/inference/jobs")
+async def post_inference_job(
+    files: List[UploadFile] = File(...),
+    hooks: str = Form("agentic_config"),
+) -> Dict[str, Any]:
+    """
+    Upload one or more PDFs and run KV extraction via the inference API.
+
+    Mirrors inference-pipeline/client_dir.sh with base64 upload (--upload).
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="at least one PDF file is required")
+
+    payload: List[tuple[str, bytes]] = []
+    for upload in files:
+        name = (upload.filename or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="each file must have a filename")
+        data = await upload.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"empty file: {name}")
+        payload.append((name, data))
+
+    hooks_name = (hooks or "agentic_config").strip() or "agentic_config"
+    try:
+        job = _INFERENCE_JOB_MANAGER.start(payload, hooks=hooks_name)
+        return job.to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/runs/{run_id}/agentic-eval")
@@ -712,7 +802,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .run {
       padding: 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer;
+      position: relative;
     }
+    .run .run-head {
+      display: flex; gap: 8px; align-items: flex-start; justify-content: space-between;
+    }
+    .run .run-delete {
+      flex: 0 0 auto; background: transparent; border: 1px solid transparent;
+      color: var(--muted); border-radius: 6px; cursor: pointer; font-size: 14px;
+      line-height: 1; padding: 2px 6px;
+    }
+    .run .run-delete:hover:not(:disabled) {
+      color: var(--err); border-color: #7a3a3f; background: rgba(240, 113, 120, 0.08);
+    }
+    .run .run-delete:disabled { opacity: 0.35; cursor: not-allowed; }
     .run:hover, .run.active { background: var(--panel); }
     .run .id { font-size: 12px; word-break: break-all; }
     .run-label { display: flex; flex-direction: column; gap: 2px; }
@@ -1050,6 +1153,35 @@ INDEX_HTML = r"""<!DOCTYPE html>
     body.embed aside { display: none; }
     body.embed main { grid-template-columns: 1fr; min-height: 100vh; }
     body.embed section { padding: 12px 14px; }
+    .upload-panel {
+      padding: 12px 14px; border-bottom: 1px solid var(--line);
+      background: #121820; display: flex; flex-direction: column; gap: 8px;
+    }
+    .upload-panel h2 {
+      margin: 0; font-size: 12px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+    }
+    .upload-panel .hint { margin: 0; font-size: 11px; line-height: 1.4; }
+    .upload-panel input[type="file"] {
+      width: 100%; font-size: 12px; color: var(--muted);
+    }
+    .upload-panel .upload-actions {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    }
+    .upload-panel .upload-btn {
+      background: #152033; border: 1px solid var(--accent); color: var(--text);
+      padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px;
+    }
+    .upload-panel .upload-btn:disabled {
+      opacity: 0.5; cursor: not-allowed; border-color: var(--line);
+    }
+    .upload-status {
+      font-size: 11px; color: var(--muted); line-height: 1.45;
+      font-family: var(--mono); word-break: break-word;
+    }
+    .upload-status.running { color: #e0a45c; }
+    .upload-status.error { color: var(--err); }
+    .upload-status.done { color: var(--ok); }
   </style>
 </head>
 <body id="appBody">
@@ -1063,7 +1195,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="meta" id="headerMeta">Loading runs…</div>
   </header>
   <main>
-    <aside id="runList"></aside>
+    <aside>
+      <div class="upload-panel" id="uploadPanel">
+        <h2>KV extraction</h2>
+        <p class="hint">Upload PDF(s) to run agentic KV extraction (same as <code>client_dir.sh</code>).</p>
+        <input type="file" id="inferenceUploadInput" accept=".pdf,.PDF,application/pdf" multiple />
+        <div class="upload-actions">
+          <button type="button" class="upload-btn" id="inferenceUploadBtn">Run extraction</button>
+        </div>
+        <div class="upload-status" id="inferenceUploadStatus"></div>
+      </div>
+      <div id="runList"></div>
+    </aside>
     <section id="detail">
       <div class="empty" id="detailPlaceholder">Select a run</div>
     </section>
@@ -1078,6 +1221,7 @@ const state = {
   evalOpenDetails: new Set(),
   gtEdit: null,
   batchJob: null, batchPollTimer: null,
+  inferenceJob: null, inferencePollTimer: null,
   evalKey: null, embed: false,
   evalHierarchyKeys: [], evalHierarchyKeysLoading: false,
   loadedRunId: null,
@@ -1195,6 +1339,191 @@ function runLabelText(runOrId) {
   return `${doc} · ${r.run_id}`;
 }
 
+function isRunBusy(runId) {
+  const batch = state.batchJob;
+  if (batch && (batch.status === "queued" || batch.status === "running")
+      && (batch.run_ids || []).includes(runId)) {
+    return true;
+  }
+  const infer = state.inferenceJob;
+  if (infer && (infer.status === "queued" || infer.status === "running")) {
+    for (const task of infer.tasks || []) {
+      if (task.run_id === runId && (task.status === "pending" || task.status === "running")) {
+        return true;
+      }
+    }
+  }
+  if (state.runId === runId && (state.agenticEvalInflight || []).length) {
+    return true;
+  }
+  const run = runRecord(runId);
+  return run.status === "running";
+}
+
+async function apiDelete(path) {
+  const r = await fetch(path, { method: "DELETE" });
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+  if (!r.ok) throw new Error(data.detail || text || r.statusText);
+  return data;
+}
+
+async function deleteRun(runId, ev) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  if (!runId) return;
+  if (isRunBusy(runId)) {
+    alert("Cannot delete this run while extraction or evaluation is in progress.");
+    return;
+  }
+  const label = runLabelText(runId);
+  if (!confirm(`Delete this run permanently?\n\n${label}`)) return;
+  try {
+    await apiDelete(`/api/runs/${encodeURIComponent(runId)}`);
+    state.runs = state.runs.filter(r => r.run_id !== runId);
+    if (state.runId === runId) {
+      state.runId = null;
+      const next = state.runs[0];
+      if (next) {
+        await selectRun(next.run_id);
+      } else {
+        const detail = document.getElementById("detail");
+        if (detail) {
+          detail.innerHTML = '<div class="empty" id="detailPlaceholder">Select a run</div>';
+        }
+        renderRuns();
+      }
+      return;
+    }
+    renderRuns();
+  } catch (err) {
+    alert(String(err.message || err));
+  }
+}
+
+function renderUploadPanel() {
+  if (state.embed) return;
+  const statusEl = document.getElementById("inferenceUploadStatus");
+  const btn = document.getElementById("inferenceUploadBtn");
+  const input = document.getElementById("inferenceUploadInput");
+  const job = state.inferenceJob;
+  const active = job && (job.status === "queued" || job.status === "running");
+  if (btn) btn.disabled = active;
+  if (input) input.disabled = active;
+  if (!statusEl) return;
+  if (!job) {
+    statusEl.className = "upload-status";
+    statusEl.textContent = "";
+    return;
+  }
+  const pct = job.progress_pct ?? (job.total ? Math.round(100 * job.completed / job.total) : 0);
+  const cur = job.current ? ` · ${esc(job.current.filename)}` : "";
+  const failed = job.failed ? ` · failed ${job.failed}` : "";
+  statusEl.className = `upload-status ${job.status === "running" || job.status === "queued" ? "running" : (job.failed ? "error" : "done")}`;
+  statusEl.innerHTML = `
+    <div><b>${esc(job.status)}</b> ${job.completed}/${job.total} (${pct}%)${cur}${failed}</div>
+    ${(job.tasks || []).map(t => `<div>${esc(t.filename)}: ${esc(t.status)}${t.run_id ? ` → ${esc(t.run_id)}` : ""}${t.error ? ` (${esc(t.error)})` : ""}</div>`).join("")}
+    ${job.message ? `<div>${esc(job.message)}</div>` : ""}`;
+}
+
+function stopInferencePoll() {
+  if (state.inferencePollTimer) {
+    clearInterval(state.inferencePollTimer);
+    state.inferencePollTimer = null;
+  }
+}
+
+function startInferencePoll() {
+  stopInferencePoll();
+  state.inferencePollTimer = setInterval(() => refreshInferenceUploadJob(), 3000);
+}
+
+async function refreshInferenceUploadJob() {
+  if (!state.inferenceJob?.job_id) return;
+  try {
+    state.inferenceJob = await api(`/api/inference/jobs/${encodeURIComponent(state.inferenceJob.job_id)}`);
+    renderUploadPanel();
+    state.runs = await api("/api/runs");
+    renderRuns();
+    if (state.inferenceJob.status === "running" || state.inferenceJob.status === "queued") {
+      const top = state.runs[0];
+      const runIds = state.inferenceJob.run_ids || [];
+      if (top && top.run_id !== state.runId && (top.status === "running" || runIds.includes(top.run_id))) {
+        await selectRun(top.run_id, { keepTab: true });
+      } else if (state.runId) {
+        await renderDetail({ force: true });
+      }
+      return;
+    }
+    stopInferencePoll();
+    const lastRunId = (state.inferenceJob.run_ids || []).slice(-1)[0];
+    if (lastRunId) {
+      await selectRun(lastRunId, { keepTab: true });
+    }
+  } catch (err) {
+    const statusEl = document.getElementById("inferenceUploadStatus");
+    if (statusEl) {
+      statusEl.className = "upload-status error";
+      statusEl.textContent = String(err.message || err);
+    }
+  }
+}
+
+async function resumeInferenceUploadJob() {
+  try {
+    const data = await api("/api/inference/jobs/active");
+    if (data.job) {
+      state.inferenceJob = data.job;
+      renderUploadPanel();
+      if (data.job.status === "queued" || data.job.status === "running") {
+        startInferencePoll();
+      }
+    }
+  } catch (_) { /* ignore */ }
+}
+
+async function startInferenceUpload() {
+  const input = document.getElementById("inferenceUploadInput");
+  const statusEl = document.getElementById("inferenceUploadStatus");
+  if (!input || !input.files || !input.files.length) {
+    if (statusEl) {
+      statusEl.className = "upload-status error";
+      statusEl.textContent = "Select one or more PDF files.";
+    }
+    return;
+  }
+  if (state.inferenceJob && (state.inferenceJob.status === "queued" || state.inferenceJob.status === "running")) {
+    return;
+  }
+  const form = new FormData();
+  for (const file of input.files) {
+    form.append("files", file, file.name);
+  }
+  if (statusEl) {
+    statusEl.className = "upload-status running";
+    statusEl.textContent = "Uploading…";
+  }
+  try {
+    const r = await fetch("/api/inference/jobs", { method: "POST", body: form });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+    if (!r.ok) throw new Error(data.detail || text || r.statusText);
+    state.inferenceJob = data;
+    renderUploadPanel();
+    startInferencePoll();
+    input.value = "";
+  } catch (err) {
+    if (statusEl) {
+      statusEl.className = "upload-status error";
+      statusEl.textContent = String(err.message || err);
+    }
+  }
+}
+
 function renderRuns() {
   if (state.embed) return;
   const el = document.getElementById("runList");
@@ -1207,9 +1536,14 @@ function renderRuns() {
     const agenticLine = ae && ae.n_total
       ? `<div class="eval-mini">agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · pred acc ${fmtPct(ae.accuracy)}` : ""}${ae.gold_validity != null ? ` · GT valid ${fmtPct(ae.gold_validity)}` : ""}</div>`
       : "";
+    const busy = isRunBusy(r.run_id);
     return `
     <div class="run ${r.run_id === state.runId ? "active" : ""}" data-id="${esc(r.run_id)}">
-      <div class="id">${runLabelHtml(r)}</div>
+      <div class="run-head">
+        <div class="id">${runLabelHtml(r)}</div>
+        <button type="button" class="run-delete" data-delete-run="${esc(r.run_id)}"
+          title="Delete run" aria-label="Delete run" ${busy ? "disabled" : ""}>×</button>
+      </div>
       <div class="sub">
         <span class="badge ${r.status === "ok" ? "ok" : (r.status === "error" ? "error" : (r.status === "running" ? "warn" : ""))}">${esc(r.status)}</span>
         ${r.seconds != null ? r.seconds + "s" : ""} · kv=${r.n_kv ?? "?"} · pages=${r.page_count ?? "?"}
@@ -1221,8 +1555,12 @@ function renderRuns() {
   el.querySelectorAll(".run").forEach(node => {
     node.onclick = () => selectRun(node.dataset.id);
   });
+  el.querySelectorAll("[data-delete-run]").forEach(btn => {
+    btn.onclick = (ev) => deleteRun(btn.dataset.deleteRun, ev);
+  });
   document.getElementById("headerMeta").textContent =
     `${state.runs.length} run(s) · ${location.origin}`;
+  renderUploadPanel();
 }
 
 async function selectRun(runId, opts = {}) {
@@ -3257,6 +3595,8 @@ function paintDetail() {
       · status=${esc(state.info?.meta?.status || (state.info?.meta?.finished_at ? "done" : "running"))}
       · ${esc(state.info?.meta?.seconds)}s
       <button type="button" id="runRefresh" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--text);font-size:12px;cursor:pointer">Refresh</button>
+      <button type="button" id="runDelete" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid #7a3a3f;background:#2a1518;color:var(--err);font-size:12px;cursor:pointer"
+        ${isRunBusy(state.runId) ? "disabled" : ""}>Delete run</button>
     </div>`}
     ${tabsHtml()}
     ${body}${renderGtModal()}`;
@@ -3289,6 +3629,8 @@ function paintDetail() {
   }
   const runRefresh = document.getElementById("runRefresh");
   if (runRefresh) runRefresh.onclick = () => renderDetail({ force: true });
+  const runDelete = document.getElementById("runDelete");
+  if (runDelete) runDelete.onclick = () => deleteRun(state.runId);
   const refreshBtn = document.getElementById("evalRefresh");
   if (refreshBtn) refreshBtn.onclick = () => ensureEval(true);
   if (state.tab === "eval" && !state.evalReport && !state.evalLoading && !state.evalError) {
@@ -3425,7 +3767,12 @@ function paintDetail() {
   }
 
   state.runs = await api("/api/runs");
-  if (!state.embed) renderRuns();
+  if (!state.embed) {
+    renderRuns();
+    await resumeInferenceUploadJob();
+    const uploadBtn = document.getElementById("inferenceUploadBtn");
+    if (uploadBtn) uploadBtn.onclick = () => startInferenceUpload();
+  }
   if (runParam && (state.embed || state.runs.some(r => r.run_id === runParam))) {
     await selectRun(runParam, { keepTab: true, keepEvalKey: true });
   } else if (!state.embed && state.runs[0]) {

@@ -1,0 +1,82 @@
+"""Tests for inference upload job manager."""
+
+from __future__ import annotations
+
+import unittest
+from unittest.mock import patch
+
+from agentic_viewer.inference_jobs import InferenceJobManager
+
+
+class InferenceJobManagerTests(unittest.TestCase):
+    def test_rejects_non_pdf(self) -> None:
+        mgr = InferenceJobManager("http://127.0.0.1:8010")
+        with self.assertRaises(ValueError):
+            mgr.start([("notes.txt", b"hello")])
+
+    def test_rejects_empty_file_list(self) -> None:
+        mgr = InferenceJobManager("http://127.0.0.1:8010")
+        with self.assertRaises(ValueError):
+            mgr.start([])
+
+    @patch("agentic_viewer.inference_jobs.wait_for_inference_api")
+    @patch("agentic_viewer.inference_jobs.invoke_inference")
+    def test_runs_files_sequentially(self, mock_invoke, mock_wait) -> None:
+        mock_invoke.side_effect = [
+            {"kv_results": [{"key": "a"}], "meta": {"run_id": "run-1", "seconds": 1.2}},
+            {"kv_results": [], "meta": {"run_id": "run-2", "seconds": 2.1}},
+        ]
+        mgr = InferenceJobManager("http://127.0.0.1:8010")
+        job = mgr.start(
+            [
+                ("one.pdf", b"%PDF-1"),
+                ("two.pdf", b"%PDF-2"),
+            ]
+        )
+        job_id = job.job_id
+
+        import time
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            job = mgr.get_job(job_id)
+            assert job is not None
+            if job.status in {"done", "partial", "error"}:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("job did not finish")
+
+        self.assertEqual(job.status, "done")
+        self.assertEqual(job.tasks[0].status, "done")
+        self.assertEqual(job.tasks[0].run_id, "run-1")
+        self.assertEqual(job.tasks[1].run_id, "run-2")
+        self.assertEqual(mock_invoke.call_count, 2)
+        mock_wait.assert_called_once()
+
+    @patch("agentic_viewer.inference_jobs.wait_for_inference_api")
+    def test_marks_all_tasks_error_when_api_unavailable(self, mock_wait) -> None:
+        from agentic_viewer.inference_client import InferenceError
+
+        mock_wait.side_effect = InferenceError("down", status_code=502)
+        mgr = InferenceJobManager("http://127.0.0.1:8010")
+        job = mgr.start([("doc.pdf", b"%PDF")])
+
+        import time
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            job = mgr.get_job(job.job_id)
+            assert job is not None
+            if job.status == "error":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("job did not fail")
+
+        self.assertEqual(job.tasks[0].status, "error")
+        self.assertIn("down", job.tasks[0].error or "")
+
+
+if __name__ == "__main__":
+    unittest.main()
