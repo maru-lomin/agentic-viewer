@@ -55,6 +55,53 @@ class InferenceJobManagerTests(unittest.TestCase):
         mock_wait.assert_called_once()
 
     @patch("agentic_viewer.inference_jobs.wait_for_inference_api")
+    @patch("agentic_viewer.inference_jobs.invoke_inference")
+    def test_runs_from_paths_and_annotates_dataset(self, mock_invoke, mock_wait) -> None:
+        import json
+        import tempfile
+        import time
+        from pathlib import Path
+
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            root = Path(tmp.name)
+            pdf = root / "doc.pdf"
+            pdf.write_bytes(b"%PDF-1")
+            runs_root = root / "runs"
+            runs_root.mkdir()
+
+            def fake_invoke(*_args, **kwargs):
+                run_id = "run-ds-1"
+                dest = runs_root / run_id
+                dest.mkdir()
+                (dest / "meta.json").write_text("{}", encoding="utf-8")
+                return {"kv_results": [], "meta": {"run_id": run_id, "seconds": 0.5}}
+
+            mock_invoke.side_effect = fake_invoke
+            mgr = InferenceJobManager("http://127.0.0.1:8010", runs_root=runs_root)
+            job = mgr.start(
+                paths=[pdf],
+                dataset_id="evaluation-v2",
+                dataset_name="evaluation-v2",
+                dataset_source="folder",
+            )
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                job = mgr.get_job(job.job_id)
+                assert job is not None
+                if job.status in {"done", "partial", "error"}:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("job did not finish")
+            self.assertEqual(job.status, "done")
+            meta = json.loads((runs_root / "run-ds-1" / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["dataset_id"], "evaluation-v2")
+            self.assertEqual(meta["source_filename"], "doc.pdf")
+        finally:
+            tmp.cleanup()
+
+    @patch("agentic_viewer.inference_jobs.wait_for_inference_api")
     def test_marks_all_tasks_error_when_api_unavailable(self, mock_wait) -> None:
         from agentic_viewer.inference_client import InferenceError
 

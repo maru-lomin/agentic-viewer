@@ -1,11 +1,13 @@
-"""Background KV extraction jobs triggered from uploaded PDFs."""
+"""Background KV extraction jobs triggered from uploaded PDFs or datasets."""
 
 from __future__ import annotations
 
+import json
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agentic_viewer.inference_client import InferenceError, invoke_inference, wait_for_inference_api
@@ -15,9 +17,34 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def annotate_run_meta(
+    runs_root: Optional[Path],
+    run_id: Optional[str],
+    extra: Dict[str, Any],
+) -> None:
+    """Merge viewer-owned fields into a run's meta.json after inference returns."""
+    if not runs_root or not run_id or not extra:
+        return
+    path = Path(runs_root) / run_id / "meta.json"
+    if not path.is_file():
+        return
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    meta.update({k: v for k, v in extra.items() if v is not None})
+    path.write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 @dataclass
 class InferenceTask:
     filename: str
+    path: Optional[str] = None
     status: str = "pending"
     run_id: Optional[str] = None
     error: Optional[str] = None
@@ -45,6 +72,9 @@ class InferenceJob:
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     message: Optional[str] = None
+    dataset_id: Optional[str] = None
+    dataset_name: Optional[str] = None
+    dataset_source: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         total = len(self.tasks)
@@ -71,14 +101,23 @@ class InferenceJob:
             "finished_at": self.finished_at,
             "message": self.message,
             "progress_pct": progress_pct,
+            "dataset_id": self.dataset_id,
+            "dataset_name": self.dataset_name,
+            "dataset_source": self.dataset_source,
         }
 
 
 class InferenceJobManager:
-    def __init__(self, inference_api_url: str) -> None:
+    def __init__(
+        self,
+        inference_api_url: str,
+        *,
+        runs_root: Optional[Path] = None,
+    ) -> None:
         self.inference_api_url = inference_api_url
+        self.runs_root = Path(runs_root).resolve() if runs_root else None
         self._jobs: Dict[str, InferenceJob] = {}
-        self._file_bytes: Dict[str, List[bytes]] = {}
+        self._file_bytes: Dict[str, List[Optional[bytes]]] = {}
         self._lock = threading.Lock()
         self._active_job_id: Optional[str] = None
 
@@ -94,15 +133,36 @@ class InferenceJobManager:
 
     def start(
         self,
-        files: Sequence[Tuple[str, bytes]],
+        files: Sequence[Tuple[str, bytes]] = (),
         *,
+        paths: Sequence[Path] = (),
         hooks: str = "agentic_config",
+        dataset_id: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        dataset_source: Optional[str] = None,
     ) -> InferenceJob:
-        if not files:
-            raise ValueError("at least one PDF file is required")
-        for name, _ in files:
+        tasks: List[InferenceTask] = []
+        bytes_list: List[Optional[bytes]] = []
+
+        for name, data in files:
             if not str(name).lower().endswith(".pdf"):
                 raise ValueError(f"only PDF files are supported: {name}")
+            if not data:
+                raise ValueError(f"empty file: {name}")
+            tasks.append(InferenceTask(filename=Path(name).name))
+            bytes_list.append(data)
+
+        for path in paths:
+            path = Path(path)
+            if not path.is_file():
+                raise ValueError(f"file not found: {path}")
+            if path.suffix.lower() != ".pdf":
+                raise ValueError(f"only PDF files are supported: {path.name}")
+            tasks.append(InferenceTask(filename=path.name, path=str(path)))
+            bytes_list.append(None)
+
+        if not tasks:
+            raise ValueError("at least one PDF file is required")
 
         with self._lock:
             if self._active_job_id:
@@ -116,11 +176,14 @@ class InferenceJobManager:
         job = InferenceJob(
             job_id=job_id,
             hooks=hooks,
-            tasks=[InferenceTask(filename=name) for name, _ in files],
+            tasks=tasks,
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+            dataset_source=dataset_source,
         )
         with self._lock:
             self._jobs[job_id] = job
-            self._file_bytes[job_id] = [data for _, data in files]
+            self._file_bytes[job_id] = bytes_list
             self._active_job_id = job_id
 
         thread = threading.Thread(
@@ -131,6 +194,14 @@ class InferenceJobManager:
         )
         thread.start()
         return job
+
+    def _run_meta(self, job: InferenceJob, task: InferenceTask) -> Dict[str, Any]:
+        extra: Dict[str, Any] = {"source_filename": task.filename}
+        if job.dataset_id:
+            extra["dataset_id"] = job.dataset_id
+            extra["dataset_name"] = job.dataset_name or job.dataset_id
+            extra["dataset_source"] = job.dataset_source
+        return extra
 
     def _run_job(self, job_id: str) -> None:
         job = self._jobs[job_id]
@@ -151,12 +222,16 @@ class InferenceJobManager:
             self._cleanup_job_files(job_id)
             return
 
-        for index, (task, file_bytes) in enumerate(zip(job.tasks, file_bytes_list)):
+        for index, task in enumerate(job.tasks):
             job.current_index = index
             task.status = "running"
             request_id = f"agentic-{uuid.uuid4()}"
             task.run_id = request_id
             try:
+                if task.path:
+                    file_bytes = Path(task.path).read_bytes()
+                else:
+                    file_bytes = file_bytes_list[index] or b""
                 result = invoke_inference(
                     self.inference_api_url,
                     filename=task.filename,
@@ -179,6 +254,7 @@ class InferenceJobManager:
             except Exception as exc:  # noqa: BLE001
                 task.status = "error"
                 task.error = str(exc)
+            annotate_run_meta(self.runs_root, task.run_id, self._run_meta(job, task))
 
         job.current_index = len(job.tasks)
         failed = sum(1 for t in job.tasks if t.status == "error")
@@ -195,5 +271,9 @@ class InferenceJobManager:
             self._file_bytes.pop(job_id, None)
 
 
-def make_inference_job_manager(inference_api_url: str) -> InferenceJobManager:
-    return InferenceJobManager(inference_api_url)
+def make_inference_job_manager(
+    inference_api_url: str,
+    *,
+    runs_root: Optional[Path] = None,
+) -> InferenceJobManager:
+    return InferenceJobManager(inference_api_url, runs_root=runs_root)

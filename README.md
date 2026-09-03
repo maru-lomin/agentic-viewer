@@ -22,6 +22,16 @@ If `AGENTIC_RUNS_DIR` is unset, defaults to shared `../outputs/runs`
 - **Pages** — parsed page markdown
 - **Eval** — value Exact Match, search page P/R/F1, evidence token F1 vs `dataset/answer_sheet.json` (cached as `05_eval.json` when the runs dir is writable)
 
+## Datasets
+
+Define named PDF groups on `/datasets`, then run them from Inference (one run per file).
+
+- **Folder datasets** — directories with PDFs under `../dataset/` (for example `evaluation-v2`). Read-only in the UI; same files `client_dir.sh` uses.
+- **Managed datasets** — created in the UI, stored under `../outputs/datasets/<id>/`.
+- **Upload on Inference** — ad-hoc file uploads are saved as a new managed dataset (UUID name) so runs stay grouped for evaluation.
+
+Runs are grouped by dataset in the Inference sidebar.
+
 ## CLI evaluation
 
 ```bash
@@ -35,6 +45,7 @@ If `AGENTIC_RUNS_DIR` is unset, defaults to shared `../outputs/runs`
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `AGENTIC_RUNS_DIR` | `../outputs/runs` | runs root |
+| `AGENTIC_DATASETS_DIR` | `../outputs/datasets` | managed dataset PDFs |
 | `AGENTIC_ANSWER_SHEET` | `../dataset/answer_sheet.json` | gold labels for Eval |
 | `TRACE_VIEWER_HOST` | `0.0.0.0` | bind host |
 | `TRACE_VIEWER_PORT` | `8099` | bind port |

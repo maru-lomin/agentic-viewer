@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import FastAPI, HTTPException, Body, File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from agentic_viewer.datasets import DatasetStore
+from agentic_viewer.datasets_page import DATASETS_HTML
 from agentic_viewer.eval.paths import answer_sheet_path
 from agentic_viewer.evaluation.agentic_client import AgenticEvalError, invoke_agentic_eval
 from agentic_viewer.evaluation.batch import enrich_batch_job_dict, make_batch_manager
@@ -72,7 +74,10 @@ _BATCH_MANAGER = make_batch_manager(
     INFERENCE_API_URL,
     _AGENTIC_EVAL_INFLIGHT,
 )
-_INFERENCE_JOB_MANAGER = make_inference_job_manager(INFERENCE_API_URL)
+_INFERENCE_JOB_MANAGER = make_inference_job_manager(
+    INFERENCE_API_URL, runs_root=RUNS_ROOT
+)
+_DATASET_STORE = DatasetStore()
 
 app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0")
 
@@ -206,6 +211,10 @@ def list_runs() -> List[Dict[str, Any]]:
                 "seconds": meta.get("seconds"),
                 "n_kv": len(result.get("kv_results") or []),
                 "page_count": (result.get("meta") or {}).get("page_count"),
+                "dataset_id": meta.get("dataset_id"),
+                "dataset_name": meta.get("dataset_name"),
+                "dataset_source": meta.get("dataset_source"),
+                "source_filename": meta.get("source_filename"),
                 "eval_summary": _eval_summary(eval_report),
                 "agentic_eval_summary": agentic_eval_summary(
                     agentic_by_key, gold_keys
@@ -405,6 +414,90 @@ def put_ground_truth_key(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     return {**result, "invalidated_eval_caches": invalidated}
 
 
+def _raise_dataset_error(exc: Exception) -> None:
+    if isinstance(exc, FileNotFoundError):
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(exc, FileExistsError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, PermissionError):
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise exc
+
+
+async def _read_pdf_uploads(files: List[UploadFile]) -> List[tuple[str, bytes]]:
+    payload: List[tuple[str, bytes]] = []
+    for upload in files:
+        name = (upload.filename or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="each file must have a filename")
+        data = await upload.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"empty file: {name}")
+        payload.append((name, data))
+    return payload
+
+
+@app.get("/api/datasets")
+def list_datasets() -> Dict[str, Any]:
+    return {"datasets": _DATASET_STORE.list_datasets()}
+
+
+@app.post("/api/datasets")
+async def create_dataset(
+    name: str = Form(...),
+    files: List[UploadFile] = File(default=[]),
+) -> Dict[str, Any]:
+    payload = await _read_pdf_uploads(files) if files else []
+    try:
+        return _DATASET_STORE.create(name, payload)
+    except Exception as exc:
+        _raise_dataset_error(exc)
+        raise
+
+
+@app.get("/api/datasets/{source}/{dataset_id}")
+def get_dataset(source: str, dataset_id: str) -> Dict[str, Any]:
+    try:
+        return _DATASET_STORE.get(source, dataset_id)
+    except Exception as exc:
+        _raise_dataset_error(exc)
+        raise
+
+
+@app.post("/api/datasets/{source}/{dataset_id}/files")
+async def add_dataset_files(
+    source: str,
+    dataset_id: str,
+    files: List[UploadFile] = File(...),
+) -> Dict[str, Any]:
+    payload = await _read_pdf_uploads(files)
+    try:
+        return _DATASET_STORE.add_files(source, dataset_id, payload)
+    except Exception as exc:
+        _raise_dataset_error(exc)
+        raise
+
+
+@app.delete("/api/datasets/{source}/{dataset_id}/files/{filename}")
+def delete_dataset_file(source: str, dataset_id: str, filename: str) -> Dict[str, Any]:
+    try:
+        return _DATASET_STORE.delete_file(source, dataset_id, filename)
+    except Exception as exc:
+        _raise_dataset_error(exc)
+        raise
+
+
+@app.delete("/api/datasets/{source}/{dataset_id}")
+def delete_dataset(source: str, dataset_id: str) -> Dict[str, Any]:
+    try:
+        return _DATASET_STORE.delete_dataset(source, dataset_id)
+    except Exception as exc:
+        _raise_dataset_error(exc)
+        raise
+
+
 @app.get("/api/evaluation/summary")
 def get_evaluation_summary(run_ids: str = "") -> Dict[str, Any]:
     """Aggregate cached baseline + agentic eval across multiple runs."""
@@ -505,8 +598,54 @@ async def post_inference_job(
         payload.append((name, data))
 
     hooks_name = (hooks or "agentic_config").strip() or "agentic_config"
+    upload_dataset_id = str(uuid.uuid4())
     try:
-        job = _INFERENCE_JOB_MANAGER.start(payload, hooks=hooks_name)
+        _DATASET_STORE.create(upload_dataset_id, payload)
+        paths = _DATASET_STORE.pdf_paths("managed", upload_dataset_id)
+        job = _INFERENCE_JOB_MANAGER.start(
+            paths=paths,
+            hooks=hooks_name,
+            dataset_id=upload_dataset_id,
+            dataset_name=upload_dataset_id,
+            dataset_source="managed",
+        )
+        result = job.to_dict()
+        result["dataset_id"] = upload_dataset_id
+        result["dataset_source"] = "managed"
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        _raise_dataset_error(exc)
+        raise
+
+
+@app.post("/api/inference/jobs/from-dataset")
+def post_inference_job_from_dataset(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Run KV extraction for every PDF in a named dataset."""
+    dataset_id = str((body or {}).get("dataset_id") or "").strip()
+    source = str((body or {}).get("source") or "").strip()
+    if not dataset_id or not source:
+        raise HTTPException(status_code=400, detail="dataset_id and source are required")
+    try:
+        info = _DATASET_STORE.get(source, dataset_id)
+        paths = _DATASET_STORE.pdf_paths(source, dataset_id)
+    except Exception as exc:
+        _raise_dataset_error(exc)
+        raise
+    if not paths:
+        raise HTTPException(status_code=400, detail="dataset has no PDF files")
+    hooks_name = str((body or {}).get("hooks") or "agentic_config").strip() or "agentic_config"
+    try:
+        job = _INFERENCE_JOB_MANAGER.start(
+            paths=paths,
+            hooks=hooks_name,
+            dataset_id=info["id"],
+            dataset_name=info.get("name") or info["id"],
+            dataset_source=info["source"],
+        )
         return job.to_dict()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1175,6 +1314,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .upload-panel .upload-btn:disabled {
       opacity: 0.5; cursor: not-allowed; border-color: var(--line);
     }
+    .upload-panel select {
+      width: 100%; padding: 6px 8px; border-radius: 6px;
+      border: 1px solid var(--line); background: #0f1419; color: var(--text);
+      font: inherit; font-size: 12px;
+    }
+    .upload-source {
+      display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted);
+    }
+    .upload-source label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+    .dataset-group { border-bottom: 1px solid var(--line); }
+    .dataset-group > summary {
+      cursor: pointer; list-style: none; padding: 10px 14px;
+      display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+      background: #151c26; color: var(--text); font-size: 12px; font-weight: 600;
+    }
+    .dataset-group > summary::-webkit-details-marker { display: none; }
+    .dataset-group > summary .count { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; }
+    .dataset-group .run { padding-left: 18px; }
     .upload-status {
       font-size: 11px; color: var(--muted); line-height: 1.45;
       font-family: var(--mono); word-break: break-word;
@@ -1189,6 +1346,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <h1>Agentic Viewer</h1>
     <nav class="topnav">
       <a href="/" class="active">Inference</a>
+      <a href="/datasets">Datasets</a>
       <a href="/evaluation">Evaluation</a>
       <a href="/ground-truth">Ground Truth</a>
     </nav>
@@ -1198,8 +1356,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <aside>
       <div class="upload-panel" id="uploadPanel">
         <h2>KV extraction</h2>
-        <p class="hint">Upload PDF(s) to run agentic KV extraction (same as <code>client_dir.sh</code>).</p>
+        <p class="hint">Upload PDFs (saved as a new UUID dataset) or run an existing dataset from the <a href="/datasets">Datasets</a> page.</p>
+        <div class="upload-source">
+          <label><input type="radio" name="inferSource" value="files" checked /> Upload files</label>
+          <label><input type="radio" name="inferSource" value="dataset" /> Dataset</label>
+        </div>
         <input type="file" id="inferenceUploadInput" accept=".pdf,.PDF,application/pdf" multiple />
+        <select id="inferenceDatasetSelect" hidden>
+          <option value="">Select a dataset…</option>
+        </select>
         <div class="upload-actions">
           <button type="button" class="upload-btn" id="inferenceUploadBtn">Run extraction</button>
         </div>
@@ -1222,6 +1387,7 @@ const state = {
   gtEdit: null,
   batchJob: null, batchPollTimer: null,
   inferenceJob: null, inferencePollTimer: null,
+  datasets: [], inferSource: "files", inferDataset: "", collapsedGroups: new Set(),
   evalKey: null, embed: false,
   evalHierarchyKeys: [], evalHierarchyKeysLoading: false,
   loadedRunId: null,
@@ -1409,10 +1575,36 @@ function renderUploadPanel() {
   const statusEl = document.getElementById("inferenceUploadStatus");
   const btn = document.getElementById("inferenceUploadBtn");
   const input = document.getElementById("inferenceUploadInput");
+  const select = document.getElementById("inferenceDatasetSelect");
   const job = state.inferenceJob;
   const active = job && (job.status === "queued" || job.status === "running");
+  const useDataset = state.inferSource === "dataset";
   if (btn) btn.disabled = active;
-  if (input) input.disabled = active;
+  if (input) {
+    input.disabled = active;
+    input.hidden = useDataset;
+  }
+  if (select) {
+    select.hidden = !useDataset;
+    select.disabled = active;
+    const current = state.inferDataset || select.value;
+    const opts = [`<option value="">Select a dataset…</option>`].concat(
+      (state.datasets || []).map(d => {
+        const value = `${d.source}/${d.id}`;
+        return `<option value="${esc(value)}">${esc(d.name || d.id)} (${d.n_files || 0} PDF${d.source === "folder" ? ", folder" : ""})</option>`;
+      })
+    );
+    select.innerHTML = opts.join("");
+    if (current && [...select.options].some(o => o.value === current)) {
+      select.value = current;
+      state.inferDataset = current;
+    }
+    select.onchange = () => { state.inferDataset = select.value; };
+  }
+  document.querySelectorAll('input[name="inferSource"]').forEach(radio => {
+    radio.disabled = active;
+    radio.checked = radio.value === state.inferSource;
+  });
   if (!statusEl) return;
   if (!job) {
     statusEl.className = "upload-status";
@@ -1422,9 +1614,10 @@ function renderUploadPanel() {
   const pct = job.progress_pct ?? (job.total ? Math.round(100 * job.completed / job.total) : 0);
   const cur = job.current ? ` · ${esc(job.current.filename)}` : "";
   const failed = job.failed ? ` · failed ${job.failed}` : "";
+  const ds = job.dataset_name ? ` · ${esc(job.dataset_name)}` : "";
   statusEl.className = `upload-status ${job.status === "running" || job.status === "queued" ? "running" : (job.failed ? "error" : "done")}`;
   statusEl.innerHTML = `
-    <div><b>${esc(job.status)}</b> ${job.completed}/${job.total} (${pct}%)${cur}${failed}</div>
+    <div><b>${esc(job.status)}</b> ${job.completed}/${job.total} (${pct}%)${ds}${cur}${failed}</div>
     ${(job.tasks || []).map(t => `<div>${esc(t.filename)}: ${esc(t.status)}${t.run_id ? ` → ${esc(t.run_id)}` : ""}${t.error ? ` (${esc(t.error)})` : ""}</div>`).join("")}
     ${job.message ? `<div>${esc(job.message)}</div>` : ""}`;
 }
@@ -1439,6 +1632,15 @@ function stopInferencePoll() {
 function startInferencePoll() {
   stopInferencePoll();
   state.inferencePollTimer = setInterval(() => refreshInferenceUploadJob(), 3000);
+}
+
+async function refreshDatasets() {
+  try {
+    const ds = await api("/api/datasets");
+    state.datasets = ds.datasets || [];
+  } catch (_) {
+    state.datasets = [];
+  }
 }
 
 async function refreshInferenceUploadJob() {
@@ -1459,6 +1661,7 @@ async function refreshInferenceUploadJob() {
       return;
     }
     stopInferencePoll();
+    await refreshDatasets();
     const lastRunId = (state.inferenceJob.run_ids || []).slice(-1)[0];
     if (lastRunId) {
       await selectRun(lastRunId, { keepTab: true });
@@ -1486,36 +1689,62 @@ async function resumeInferenceUploadJob() {
 }
 
 async function startInferenceUpload() {
-  const input = document.getElementById("inferenceUploadInput");
   const statusEl = document.getElementById("inferenceUploadStatus");
-  if (!input || !input.files || !input.files.length) {
-    if (statusEl) {
-      statusEl.className = "upload-status error";
-      statusEl.textContent = "Select one or more PDF files.";
-    }
-    return;
-  }
   if (state.inferenceJob && (state.inferenceJob.status === "queued" || state.inferenceJob.status === "running")) {
     return;
   }
-  const form = new FormData();
-  for (const file of input.files) {
-    form.append("files", file, file.name);
+  let start;
+  if (state.inferSource === "dataset") {
+    const select = document.getElementById("inferenceDatasetSelect");
+    const value = select && select.value;
+    if (!value || !value.includes("/")) {
+      if (statusEl) {
+        statusEl.className = "upload-status error";
+        statusEl.textContent = "Select a dataset.";
+      }
+      return;
+    }
+    const slash = value.indexOf("/");
+    const source = value.slice(0, slash);
+    const datasetId = value.slice(slash + 1);
+    start = () => apiPost("/api/inference/jobs/from-dataset", {
+      source,
+      dataset_id: datasetId,
+    });
+  } else {
+    const input = document.getElementById("inferenceUploadInput");
+    if (!input || !input.files || !input.files.length) {
+      if (statusEl) {
+        statusEl.className = "upload-status error";
+        statusEl.textContent = "Select one or more PDF files.";
+      }
+      return;
+    }
+    const form = new FormData();
+    for (const file of input.files) {
+      form.append("files", file, file.name);
+    }
+    start = async () => {
+      const r = await fetch("/api/inference/jobs", { method: "POST", body: form });
+      const text = await r.text();
+      let data;
+      try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+      if (!r.ok) throw new Error(data.detail || text || r.statusText);
+      input.value = "";
+      return data;
+    };
   }
   if (statusEl) {
     statusEl.className = "upload-status running";
-    statusEl.textContent = "Uploading…";
+    statusEl.textContent = "Starting…";
   }
   try {
-    const r = await fetch("/api/inference/jobs", { method: "POST", body: form });
-    const text = await r.text();
-    let data;
-    try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
-    if (!r.ok) throw new Error(data.detail || text || r.statusText);
-    state.inferenceJob = data;
+    state.inferenceJob = await start();
+    if (state.inferSource === "files" && state.inferenceJob.dataset_id) {
+      await refreshDatasets();
+    }
     renderUploadPanel();
     startInferencePoll();
-    input.value = "";
   } catch (err) {
     if (statusEl) {
       statusEl.className = "upload-status error";
@@ -1524,20 +1753,17 @@ async function startInferenceUpload() {
   }
 }
 
-function renderRuns() {
-  if (state.embed) return;
-  const el = document.getElementById("runList");
-  el.innerHTML = state.runs.map(r => {
-    const es = r.eval_summary;
-    const evalLine = es
-      ? `<div class="eval-mini">EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)} · evidF1 ${fmtPct(es.evidence_token_f1)}</div>`
-      : "";
-    const ae = r.agentic_eval_summary;
-    const agenticLine = ae && ae.n_total
-      ? `<div class="eval-mini">agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · pred acc ${fmtPct(ae.accuracy)}` : ""}${ae.gold_validity != null ? ` · GT valid ${fmtPct(ae.gold_validity)}` : ""}</div>`
-      : "";
-    const busy = isRunBusy(r.run_id);
-    return `
+function runItemHtml(r) {
+  const es = r.eval_summary;
+  const evalLine = es
+    ? `<div class="eval-mini">EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)} · evidF1 ${fmtPct(es.evidence_token_f1)}</div>`
+    : "";
+  const ae = r.agentic_eval_summary;
+  const agenticLine = ae && ae.n_total
+    ? `<div class="eval-mini">agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · pred acc ${fmtPct(ae.accuracy)}` : ""}${ae.gold_validity != null ? ` · GT valid ${fmtPct(ae.gold_validity)}` : ""}</div>`
+    : "";
+  const busy = isRunBusy(r.run_id);
+  return `
     <div class="run ${r.run_id === state.runId ? "active" : ""}" data-id="${esc(r.run_id)}">
       <div class="run-head">
         <div class="id">${runLabelHtml(r)}</div>
@@ -1551,13 +1777,70 @@ function renderRuns() {
       ${evalLine}
       ${agenticLine}
     </div>`;
-  }).join("") || `<div class="empty" style="padding:16px">No runs in outputs/runs</div>`;
+}
+
+function groupRuns(runs) {
+  const groups = [];
+  const index = new Map();
+  for (const r of runs) {
+    const grouped = Boolean(r.dataset_id);
+    const key = grouped ? `${r.dataset_source || "managed"}/${r.dataset_id}` : "ungrouped";
+    if (!index.has(key)) {
+      index.set(key, groups.length);
+      groups.push({
+        key,
+        name: grouped ? (r.dataset_name || r.dataset_id) : "Ungrouped",
+        runs: [],
+        latest: 0,
+      });
+    }
+    const g = groups[index.get(key)];
+    g.runs.push(r);
+    const ts = Date.parse(r.started_at || "") || 0;
+    if (ts > g.latest) g.latest = ts;
+  }
+  groups.sort((a, b) => b.latest - a.latest);
+  for (const g of groups) {
+    g.runs.sort((a, b) => (Date.parse(b.started_at || "") || 0) - (Date.parse(a.started_at || "") || 0));
+  }
+  return groups;
+}
+
+function bindRunList(el) {
   el.querySelectorAll(".run").forEach(node => {
     node.onclick = () => selectRun(node.dataset.id);
   });
   el.querySelectorAll("[data-delete-run]").forEach(btn => {
     btn.onclick = (ev) => deleteRun(btn.dataset.deleteRun, ev);
   });
+  el.querySelectorAll(".dataset-group").forEach(node => {
+    node.addEventListener("toggle", () => {
+      if (node.open) state.collapsedGroups.delete(node.dataset.group);
+      else state.collapsedGroups.add(node.dataset.group);
+    });
+  });
+}
+
+function renderRuns() {
+  if (state.embed) return;
+  const el = document.getElementById("runList");
+  if (!state.runs.length) {
+    el.innerHTML = `<div class="empty" style="padding:16px">No runs in outputs/runs</div>`;
+  } else {
+    el.innerHTML = groupRuns(state.runs).map(g => {
+      const open = !state.collapsedGroups.has(g.key);
+      const nOk = g.runs.filter(r => r.status === "ok").length;
+      return `
+        <details class="dataset-group" data-group="${esc(g.key)}" ${open ? "open" : ""}>
+          <summary>
+            ${esc(g.name)}
+            <span class="count">${nOk}/${g.runs.length}</span>
+          </summary>
+          ${g.runs.map(runItemHtml).join("")}
+        </details>`;
+    }).join("");
+    bindRunList(el);
+  }
   document.getElementById("headerMeta").textContent =
     `${state.runs.length} run(s) · ${location.origin}`;
   renderUploadPanel();
@@ -3768,10 +4051,28 @@ function paintDetail() {
 
   state.runs = await api("/api/runs");
   if (!state.embed) {
+    await refreshDatasets();
+    const dsId = params.get("dataset");
+    const dsSource = params.get("source");
+    if (dsId) {
+      state.inferSource = "dataset";
+      const source = dsSource
+        || (state.datasets.find(d => d.id === dsId) || {}).source
+        || "folder";
+      state.inferDataset = `${source}/${dsId}`;
+    }
     renderRuns();
     await resumeInferenceUploadJob();
     const uploadBtn = document.getElementById("inferenceUploadBtn");
     if (uploadBtn) uploadBtn.onclick = () => startInferenceUpload();
+    document.querySelectorAll('input[name="inferSource"]').forEach(radio => {
+      radio.onchange = () => {
+        if (radio.checked) {
+          state.inferSource = radio.value;
+          renderUploadPanel();
+        }
+      };
+    });
   }
   if (runParam && (state.embed || state.runs.some(r => r.run_id === runParam))) {
     await selectRun(runParam, { keepTab: true, keepEvalKey: true });
@@ -3795,6 +4096,11 @@ def evaluation_page() -> str:
     return EVALUATION_HTML
 
 
+@app.get("/datasets", response_class=HTMLResponse)
+def datasets_page() -> str:
+    return DATASETS_HTML
+
+
 @app.get("/ground-truth", response_class=HTMLResponse)
 def ground_truth_page() -> str:
     return GROUND_TRUTH_HTML
@@ -3805,7 +4111,7 @@ def main() -> None:
 
     host = os.environ.get("TRACE_VIEWER_HOST", "0.0.0.0")
     port = int(os.environ.get("TRACE_VIEWER_PORT", "8099"))
-    print(f"Trace viewer on http://{host}:{port}  runs_root={RUNS_ROOT}")
+    print(f"Trace viewer on http://{host}:{port}  runs_root={RUNS_ROOT}  datasets={_DATASET_STORE.managed_root}")
     uvicorn.run(
         "agentic_viewer.app:app",
         host=host,

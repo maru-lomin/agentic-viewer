@@ -198,6 +198,7 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     <h1>Agentic Viewer</h1>
     <nav class="topnav">
       <a href="/">Inference</a>
+      <a href="/datasets">Datasets</a>
       <a href="/evaluation" class="active">Evaluation</a>
       <a href="/ground-truth">Ground Truth</a>
     </nav>

@@ -96,6 +96,7 @@ GROUND_TRUTH_HTML = r"""<!DOCTYPE html>
     <h1>Agentic Viewer</h1>
     <nav class="topnav">
       <a href="/">Inference</a>
+      <a href="/datasets">Datasets</a>
       <a href="/evaluation">Evaluation</a>
       <a href="/ground-truth" class="active">Ground Truth</a>
     </nav>
