@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import queue
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -164,6 +166,8 @@ class BatchJobManager:
             1, int(max_parallel_evals or default_max_parallel_evals())
         )
         self._jobs: Dict[str, BatchJob] = {}
+        self._queues: Dict[str, queue.Queue] = {}
+        self._sealed: Dict[str, bool] = {}
         self._lock = threading.Lock()
         self._active_job_id: Optional[str] = None
 
@@ -198,6 +202,7 @@ class BatchJobManager:
         run_ids: Sequence[str],
         *,
         skip_existing: bool = True,
+        sealed: bool = True,
     ) -> BatchJob:
         ids = [str(x).strip() for x in run_ids if str(x).strip()]
         if not ids:
@@ -211,31 +216,82 @@ class BatchJobManager:
             ids, self.runs_root, skip_existing=skip_existing
         )
 
+        job_id = str(uuid.uuid4())
         job = BatchJob(
-            job_id=str(uuid.uuid4()),
+            job_id=job_id,
             run_ids=ids,
             skip_existing=skip_existing,
             total=len(tasks),
             skipped=skipped,
-            status="queued" if tasks else "done",
-            message="no pending keys" if not tasks else None,
-            finished_at=_utc_now() if not tasks else None,
+            status="queued" if (tasks or not sealed) else "done",
+            message="no pending keys" if (not tasks and sealed) else None,
+            finished_at=_utc_now() if (not tasks and sealed) else None,
         )
+
+        q: queue.Queue[Tuple[str, str]] = queue.Queue()
+        for t in tasks:
+            q.put(t)
 
         with self._lock:
             self._jobs[job.job_id] = job
-            if tasks:
+            self._queues[job.job_id] = q
+            self._sealed[job.job_id] = sealed
+            if tasks or not sealed:
                 self._active_job_id = job.job_id
 
-        if tasks:
+        if tasks or not sealed:
             thread = threading.Thread(
                 target=self._run_job,
-                args=(job.job_id, tasks),
+                args=(job.job_id,),
                 daemon=True,
                 name=f"agentic-batch-{job.job_id[:8]}",
             )
             thread.start()
         return job
+
+    def enqueue_run(
+        self,
+        run_id: str,
+        *,
+        skip_existing: bool = True,
+    ) -> BatchJob:
+        run_id = str(run_id).strip()
+        if not run_id:
+            raise ValueError("run_id is required")
+
+        with self._lock:
+            active_id = self._active_job_id
+            active = self._jobs.get(active_id) if active_id else None
+            is_active = active and active.status in {"queued", "running"}
+
+        if not is_active or active_id is None:
+            return self.start([run_id], skip_existing=skip_existing, sealed=False)
+
+        with self._lock:
+            job = self._jobs[active_id]
+            if run_id in job.run_ids:
+                return job
+
+        tasks, skipped = plan_batch_tasks(
+            [run_id], self.runs_root, skip_existing=skip_existing
+        )
+
+        with self._lock:
+            job = self._jobs[active_id]
+            if run_id not in job.run_ids:
+                job.run_ids.append(run_id)
+            job.total += len(tasks)
+            job.skipped += skipped
+            q = self._queues.get(active_id)
+            if q is not None:
+                for t in tasks:
+                    q.put(t)
+        return job
+
+    def seal_job(self, job_id: str) -> None:
+        with self._lock:
+            if job_id in self._sealed:
+                self._sealed[job_id] = True
 
     def cancel(self, job_id: str) -> BatchJob:
         with self._lock:
@@ -246,6 +302,15 @@ class BatchJobManager:
                 return job
             job.cancel_requested = True
             job.message = "cancel requested"
+            self._sealed[job_id] = True
+            q = self._queues.get(job_id)
+            if q is not None:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                        q.task_done()
+                    except Exception:
+                        break
             run_ids = list(job.run_ids)
         for run_id in run_ids:
             cancel_agentic_eval_safe(self.inference_api_url, run_id)
@@ -306,45 +371,58 @@ class BatchJobManager:
             self._untrack_inflight(run_id, key)
             self._set_active_task(job_id, run_id=run_id, key=key, add=False)
 
-    def _run_job(self, job_id: str, tasks: List[Tuple[str, str]]) -> None:
+    def _run_job(self, job_id: str) -> None:
         with self._lock:
-            job = self._jobs[job_id]
+            job = self._jobs.get(job_id)
+            if not job:
+                return
             job.status = "running"
             job.started_at = _utc_now()
+            q = self._queues.get(job_id)
 
-        try:
-            workers = min(self.max_parallel_evals, max(1, len(tasks)))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(self._eval_one, job_id, run_id, key): (run_id, key)
-                    for run_id, key in tasks
-                }
-                for fut in as_completed(futures):
-                    with self._lock:
-                        job = self._jobs[job_id]
-                        if job.cancel_requested:
-                            for pending in futures:
-                                pending.cancel()
-                            job.status = "cancelled"
-                            job.message = "cancelled by user"
-                            job.current_run_id = None
-                            job.current_key = None
-                            job.active = []
-                            job.finished_at = _utc_now()
-                            return
+        if q is None:
+            return
 
-                    run_id, key = futures[fut]
-                    try:
-                        ok, payload = fut.result()
-                    except Exception as exc:
-                        ok, payload = False, {"error": str(exc)}
+        def _worker() -> None:
+            idle_since = None
+            while True:
+                with self._lock:
+                    j = self._jobs.get(job_id)
+                    if j is None or j.cancel_requested:
+                        break
+                    sealed = self._sealed.get(job_id, True)
 
-                    with self._lock:
-                        job = self._jobs[job_id]
-                        job.completed += 1
+                try:
+                    task = q.get(timeout=0.5)
+                    idle_since = None
+                except queue.Empty:
+                    if sealed:
+                        break
+                    now = time.time()
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since > 30.0:
+                        with self._lock:
+                            if q.empty() and not j.active:
+                                self._sealed[job_id] = True
+                                break
+                    continue
+
+                run_id, key = task
+                try:
+                    ok, payload = self._eval_one(job_id, run_id, key)
+                except Exception as exc:
+                    ok, payload = False, {"error": str(exc)}
+                finally:
+                    q.task_done()
+
+                with self._lock:
+                    j = self._jobs.get(job_id)
+                    if j:
+                        j.completed += 1
                         if not ok:
-                            job.failed += 1
-                            job.errors.append(
+                            j.failed += 1
+                            j.errors.append(
                                 {
                                     "run_id": run_id,
                                     "key": key,
@@ -352,24 +430,32 @@ class BatchJobManager:
                                 }
                             )
 
+        try:
+            workers = self.max_parallel_evals
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                worker_futs = [pool.submit(_worker) for _ in range(workers)]
+                for fut in as_completed(worker_futs):
+                    fut.result()
+
             with self._lock:
                 job = self._jobs[job_id]
-                if job.cancel_requested:
-                    job.status = "cancelled"
-                    job.message = "cancelled by user"
-                else:
-                    job.status = "done"
-                    job.message = (
-                        f"finished: {job.completed - job.failed} ok, "
-                        f"{job.failed} failed, {job.skipped} skipped"
-                    )
-                job.finished_at = _utc_now()
-                job.current_run_id = None
-                job.current_key = None
-                job.active = []
+                if job:
+                    if job.cancel_requested:
+                        job.status = "cancelled"
+                        job.message = "cancelled by user"
+                    else:
+                        job.status = "done"
+                        job.message = (
+                            f"finished: {job.completed - job.failed} ok, "
+                            f"{job.failed} failed, {job.skipped} skipped"
+                        )
+                    job.finished_at = _utc_now()
+                    job.current_run_id = None
+                    job.current_key = None
+                    job.active = []
         except Exception as exc:
             with self._lock:
-                job = self._jobs.get(job_id)
+                job = self._jobs[job_id]
                 if job:
                     job.status = "error"
                     job.message = str(exc)
@@ -379,9 +465,10 @@ class BatchJobManager:
                     job.active = []
         finally:
             with self._lock:
+                self._queues.pop(job_id, None)
+                self._sealed.pop(job_id, None)
                 if self._active_job_id == job_id:
                     self._active_job_id = None
-
 
 def make_batch_manager(
     runs_root: Path,

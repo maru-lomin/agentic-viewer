@@ -56,6 +56,7 @@ class InferenceTask:
     error: Optional[str] = None
     n_kv: Optional[int] = None
     seconds: Optional[float] = None
+    eval_status: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +66,7 @@ class InferenceTask:
             "error": self.error,
             "n_kv": self.n_kv,
             "seconds": self.seconds,
+            "eval_status": self.eval_status,
         }
 
 
@@ -83,6 +85,8 @@ class InferenceJob:
     dataset_source: Optional[str] = None
     run_group_id: Optional[str] = None
     run_group_name: Optional[str] = None
+    auto_eval: bool = True
+    eval_job_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         total = len(self.tasks)
@@ -114,6 +118,8 @@ class InferenceJob:
             "dataset_source": self.dataset_source,
             "run_group_id": self.run_group_id,
             "run_group_name": self.run_group_name,
+            "auto_eval": self.auto_eval,
+            "eval_job_id": self.eval_job_id,
         }
 
 
@@ -123,9 +129,11 @@ class InferenceJobManager:
         inference_api_url: str,
         *,
         runs_root: Optional[Path] = None,
+        batch_manager: Optional[Any] = None,
     ) -> None:
         self.inference_api_url = inference_api_url
         self.runs_root = Path(runs_root).resolve() if runs_root else None
+        self.batch_manager = batch_manager
         self._jobs: Dict[str, InferenceJob] = {}
         self._file_bytes: Dict[str, List[Optional[bytes]]] = {}
         self._lock = threading.Lock()
@@ -133,13 +141,36 @@ class InferenceJobManager:
 
     def get_job(self, job_id: str) -> Optional[InferenceJob]:
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+        if job:
+            self._refresh_eval_statuses(job)
+        return job
 
     def get_active_job(self) -> Optional[InferenceJob]:
         with self._lock:
-            if self._active_job_id:
-                return self._jobs.get(self._active_job_id)
-            return None
+            job = self._jobs.get(self._active_job_id) if self._active_job_id else None
+        if job:
+            self._refresh_eval_statuses(job)
+        return job
+
+    def _refresh_eval_statuses(self, job: Optional[InferenceJob]) -> None:
+        if not job:
+            return
+        for task in job.tasks:
+            if not task.run_id or task.eval_status != "evaluating":
+                continue
+            if self.batch_manager:
+                inflight = self.batch_manager.inflight_tracker.get(task.run_id)
+                if not inflight:
+                    eval_dir = (
+                        (self.runs_root / task.run_id / "06_agentic_eval")
+                        if self.runs_root
+                        else None
+                    )
+                    if eval_dir and eval_dir.is_dir():
+                        results = list(eval_dir.glob("*.result.json"))
+                        if results:
+                            task.eval_status = f"done ({len(results)} keys)"
 
     def start(
         self,
@@ -152,6 +183,7 @@ class InferenceJobManager:
         dataset_source: Optional[str] = None,
         run_group_id: Optional[str] = None,
         run_group_name: Optional[str] = None,
+        auto_eval: bool = True,
     ) -> InferenceJob:
         tasks: List[InferenceTask] = []
         bytes_list: List[Optional[bytes]] = []
@@ -194,6 +226,7 @@ class InferenceJobManager:
             dataset_source=dataset_source,
             run_group_id=run_group_id,
             run_group_name=run_group_name,
+            auto_eval=auto_eval,
         )
         with self._lock:
             self._jobs[job_id] = job
@@ -269,6 +302,14 @@ class InferenceJobManager:
                 task.n_kv = len((result or {}).get("kv_results") or [])
                 task.seconds = (meta or {}).get("seconds")
                 task.status = "done"
+                if job.auto_eval and self.batch_manager and task.run_id:
+                    task.eval_status = "evaluating"
+                    try:
+                        eval_job = self.batch_manager.enqueue_run(task.run_id)
+                        if eval_job:
+                            job.eval_job_id = eval_job.job_id
+                    except Exception as eval_err:
+                        task.eval_status = f"eval_error: {eval_err}"
             except InferenceError as exc:
                 task.status = "error"
                 task.error = str(exc)
@@ -281,6 +322,11 @@ class InferenceJobManager:
         failed = sum(1 for t in job.tasks if t.status == "error")
         job.status = "error" if failed == len(job.tasks) else ("partial" if failed else "done")
         job.finished_at = _utc_now()
+        if job.auto_eval and self.batch_manager and job.eval_job_id:
+            try:
+                self.batch_manager.seal_job(job.eval_job_id)
+            except Exception:
+                pass
         self._cleanup_job_files(job_id)
 
         with self._lock:
@@ -296,5 +342,8 @@ def make_inference_job_manager(
     inference_api_url: str,
     *,
     runs_root: Optional[Path] = None,
+    batch_manager: Optional[Any] = None,
 ) -> InferenceJobManager:
-    return InferenceJobManager(inference_api_url, runs_root=runs_root)
+    return InferenceJobManager(
+        inference_api_url, runs_root=runs_root, batch_manager=batch_manager
+    )

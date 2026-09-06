@@ -78,7 +78,9 @@ _BATCH_MANAGER = make_batch_manager(
     _AGENTIC_EVAL_INFLIGHT,
 )
 _INFERENCE_JOB_MANAGER = make_inference_job_manager(
-    INFERENCE_API_URL, runs_root=RUNS_ROOT
+    INFERENCE_API_URL,
+    runs_root=RUNS_ROOT,
+    batch_manager=_BATCH_MANAGER,
 )
 _DATASET_STORE = DatasetStore()
 
@@ -729,6 +731,7 @@ def get_inference_job(job_id: str) -> Dict[str, Any]:
 async def post_inference_job(
     files: List[UploadFile] = File(...),
     hooks: str = Form("agentic_config"),
+    auto_eval: str = Form("true"),
 ) -> Dict[str, Any]:
     """
     Upload one or more PDFs and run KV extraction via the inference API.
@@ -749,6 +752,7 @@ async def post_inference_job(
         payload.append((name, data))
 
     hooks_name = (hooks or "agentic_config").strip() or "agentic_config"
+    auto_eval_bool = str(auto_eval).strip().lower() in {"true", "1", "yes"}
     now = datetime.now()
     display_time = now.strftime("%Y-%m-%d %H:%M")
     ts_slug = now.strftime("%Y%m%d-%H%M%S")
@@ -765,6 +769,7 @@ async def post_inference_job(
             dataset_source="managed",
             run_group_id=upload_dataset_id,
             run_group_name=upload_dataset_name,
+            auto_eval=auto_eval_bool,
         )
         result = job.to_dict()
         result["dataset_id"] = upload_dataset_id
@@ -795,6 +800,7 @@ def post_inference_job_from_dataset(body: Dict[str, Any] = Body(...)) -> Dict[st
     if not paths:
         raise HTTPException(status_code=400, detail="dataset has no PDF files")
     hooks_name = str((body or {}).get("hooks") or "agentic_config").strip() or "agentic_config"
+    auto_eval = bool((body or {}).get("auto_eval", True))
     next_v = _next_dataset_run_version(info["id"])
     now = datetime.now()
     display_time = now.strftime("%Y-%m-%d %H:%M")
@@ -811,6 +817,7 @@ def post_inference_job_from_dataset(body: Dict[str, Any] = Body(...)) -> Dict[st
             dataset_source=info["source"],
             run_group_id=run_group_id,
             run_group_name=run_group_name,
+            auto_eval=auto_eval,
         )
         return job.to_dict()
     except ValueError as exc:
@@ -1532,6 +1539,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <select id="inferenceDatasetSelect" hidden>
           <option value="">Select a dataset…</option>
         </select>
+        <div style="margin: 6px 0 4px 0;">
+          <label style="font-size: 11px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; color: var(--text);">
+            <input type="checkbox" id="inferenceAutoEval" checked />
+            Auto-evaluate via <code>-eval</code> model (asynchronous)
+          </label>
+        </div>
         <div class="upload-actions">
           <button type="button" class="upload-btn" id="inferenceUploadBtn">Run extraction</button>
           <button type="button" class="upload-btn" id="inferenceRefreshBtn">Refresh</button>
@@ -1773,6 +1786,8 @@ function renderUploadPanel() {
     radio.disabled = active;
     radio.checked = radio.value === state.inferSource;
   });
+  const autoEvalCheckbox = document.getElementById("inferenceAutoEval");
+  if (autoEvalCheckbox) autoEvalCheckbox.disabled = active;
   if (!statusEl) return;
   if (!job) {
     statusEl.className = "upload-status";
@@ -1783,10 +1798,14 @@ function renderUploadPanel() {
   const cur = job.current ? ` · ${esc(job.current.filename)}` : "";
   const failed = job.failed ? ` · failed ${job.failed}` : "";
   const ds = (job.run_group_name || job.dataset_name) ? ` · ${esc(job.run_group_name || job.dataset_name)}` : "";
+  const autoEvalTag = job.auto_eval ? ` · <span style="color:var(--accent,#4daafc)">auto-eval: on</span>` : "";
   statusEl.className = `upload-status ${job.status === "running" || job.status === "queued" ? "running" : (job.failed ? "error" : "done")}`;
   statusEl.innerHTML = `
-    <div><b>${esc(job.status)}</b> ${job.completed}/${job.total} (${pct}%)${ds}${cur}${failed}</div>
-    ${(job.tasks || []).map(t => `<div>${esc(t.filename)}: ${esc(t.status)}${t.run_id ? ` → ${esc(t.run_id)}` : ""}${t.error ? ` (${esc(t.error)})` : ""}</div>`).join("")}
+    <div><b>${esc(job.status)}</b> ${job.completed}/${job.total} (${pct}%)${ds}${autoEvalTag}${cur}${failed}</div>
+    ${(job.tasks || []).map(t => {
+      const evalTag = t.eval_status ? ` · <span style="color:var(--accent,#4daafc)">eval: ${esc(t.eval_status)}</span>` : "";
+      return `<div>${esc(t.filename)}: ${esc(t.status)}${t.run_id ? ` → ${esc(t.run_id)}` : ""}${evalTag}${t.error ? ` (${esc(t.error)})` : ""}</div>`;
+    }).join("")}
     ${job.message ? `<div>${esc(job.message)}</div>` : ""}`;
 }
 
@@ -1810,6 +1829,13 @@ async function refreshInferenceUploadJob() {
     if (state.inferenceJob && (state.inferenceJob.status === "done" || state.inferenceJob.status === "partial" || state.inferenceJob.status === "error")) {
       await refreshDatasets();
     }
+    if (state.inferenceJob?.eval_job_id && (!state.batchJob || state.batchJob.status !== "running")) {
+      const bData = await api("/api/evaluation/batch-jobs/active");
+      if (bData.job) {
+        state.batchJob = bData.job;
+      }
+    }
+    renderUploadPanel();
     state.runs = await api("/api/runs");
     renderRuns();
   } catch (err) {
@@ -1836,6 +1862,8 @@ async function startInferenceUpload() {
   if (state.inferenceJob && (state.inferenceJob.status === "queued" || state.inferenceJob.status === "running")) {
     return;
   }
+  const autoEvalCheckbox = document.getElementById("inferenceAutoEval");
+  const autoEval = autoEvalCheckbox ? autoEvalCheckbox.checked : true;
   let start;
   if (state.inferSource === "dataset") {
     const select = document.getElementById("inferenceDatasetSelect");
@@ -1853,6 +1881,7 @@ async function startInferenceUpload() {
     start = () => apiPost("/api/inference/jobs/from-dataset", {
       source,
       dataset_id: datasetId,
+      auto_eval: autoEval,
     });
   } else {
     const input = document.getElementById("inferenceUploadInput");
@@ -1867,6 +1896,7 @@ async function startInferenceUpload() {
     for (const file of input.files) {
       form.append("files", file, file.name);
     }
+    form.append("auto_eval", autoEval ? "true" : "false");
     start = async () => {
       const r = await fetch("/api/inference/jobs", { method: "POST", body: form });
       const text = await r.text();

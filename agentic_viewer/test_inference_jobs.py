@@ -138,6 +138,42 @@ class InferenceJobManagerTests(unittest.TestCase):
         self.assertEqual(job.tasks[0].status, "error")
         self.assertIn("down", job.tasks[0].error or "")
 
+    @patch("agentic_viewer.inference_jobs.wait_for_inference_api")
+    @patch("agentic_viewer.inference_jobs.invoke_inference")
+    def test_auto_eval_enqueues_runs(self, mock_invoke, mock_wait) -> None:
+        from unittest.mock import MagicMock
+        import time
+
+        mock_invoke.return_value = {
+            "kv_results": [{"key": "test_key"}],
+            "meta": {"run_id": "run-auto-1", "seconds": 0.5},
+        }
+        mock_batch = MagicMock()
+        fake_eval_job = MagicMock()
+        fake_eval_job.job_id = "eval-batch-1"
+        mock_batch.enqueue_run.return_value = fake_eval_job
+
+        mgr = InferenceJobManager(
+            "http://127.0.0.1:8010",
+            batch_manager=mock_batch,
+        )
+        job = mgr.start([("sample.pdf", b"%PDF-1")], auto_eval=True)
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            job = mgr.get_job(job.job_id)
+            assert job is not None
+            if job.status in {"done", "error"}:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("job did not finish")
+
+        self.assertEqual(job.status, "done")
+        mock_batch.enqueue_run.assert_called_once_with("run-auto-1")
+        mock_batch.seal_job.assert_called_once_with("eval-batch-1")
+        self.assertEqual(job.eval_job_id, "eval-batch-1")
+
 
 if __name__ == "__main__":
     unittest.main()
