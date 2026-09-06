@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -20,6 +21,10 @@ from agentic_viewer.eval.paths import answer_sheet_path
 from agentic_viewer.evaluation.agentic_client import AgenticEvalError, invoke_agentic_eval
 from agentic_viewer.evaluation.batch import enrich_batch_job_dict, make_batch_manager
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
+from agentic_viewer.evaluation.status_cleanup import (
+    cleanup_all_running_eval_statuses,
+    mark_running_eval_status_cancelled,
+)
 from agentic_viewer.evaluation.summary import (
     agentic_eval_summary,
     build_evaluation_summary,
@@ -84,7 +89,20 @@ _INFERENCE_JOB_MANAGER = make_inference_job_manager(
 )
 _DATASET_STORE = DatasetStore()
 
-app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: clean up stale running statuses from previous crashes or ungraceful stops
+    cleaned = cleanup_all_running_eval_statuses(RUNS_ROOT)
+    if cleaned:
+        total = sum(cleaned.values())
+        print(
+            f"[agentic-viewer] Startup cleanup: marked {total} stale eval task(s) cancelled across {len(cleaned)} run(s): {cleaned}"
+        )
+    yield
+
+
+app = FastAPI(title="Agentic Run Trace Viewer", version="0.3.0", lifespan=lifespan)
 
 
 def _list_agentic_evals(run_id: str) -> Dict[str, Any]:
@@ -714,6 +732,18 @@ def cancel_batch_job(job_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/evaluation/cleanup-stale")
+def post_cleanup_all_stale_eval(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """Clean up stale running evaluation status files across runs."""
+    run_ids = body.get("run_ids")
+    if run_ids is not None and not isinstance(run_ids, list):
+        raise HTTPException(status_code=400, detail="run_ids must be a list of strings")
+    reason = str(body.get("reason") or "cancelled by user (stale cleanup)")
+    cleaned = cleanup_all_running_eval_statuses(RUNS_ROOT, run_ids=run_ids, reason=reason)
+    total = sum(cleaned.values())
+    return {"cleaned_by_run": cleaned, "total_cleaned": total}
+
+
 @app.get("/api/inference/jobs/active")
 def get_active_inference_job() -> Dict[str, Any]:
     job = _INFERENCE_JOB_MANAGER.get_active_job()
@@ -857,6 +887,26 @@ def post_agentic_eval(run_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str
         inflight.discard(key)
         if not inflight:
             _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
+
+
+@app.post("/api/runs/{run_id}/agentic-eval/cleanup-stale")
+def post_cleanup_stale_eval(
+    run_id: str, body: Dict[str, Any] = Body(default={})
+) -> Dict[str, Any]:
+    """Clean up stale running status for a specific run or key."""
+    run_dir = _run_dir(run_id)
+    key = body.get("key")
+    reason = str(body.get("reason") or "cancelled by user (stale cleanup)")
+    count = mark_running_eval_status_cancelled(run_dir, reason=reason, key=key)
+    if key:
+        inflight = _AGENTIC_EVAL_INFLIGHT.get(run_id)
+        if inflight:
+            inflight.discard(key)
+            if not inflight:
+                _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
+    else:
+        _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
+    return {"run_id": run_id, "cleaned": count}
 
 
 def _serve_run_file(root: Path, rel: str):
@@ -3743,6 +3793,7 @@ function renderEval() {
     const keyInflight = inflightKeys.includes(row.key);
     const batchActiveForKey = batchActive && batch && batch.active
       && batch.active.some(x => x.key === row.key);
+    const isActuallyRunning = Boolean(keyInflight || batchActiveForKey);
     const goldVerdictForBtn = String((ae && ae.is_valid_gold) || "").toLowerCase();
     const gtEditCls = goldVerdictForBtn === "invalid" ? " warn" : (hasGt ? "" : " warn");
     const gtEditBtn = `<button type="button" class="gt-edit-btn${gtEditCls}" data-gt-edit="${esc(row.key)}">
@@ -3771,8 +3822,12 @@ function renderEval() {
       agenticCell = `<div class="agentic-eval-err">${esc(ae.error || "error")}</div>
         <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
           ${batchActive ? "disabled" : ""}>Retry</button>`;
-    } else if (keyInflight || batchActiveForKey || (ae && ae.status === "running")) {
+    } else if (isActuallyRunning) {
       agenticCell = `<button type="button" class="agentic-eval-btn" disabled>Running…</button>`;
+    } else if (ae && ae.status === "running") {
+      agenticCell = `<div class="agentic-eval-err" title="Interrupted while running. Click Retry to re-run.">interrupted (running)</div>
+        <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
+          ${batchActive ? "disabled" : ""}>Retry</button>`;
     } else {
       agenticCell = `<button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
         ${batchActive ? "disabled" : ""}>agentic-evaluation</button>`;
@@ -3832,6 +3887,13 @@ function renderEval() {
   }
 
   const allKeysDisabled = batchActive;
+  const hasStale = (report.per_key || []).some(row => {
+    const ae = aeByKey[row.key];
+    const keyInflight = inflightKeys.includes(row.key);
+    const batchActiveForKey = Boolean(batchActive && batch && batch.active
+      && batch.active.some(x => x.key === row.key));
+    return Boolean(ae && ae.status === "running" && !keyInflight && !batchActiveForKey);
+  });
 
   const noGtBanner = !hasGt
     ? `<div class="hint" style="border:1px solid var(--warn);border-radius:8px;padding:10px 12px;background:#2a2218;margin-bottom:12px">
@@ -3851,6 +3913,7 @@ function renderEval() {
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
       <button type="button" class="agentic-eval-btn" id="evalAllKeys"
         style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Evaluate all keys</button>
+      ${hasStale ? `<button type="button" class="tab" id="cleanStaleEval" style="margin-left:8px;color:var(--warn,#e0a45c)" title="Clean up interrupted or dead running tasks">Clear Stale</button>` : ""}
     </p>
     ${batchHtml}
     ${aeErr}
@@ -4116,6 +4179,18 @@ function paintDetail() {
   });
   const evalAllBtn = document.getElementById("evalAllKeys");
   if (evalAllBtn) evalAllBtn.onclick = () => runAllAgenticEvals();
+  const cleanStaleBtn = document.getElementById("cleanStaleEval");
+  if (cleanStaleBtn) {
+    cleanStaleBtn.onclick = async () => {
+      cleanStaleBtn.disabled = true;
+      try {
+        await apiPost(`/api/runs/${encodeURIComponent(state.runId)}/agentic-eval/cleanup-stale`, {});
+        await ensureEval(true);
+      } catch (err) {
+        alert("Failed to clear stale tasks: " + (err.message || err));
+      }
+    };
+  }
   const batchRefresh = document.getElementById("batchRefresh");
   if (batchRefresh) batchRefresh.onclick = () => refreshInferenceBatchJob();
   const batchCancel = document.getElementById("batchCancel");

@@ -191,6 +191,7 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .cell-eval-btn:hover:not(:disabled) { border-color: var(--accent); }
     .cell-eval-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .cell-eval-btn.subtle { color: var(--muted); }
+    .cell-eval-btn.warn { color: var(--warn, #e0a45c); border-color: rgba(224, 164, 92, 0.4); }
   </style>
 </head>
 <body>
@@ -652,8 +653,19 @@ function renderMatrixEvalAction(runId, key, ae, isCurrent) {
     : [];
   const isInflight = inflightKeys.includes(key);
   const batchDisabled = batchIsActive();
-  if (ae.status === "running" || isCurrent || isInflight) {
+  const batchActiveForKey = Boolean(batchDisabled && state.batchJob && (
+    (state.batchJob.current && state.batchJob.current.run_id === runId && state.batchJob.current.key === key)
+    || (state.batchJob.active || []).some(a => a.run_id === runId && a.key === key)
+  ));
+  const isActuallyRunning = isCurrent || isInflight || batchActiveForKey;
+
+  if (isActuallyRunning) {
     return `<button type="button" class="cell-eval-btn" disabled>Running…</button>`;
+  }
+  if (ae.status === "running") {
+    return `<button type="button" class="cell-eval-btn warn" data-run-eval="1"
+      data-run-id="${esc(runId)}" data-key="${esc(key)}"
+      ${batchDisabled ? "disabled" : ""} title="Interrupted while running. Click to re-run.">Retry (stale)</button>`;
   }
   if (ae.status === "error") {
     return `<button type="button" class="cell-eval-btn" data-run-eval="1"
@@ -677,6 +689,7 @@ function batchIsActive() {
 
 function renderBatchStartControls() {
   const disabled = !state.selected.size || batchIsActive();
+  const hasStale = Boolean(state.summary?.per_run?.some(r => (r.agentic?.n_running ?? 0) > 0));
   return `
     <div class="batch-panel">
       <div class="title">Batch agentic-evaluation</div>
@@ -686,6 +699,10 @@ function renderBatchStartControls() {
         </button>
         <label class="btn"><input type="checkbox" id="skipExisting" ${state.skipExisting ? "checked" : ""} />
           Skip existing</label>
+        <button type="button" class="btn ${hasStale ? "warn" : ""}" id="clearStaleTasks"
+          title="Clean up interrupted or dead running tasks across runs">
+          Clear Stale Tasks
+        </button>
       </div>
       <p class="hint" style="margin:8px 0 0">
         Evaluates every gold key via the inference API (up to 8 keys in parallel per run). Results save under
@@ -853,6 +870,17 @@ function renderSummaryBody() {
       const emCls = cell.baseline_em ? "cell-em-y" : "cell-em-n";
       const ae = cell.agentic || {};
       const isCurrent = cur && cur.run_id === runId && cur.key === row.key && ae.status !== "done";
+      const inflight = state.agenticInflight;
+      const inflightKeys = inflight && inflight.runId === runId
+        ? (Array.isArray(inflight.keys) ? inflight.keys : (inflight.key ? [inflight.key] : []))
+        : [];
+      const isInflight = inflightKeys.includes(row.key);
+      const batchDisabled = batchIsActive();
+      const batchActiveForKey = Boolean(batchDisabled && state.batchJob && (
+        (state.batchJob.current && state.batchJob.current.run_id === runId && state.batchJob.current.key === row.key)
+        || (state.batchJob.active || []).some(a => a.run_id === runId && a.key === row.key)
+      ));
+      const isActuallyRunning = isCurrent || isInflight || batchActiveForKey;
       let agentHtml;
       const canOpen = ae.status === "done" || ae.status === "error" || ae.status === "running";
       if (ae.status === "done") {
@@ -863,12 +891,14 @@ function renderSummaryBody() {
         const predHtml = v ? `<div class="cell-agent ${predCls}">pred: ${esc(v)}</div>` : "";
         const goldHtml = gv ? `<div class="cell-agent ${goldCls}">GT: ${esc(gv)}</div>` : "";
         agentHtml = `${predHtml}${goldHtml}`;
-      } else if (ae.status === "running" || isCurrent) {
+      } else if (isActuallyRunning) {
         const liveLabel = ae.live_label || formatLiveLabel(ae.live)
           || (isCurrent ? formatLiveLabel(cur?.live) : "");
         agentHtml = liveLabel
           ? `<div class="cell-agent running">running</div><div class="cell-sub">${esc(liveLabel)}</div>`
           : `<div class="cell-agent running">running</div>`;
+      } else if (ae.status === "running") {
+        agentHtml = `<div class="cell-agent error" title="Task was interrupted when server stopped">interrupted (running)</div>`;
       } else if (ae.status === "error") {
         agentHtml = `<div class="cell-agent error">${esc(ae.error || "error")}</div>`;
       } else {
@@ -1004,6 +1034,29 @@ function bindBatchControls() {
     refreshBtn.onclick = (e) => {
       e.stopPropagation();
       refreshBatchJob();
+    };
+  }
+  const clearStaleBtn = document.getElementById("clearStaleTasks");
+  if (clearStaleBtn) {
+    clearStaleBtn.onclick = async (e) => {
+      e.stopPropagation();
+      clearStaleBtn.disabled = true;
+      try {
+        const body = state.selected.size ? { run_ids: [...state.selected] } : {};
+        const res = await apiPost("/api/evaluation/cleanup-stale", body);
+        const count = res.total_cleaned ?? 0;
+        await loadSummary(true);
+        await refreshRuns();
+        if (count > 0) {
+          alert(`Cleared ${count} stale eval task(s).`);
+        } else {
+          alert("No stale running tasks found.");
+        }
+      } catch (err) {
+        alert("Failed to clear stale tasks: " + (err.message || err));
+      } finally {
+        clearStaleBtn.disabled = false;
+      }
     };
   }
   const panel = document.getElementById("batchJobPanel");
