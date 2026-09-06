@@ -2440,6 +2440,8 @@ function tabsHtml() {
 
 function renderEvalHierarchyKeyToolbar() {
   if (state.embed || state.tab !== "hierarchy_eval") return "";
+  const batch = state.batchJob;
+  const batchActive = batch && (batch.status === "queued" || batch.status === "running");
   const keyOpts = (state.evalHierarchyKeys || []).map(row => {
     const status = row.status || "pending";
     const verdict = row.is_correct_answer ? ` · pred ${row.is_correct_answer}` : "";
@@ -2454,6 +2456,8 @@ function renderEvalHierarchyKeyToolbar() {
           ${keyOpts || `<option value="">—</option>`}
         </select>
       </label>
+      ${state.evalKey ? `<button type="button" class="agentic-eval-btn" id="evalHierarchyRetry"
+        ${batchActive ? "disabled" : ""}>Retry eval</button>` : ""}
       ${state.evalHierarchyKeysLoading ? `<span class="tree-kv">Loading keys…</span>` : ""}
     </div>`;
 }
@@ -2825,7 +2829,7 @@ async function getPdfDocument(runId) {
   return _pdfDocCache[runId];
 }
 
-async function mountChunkPdfViewer(host, runId, regions) {
+async function mountChunkPdfViewer(host, runId, regions, fallbackPages=[]) {
   if (!host || !runId) return;
   const grouped = {};
   for (const r of (regions || [])) {
@@ -2834,9 +2838,15 @@ async function mountChunkPdfViewer(host, runId, regions) {
     if (!grouped[page]) grouped[page] = [];
     grouped[page].push(r);
   }
-  const pages = Object.keys(grouped).map(Number).sort((a, b) => a - b);
+  let pages = Object.keys(grouped).map(Number).sort((a, b) => a - b);
+  if (!pages.length && Array.isArray(fallbackPages) && fallbackPages.length) {
+    pages = fallbackPages.map(Number).filter(p => Number.isFinite(p) && p > 0).sort((a, b) => a - b);
+    for (const p of pages) {
+      if (!grouped[p]) grouped[p] = [];
+    }
+  }
   if (!pages.length) {
-    host.innerHTML = `<div class="empty">No highlight regions for PDF overlay.</div>`;
+    host.innerHTML = `<div class="empty">No pages available for PDF view.</div>`;
     return;
   }
 
@@ -2891,7 +2901,7 @@ async function mountChunkPdfViewer(host, runId, regions) {
       overlay.style.width = `${Math.round(viewport.width)}px`;
       overlay.style.height = `${Math.round(viewport.height)}px`;
 
-      for (const region of grouped[pageNum]) {
+      for (const region of (grouped[pageNum] || [])) {
         const style = regionToPctStyle(region);
         if (!style) continue;
         const box = document.createElement("div");
@@ -2907,10 +2917,10 @@ async function mountChunkPdfViewer(host, runId, regions) {
       pagesHost.appendChild(wrap);
     }
     if (!pagesHost.children.length) {
-      pagesHost.innerHTML = `<div class="empty">Could not render PDF pages for highlights.</div>`;
+      pagesHost.innerHTML = `<div class="empty">Could not render PDF pages. <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank">Open full PDF</a></div>`;
     }
   } catch (err) {
-    host.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)}</div>`;
+    host.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)} · <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank">open full PDF</a></div>`;
   }
 }
 
@@ -2973,8 +2983,9 @@ async function openChunkPreview(chunkId, anchorEl) {
       </div>
     </details>`;
     const pdfHost = box.querySelector(".pdf-chunk-host");
-    if (pdfHost && regions.length) {
-      mountChunkPdfViewer(pdfHost, state.runId, regions);
+    const fallbackPages = (hl && hl.pages) || row.pages || (row.page ? [row.page] : []);
+    if (pdfHost && (regions.length || (fallbackPages && fallbackPages.length))) {
+      mountChunkPdfViewer(pdfHost, state.runId, regions, fallbackPages);
     }
   } catch (err) {
     box.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)}</div>`;
@@ -3946,35 +3957,42 @@ function renderEval() {
     const gtEditBtn = `<button type="button" class="gt-edit-btn${gtEditCls}" data-gt-edit="${esc(row.key)}">
       ${hasGt ? "Edit GT" : "Add GT"}</button>`;
     let agenticCell;
-    if (ae && ae.status === "done" && (ae.is_correct_answer || ae.is_valid_gold || ae.reason_summary || ae.reason || ae.text)) {
+    if (isActuallyRunning) {
+      agenticCell = `<button type="button" class="agentic-eval-btn" disabled>Running…</button>`;
+    } else if (ae && ae.status === "running") {
+      agenticCell = `<div class="agentic-eval-err" title="Interrupted while running. Click Retry to re-run.">interrupted (running)</div>
+        <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
+          ${batchActive ? "disabled" : ""}>Retry</button>`;
+    } else if (ae && ae.status === "error") {
+      agenticCell = `<div class="agentic-eval-err">${esc(ae.error || "error")}</div>
+        <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
+          ${batchActive ? "disabled" : ""}>Retry</button>`;
+    } else if (ae && (ae.status === "done" || ae.is_correct_answer || ae.is_valid_gold || ae.reason_summary || ae.reason || ae.text)) {
       const verdict = String(ae.is_correct_answer || "").toLowerCase();
       const goldVerdict = String(ae.is_valid_gold || "").toLowerCase();
       const verdictCls = verdict === "correct" ? "correct" : (verdict === "incorrect" ? "incorrect" : "");
       const goldCls = goldVerdict === "valid" ? "valid" : (goldVerdict === "invalid" ? "invalid" : "");
       const summary = ae.reason_summary || ae.reason || "";
       const detail = ae.reason_detail || ae.text || "";
+      const isIncomplete = summary.includes("평가가 완료되지 않았습니다")
+        || detail.includes("submit_evaluation을 호출하지 않았습니다");
       agenticCell = `
         <div class="agentic-eval-verdicts">
           ${verdict === "correct" || verdict === "incorrect"
             ? `<div class="agentic-eval-verdict ${verdictCls}">pred: ${esc(verdict)}</div>` : ""}
           ${goldVerdict === "valid" || goldVerdict === "invalid"
             ? `<div class="agentic-eval-verdict ${goldCls}">GT: ${esc(goldVerdict)}</div>` : ""}
+          ${isIncomplete ? `<div class="agentic-eval-verdict warn" style="color:var(--warn,#e0a45c);background:rgba(224,164,92,0.15);border:1px solid rgba(224,164,92,0.4)">미완료</div>` : ""}
         </div>
         ${summary ? `<div class="agentic-eval-summary">${esc(summary)}</div>` : ""}
         ${detail ? `<div class="agentic-eval-detail"><details${evalDetailAttrs("agentic", row.key)}>
           <summary>상세</summary>
           <div class="agentic-eval-text">${esc(detail)}</div>
-        </details></div>` : ""}`;
-    } else if (ae && ae.status === "error") {
-      agenticCell = `<div class="agentic-eval-err">${esc(ae.error || "error")}</div>
-        <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
-          ${batchActive ? "disabled" : ""}>Retry</button>`;
-    } else if (isActuallyRunning) {
-      agenticCell = `<button type="button" class="agentic-eval-btn" disabled>Running…</button>`;
-    } else if (ae && ae.status === "running") {
-      agenticCell = `<div class="agentic-eval-err" title="Interrupted while running. Click Retry to re-run.">interrupted (running)</div>
-        <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
-          ${batchActive ? "disabled" : ""}>Retry</button>`;
+        </details></div>` : ""}
+        <div style="margin-top:6px">
+          <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
+            ${batchActive ? "disabled" : ""}>Retry</button>
+        </div>`;
     } else {
       agenticCell = `<button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
         ${batchActive ? "disabled" : ""}>agentic-evaluation</button>`;
@@ -4042,6 +4060,18 @@ function renderEval() {
     return Boolean(ae && ae.status === "running" && !keyInflight && !batchActiveForKey);
   });
 
+  const isIncompleteKey = (row) => {
+    const ae = aeByKey[row.key];
+    if (!ae) return true;
+    if (ae.status === "error" || ae.status === "running") return true;
+    const sum = String(ae.reason_summary || ae.reason || "");
+    const det = String(ae.reason_detail || ae.text || "");
+    return sum.includes("평가가 완료되지 않았습니다") || det.includes("submit_evaluation을 호출하지 않았습니다");
+  };
+  const incompleteRows = (report.per_key || []).filter(isIncompleteKey);
+  const incompleteKeys = incompleteRows.map(r => r.key);
+  state.incompleteEvalKeys = incompleteKeys;
+
   const noGtBanner = !hasGt
     ? `<div class="hint" style="border:1px solid var(--warn);border-radius:8px;padding:10px 12px;background:#2a2218;margin-bottom:12px">
         No ground truth in <code>answer_sheet.json</code> for <b>${esc(report.document)}</b>.
@@ -4060,6 +4090,8 @@ function renderEval() {
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>
       <button type="button" class="agentic-eval-btn" id="evalAllKeys"
         style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Evaluate all keys</button>
+      ${incompleteKeys.length > 0 ? `<button type="button" class="agentic-eval-btn" id="evalRetryIncomplete"
+        style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Retry incomplete (${incompleteKeys.length})</button>` : ""}
       ${hasStale ? `<button type="button" class="tab" id="cleanStaleEval" style="margin-left:8px;color:var(--warn,#e0a45c)" title="Clean up interrupted or dead running tasks">Clear Stale</button>` : ""}
     </p>
     ${batchHtml}
@@ -4167,6 +4199,14 @@ async function runAgenticEval(key) {
   } finally {
     state.agenticEvalInflight = (state.agenticEvalInflight || []).filter(k => k !== key);
     await ensureAgenticEvals();
+    await loadEvalHierarchyKeys();
+    if (state.tab === "hierarchy_eval" && state.evalKey === key) {
+      state.agentTree = await loadAgentTree();
+    }
+    try {
+      state.runs = await api("/api/runs");
+      renderRuns();
+    } catch (_) {}
     paintDetail();
   }
 }
@@ -4328,6 +4368,21 @@ function paintDetail() {
   });
   const evalAllBtn = document.getElementById("evalAllKeys");
   if (evalAllBtn) evalAllBtn.onclick = () => runAllAgenticEvals();
+  const evalRetryIncompleteBtn = document.getElementById("evalRetryIncomplete");
+  if (evalRetryIncompleteBtn) {
+    evalRetryIncompleteBtn.onclick = async () => {
+      const keys = state.incompleteEvalKeys || [];
+      if (keys.length === 1) {
+        runAgenticEval(keys[0]);
+      } else if (keys.length > 1) {
+        runAllAgenticEvals();
+      }
+    };
+  }
+  const evalHierarchyRetry = document.getElementById("evalHierarchyRetry");
+  if (evalHierarchyRetry && state.evalKey) {
+    evalHierarchyRetry.onclick = () => runAgenticEval(state.evalKey);
+  }
   const cleanStaleBtn = document.getElementById("cleanStaleEval");
   if (cleanStaleBtn) {
     cleanStaleBtn.onclick = async () => {

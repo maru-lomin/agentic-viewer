@@ -60,6 +60,10 @@ def agentic_key_is_done(data: Optional[Dict[str, Any]]) -> bool:
     status = str(data.get("status") or "")
     if status == "error":
         return False
+    summary = str(data.get("reason_summary") or data.get("reason") or "")
+    detail = str(data.get("reason_detail") or data.get("text") or "")
+    if "평가가 완료되지 않았습니다" in summary or "submit_evaluation을 호출하지 않았습니다" in detail:
+        return False
     if status == "done" or data.get("is_correct_answer") or data.get("is_valid_gold"):
         return True
     return False

@@ -65,6 +65,42 @@ class StatusCleanupTests(unittest.TestCase):
         self.assertIn("clearStaleTasks", EVALUATION_HTML)
         self.assertIn("Retry (stale)", EVALUATION_HTML)
 
+    def test_incomplete_eval_handling(self) -> None:
+        from agentic_viewer.app import INDEX_HTML
+        from agentic_viewer.evaluation.batch import agentic_key_is_done
+        from agentic_viewer.evaluation.summary import _agentic_cell, agentic_eval_summary
+
+        done_payload = {
+            "key": "Valid_Key",
+            "status": "done",
+            "is_correct_answer": "correct",
+            "is_valid_gold": "valid",
+            "reason_summary": "정답입니다.",
+        }
+        incomplete_payload = {
+            "key": "Incomplete_Key",
+            "status": "done",
+            "is_correct_answer": "incorrect",
+            "is_valid_gold": "invalid",
+            "reason_summary": "평가가 완료되지 않았습니다.",
+            "reason_detail": "평가 에이전트가 24단계 내에 submit_evaluation을 호출하지 않았습니다.",
+        }
+
+        self.assertTrue(agentic_key_is_done(done_payload))
+        self.assertFalse(agentic_key_is_done(incomplete_payload))
+
+        cell = _agentic_cell({"Incomplete_Key": incomplete_payload}, "Incomplete_Key")
+        self.assertEqual(cell["status"], "error")
+        self.assertIn("평가 미완료", cell["error"])
+
+        summary = agentic_eval_summary({"Incomplete_Key": incomplete_payload}, ["Incomplete_Key"])
+        self.assertEqual(summary["n_done"], 0)
+        self.assertEqual(summary["n_error"], 1)
+
+        # Viewer HTML should include retry incomplete and retry buttons
+        self.assertIn("evalRetryIncomplete", INDEX_HTML)
+        self.assertIn("evalHierarchyRetry", INDEX_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()

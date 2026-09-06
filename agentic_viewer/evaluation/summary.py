@@ -58,6 +58,14 @@ def _agentic_cell(
     if not ae:
         return {"status": "pending"}
     status = str(ae.get("status") or "pending")
+    summary = str(ae.get("reason_summary") or ae.get("reason") or "")
+    detail = str(ae.get("reason_detail") or ae.get("text") or "")
+    if "평가가 완료되지 않았습니다" in summary or "submit_evaluation을 호출하지 않았습니다" in detail:
+        return {
+            "status": "error",
+            "error": "평가 미완료",
+            "reason_summary": summary,
+        }
     if status == "done" or ae.get("is_correct_answer") or ae.get("is_valid_gold"):
         verdict = str(ae.get("is_correct_answer") or "").lower()
         gold_verdict = str(ae.get("is_valid_gold") or "").lower()
@@ -65,7 +73,7 @@ def _agentic_cell(
             "status": "done",
             "is_correct_answer": verdict or None,
             "is_valid_gold": gold_verdict or None,
-            "reason_summary": ae.get("reason_summary") or ae.get("reason") or "",
+            "reason_summary": summary,
         }
     if status == "error":
         return {"status": "error", "error": ae.get("error") or "error"}
@@ -105,6 +113,11 @@ def agentic_eval_summary(
             n_running += 1
             continue
         if status == "error":
+            n_error += 1
+            continue
+        summary = str(ae.get("reason_summary") or ae.get("reason") or "")
+        detail = str(ae.get("reason_detail") or ae.get("text") or "")
+        if "평가가 완료되지 않았습니다" in summary or "submit_evaluation을 호출하지 않았습니다" in detail:
             n_error += 1
             continue
         if status == "done" or ae.get("is_correct_answer") or ae.get("is_valid_gold"):

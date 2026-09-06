@@ -56,6 +56,19 @@ class PdfSourceTests(unittest.TestCase):
             return
         self.skipTest("no run with 05_eval.json document")
 
+    def test_infer_pdf_path_for_target_run(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        target = repo / "outputs" / "runs" / "agentic-bc9df067-1fa8-4d12-a107-1e6b85c3e005"
+        if not target.is_dir():
+            self.skipTest("target run not found")
+        path = infer_pdf_path(target)
+        self.assertIsNotNone(path)
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.name, "Albanesi - CT ROCA - 2024 (ING-1718-23-AR) - VF (English).pdf")
+        info = pdf_info(target)
+        self.assertTrue(info["available"])
+        self.assertEqual(info["filename"], "Albanesi - CT ROCA - 2024 (ING-1718-23-AR) - VF (English).pdf")
+
 
 if __name__ == "__main__":
     unittest.main()
