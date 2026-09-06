@@ -184,6 +184,7 @@ def build_evaluation_summary(
             "documents": [],
             "document_warning": None,
             "per_run": [],
+            "average": None,
             "per_key": [],
             "keys": [],
         }
@@ -264,11 +265,81 @@ def build_evaluation_summary(
     per_key = [per_key_by_name[k] for k in sorted(per_key_by_name)]
     keys = [row["key"] for row in per_key]
 
+    run_has_baseline = {r["run_id"]: bool(r.get("has_baseline_eval")) for r in per_run}
+    for row in per_key:
+        by_run = row.get("by_run") or {}
+        n_correct = 0
+        n_incorrect = 0
+        for r_id in run_ids:
+            if not run_has_baseline.get(r_id):
+                continue
+            cell = by_run.get(r_id)
+            if not cell or "baseline_em" not in cell:
+                continue
+            if cell.get("baseline_em"):
+                n_correct += 1
+            else:
+                n_incorrect += 1
+        total = n_correct + n_incorrect
+        row["overall"] = {
+            "correct": n_correct,
+            "incorrect": n_incorrect,
+            "total": total,
+            "rate": round(n_correct / total, 6) if total > 0 else None,
+        }
+
+    baseline_runs = [
+        r for r in per_run if r.get("has_baseline_eval") and r.get("baseline")
+    ]
+    em_vals = [
+        r["baseline"]["value_exact_match"]
+        for r in baseline_runs
+        if r["baseline"].get("value_exact_match") is not None
+    ]
+    page_f1_vals = [
+        r["baseline"]["page_f1_macro"]
+        for r in baseline_runs
+        if r["baseline"].get("page_f1_macro") is not None
+    ]
+    evid_f1_vals = [
+        r["baseline"]["evidence_token_f1"]
+        for r in baseline_runs
+        if r["baseline"].get("evidence_token_f1") is not None
+    ]
+
+    agentic_runs = [r for r in per_run if r.get("agentic")]
+    acc_vals = [
+        r["agentic"]["accuracy"]
+        for r in agentic_runs
+        if r["agentic"].get("accuracy") is not None
+    ]
+    gv_vals = [
+        r["agentic"]["gold_validity"]
+        for r in agentic_runs
+        if r["agentic"].get("gold_validity") is not None
+    ]
+    total_done = sum(r.get("agentic", {}).get("n_done", 0) for r in per_run)
+    total_keys = sum(r.get("agentic", {}).get("n_total", 0) for r in per_run)
+    n_runs = len(per_run)
+
+    average_metrics = {
+        "value_exact_match": round(sum(em_vals) / len(em_vals), 6) if em_vals else None,
+        "page_f1_macro": round(sum(page_f1_vals) / len(page_f1_vals), 6) if page_f1_vals else None,
+        "evidence_token_f1": round(sum(evid_f1_vals) / len(evid_f1_vals), 6) if evid_f1_vals else None,
+        "agentic_done_avg": round(total_done / n_runs, 2) if n_runs > 0 else 0,
+        "agentic_total_avg": round(total_keys / n_runs, 2) if n_runs > 0 else 0,
+        "agentic_done_total": total_done,
+        "agentic_total_total": total_keys,
+        "accuracy": round(sum(acc_vals) / len(acc_vals), 6) if acc_vals else None,
+        "gold_validity": round(sum(gv_vals) / len(gv_vals), 6) if gv_vals else None,
+    }
+
     return {
         "run_ids": list(run_ids),
         "documents": unique_docs,
         "document_warning": document_warning,
         "per_run": per_run,
+        "average": average_metrics,
         "per_key": per_key,
         "keys": keys,
     }

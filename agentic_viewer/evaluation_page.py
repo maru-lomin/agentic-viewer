@@ -244,6 +244,17 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     }
     .run-table th { color: var(--muted); font-weight: 500; }
     .run-table td.mono { font-family: var(--mono); font-size: 11px; }
+    .summary-avg-row {
+      background: rgba(61, 156, 240, 0.08);
+      font-weight: 600;
+    }
+    .summary-avg-row td {
+      border-bottom: 2px solid var(--accent);
+    }
+    .matrix-overall-head, .matrix-overall-cell {
+      min-width: 170px;
+      white-space: nowrap;
+    }
     .err-text { color: var(--err); font-size: 12px; margin-top: 6px; }
     .content-tabs {
       display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;
@@ -1166,7 +1177,8 @@ function renderSummaryBody() {
   const warn = s.document_warning
     ? `<div class="warn-box">${esc(s.document_warning)}</div>` : "";
 
-  const runRows = (s.per_run || []).map(r => {
+  const pr = s.per_run || [];
+  const runRows = pr.map(r => {
     const b = r.baseline || {};
     const a = r.agentic || {};
     const rec = runRecord(r.run_id);
@@ -1186,6 +1198,47 @@ function renderSummaryBody() {
     </tr>`;
   }).join("");
 
+  let avgRow = "";
+  if (pr.length > 1) {
+    const nRuns = pr.length;
+    const emRuns = pr.filter(r => r.has_baseline_eval && r.baseline?.value_exact_match != null);
+    const avgEm = s.average?.value_exact_match ?? (emRuns.length ? emRuns.reduce((sum, r) => sum + r.baseline.value_exact_match, 0) / emRuns.length : null);
+
+    const pageF1Runs = pr.filter(r => r.has_baseline_eval && r.baseline?.page_f1_macro != null);
+    const avgPageF1 = s.average?.page_f1_macro ?? (pageF1Runs.length ? pageF1Runs.reduce((sum, r) => sum + r.baseline.page_f1_macro, 0) / pageF1Runs.length : null);
+
+    const evidF1Runs = pr.filter(r => r.has_baseline_eval && r.baseline?.evidence_token_f1 != null);
+    const avgEvidF1 = s.average?.evidence_token_f1 ?? (evidF1Runs.length ? evidF1Runs.reduce((sum, r) => sum + r.baseline.evidence_token_f1, 0) / evidF1Runs.length : null);
+
+    const totalDone = pr.reduce((sum, r) => sum + (r.agentic?.n_done ?? 0), 0);
+    const totalTotal = pr.reduce((sum, r) => sum + (r.agentic?.n_total ?? 0), 0);
+    const avgDone = s.average?.agentic_done_avg ?? (nRuns ? totalDone / nRuns : 0);
+    const avgTotal = s.average?.agentic_total_avg ?? (nRuns ? totalTotal / nRuns : 0);
+    const fmtNum = n => (Number.isInteger(Number(n)) ? Number(n).toFixed(0) : Number(n).toFixed(1));
+    const avgDoneStr = (avgDone || avgTotal) ? `${fmtNum(avgDone)}/${fmtNum(avgTotal)}` : "0/0";
+
+    const accRuns = pr.filter(r => r.agentic?.accuracy != null);
+    const avgAcc = s.average?.accuracy ?? (accRuns.length ? accRuns.reduce((sum, r) => sum + r.agentic.accuracy, 0) / accRuns.length : null);
+
+    const gvRuns = pr.filter(r => r.agentic?.gold_validity != null);
+    const avgGv = s.average?.gold_validity ?? (gvRuns.length ? gvRuns.reduce((sum, r) => sum + r.agentic.gold_validity, 0) / gvRuns.length : null);
+
+    avgRow = `<tr class="summary-avg-row">
+      <td>
+        <span class="run-label">
+          <span class="run-doc" style="color:var(--accent)">Average</span>
+          <span class="run-id">${nRuns} runs</span>
+        </span>
+      </td>
+      <td>${avgEm != null ? fmtPct(avgEm) : "—"}</td>
+      <td>${avgPageF1 != null ? fmtPct(avgPageF1) : "—"}</td>
+      <td>${avgEvidF1 != null ? fmtPct(avgEvidF1) : "—"}</td>
+      <td title="Average per run (${totalDone}/${totalTotal} total)">${avgDoneStr}</td>
+      <td>${avgAcc != null ? fmtPct(avgAcc) : "—"}</td>
+      <td>${avgGv != null ? fmtPct(avgGv) : "—"}</td>
+    </tr>`;
+  }
+
   const runIds = s.run_ids || [];
   const cur = state.batchJob?.current;
   const headRuns = runIds.map(id =>
@@ -1193,6 +1246,34 @@ function renderSummaryBody() {
   ).join("");
 
   const matrixRows = (s.per_key || []).map(row => {
+    let ov = row.overall;
+    if (!ov) {
+      let c = 0, inc = 0;
+      for (const runId of runIds) {
+        const r = pr.find(x => x.run_id === runId);
+        if (r && !r.has_baseline_eval) continue;
+        const cell = (row.by_run || {})[runId];
+        if (!cell || cell.baseline_em === undefined) continue;
+        if (cell.baseline_em) c++;
+        else inc++;
+      }
+      const tot = c + inc;
+      ov = { correct: c, incorrect: inc, total: tot, rate: tot > 0 ? c / tot : null };
+    }
+
+    const goldTitle = row.gold_value != null ? ` title="Gold: ${esc(row.gold_value)}"` : "";
+    let overallCellHtml;
+    if (ov.total > 0) {
+      const ratePct = ov.rate != null ? `${(ov.rate * 100).toFixed(1)}%` : "—";
+      const rateFormatted = ov.rate != null ? `${fmtPct(ov.rate)} (${ratePct})` : "—";
+      overallCellHtml = `<td class="matrix-overall-cell"${goldTitle}>
+        <div style="font-weight:600">EM Rate: ${rateFormatted}</div>
+        <div class="cell-sub">Correct: <span class="cell-em-y" style="font-weight:600">${ov.correct}</span> · Incorrect: <span class="cell-em-n" style="font-weight:600">${ov.incorrect}</span></div>
+      </td>`;
+    } else {
+      overallCellHtml = `<td class="matrix-overall-cell"${goldTitle}>—</td>`;
+    }
+
     const cells = runIds.map(runId => {
       const cell = (row.by_run || {})[runId];
       if (!cell) return `<td>—</td>`;
@@ -1247,7 +1328,7 @@ function renderSummaryBody() {
     }).join("");
     return `<tr>
       <td class="key-col">${esc(row.key)}</td>
-      <td>${esc(row.gold_value ?? "")}</td>
+      ${overallCellHtml}
       ${cells}
     </tr>`;
   }).join("");
@@ -1269,7 +1350,7 @@ function renderSummaryBody() {
           <th>Evid F1</th><th>Agentic done</th><th>Pred acc</th><th>GT valid</th>
         </tr>
       </thead>
-      <tbody>${runRows || `<tr><td colspan="7" class="empty">No runs</td></tr>`}</tbody>
+      <tbody>${avgRow}${runRows || `<tr><td colspan="7" class="empty">No runs</td></tr>`}</tbody>
     </table>
     <h2 style="font-size:14px;margin:16px 0 10px">Key × run matrix</h2>
     <div class="matrix-wrap">
@@ -1277,7 +1358,7 @@ function renderSummaryBody() {
         <thead>
           <tr>
             <th class="key-col">Key</th>
-            <th>Gold value</th>
+            <th class="matrix-overall-head" data-col="overall">Overall</th>
             ${headRuns}
           </tr>
         </thead>
