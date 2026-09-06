@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from fastapi import HTTPException
+
+from agentic_viewer import app as app_module
 from agentic_viewer.ground_truth.store import (
     get_document_gt,
     import_answer_sheet,
@@ -183,6 +186,50 @@ class GroundTruthStoreTests(unittest.TestCase):
             validate_answer_sheet_payload(
                 {"doc.pdf": {"key": {"value": "x", "evidences": "bad", "evidence_pages": []}}}
             )
+
+
+class GroundTruthApiRouteTests(unittest.TestCase):
+    def test_routes_support_put_and_post(self) -> None:
+        methods_for_gt_key = set()
+        for route in app_module.app.routes:
+            if getattr(route, "path", None) == "/api/ground-truth/key":
+                methods_for_gt_key.update(getattr(route, "methods", set()))
+        self.assertIn("PUT", methods_for_gt_key)
+        self.assertIn("POST", methods_for_gt_key)
+
+    def test_put_ground_truth_key_endpoint_validation(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.put_ground_truth_key({"document": "", "key": "k"})
+        self.assertEqual(ctx.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.put_ground_truth_key({"document": "doc", "key": ""})
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_put_ground_truth_key_updates_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "answer_sheet.json"
+            sheet = {
+                "doc.pdf": {
+                    "K": {
+                        "value": "old",
+                        "evidences": ["a"],
+                        "evidence_pages": [1],
+                    }
+                }
+            }
+            path.write_text(json.dumps(sheet), encoding="utf-8")
+            with mock.patch("agentic_viewer.ground_truth.store.answer_sheet_path", return_value=path):
+                resp = app_module.put_ground_truth_key({
+                    "document": "doc.pdf",
+                    "key": "K",
+                    "value": "new",
+                    "evidences": ["ev1"],
+                    "evidence_pages": [2],
+                })
+                self.assertEqual(resp["key"], "K")
+                self.assertEqual(resp["entry"]["value"], "new")
+                self.assertEqual(resp["entry"]["evidence_pages"], [2])
 
 
 if __name__ == "__main__":

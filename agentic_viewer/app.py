@@ -508,6 +508,7 @@ def get_ground_truth_document(document: str) -> Dict[str, Any]:
 
 
 @app.put("/api/ground-truth/key")
+@app.post("/api/ground-truth/key")
 def put_ground_truth_key(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     document = str(body.get("document") or "").strip()
     key = str(body.get("key") or "").strip()
@@ -3656,7 +3657,7 @@ async function saveGtEditor() {
   edit.message = null;
   paintDetail();
   try {
-    const result = await apiPost("/api/ground-truth/key", {
+    const result = await apiPut("/api/ground-truth/key", {
       document: edit.document,
       key: edit.key,
       value,
@@ -3961,6 +3962,19 @@ async function runAgenticEval(key) {
 async function apiPost(path, body) {
   const r = await fetch(path, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+  if (!r.ok) throw new Error(data.detail || text || r.statusText);
+  return data;
+}
+
+async function apiPut(path, body) {
+  const r = await fetch(path, {
+    method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   });
