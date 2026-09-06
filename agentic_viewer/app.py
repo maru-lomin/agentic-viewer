@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -179,6 +181,115 @@ def _compute_run_eval(run_id: str, *, refresh: bool = False) -> Dict[str, Any]:
     )
 
 
+def _parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
+    if not ts_str:
+        return None
+    try:
+        s = ts_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            return dt.astimezone()
+        return dt
+    except Exception:
+        return None
+
+
+def _format_display_ts(dt: Optional[datetime]) -> str:
+    if not dt:
+        return ""
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _enrich_run_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Ensure every run has a well-defined run_group_id and run_group_name.
+    If already stored in meta.json, preserve them.
+    If missing, group by dataset_id and cluster consecutive runs separated by
+    <= 30 minutes into execution batches (e.g. evaluation-v2-run-v1 (2026-09-06 11:08)).
+    """
+    by_ds: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        if r.get("run_group_id"):
+            continue
+        ds_id = r.get("dataset_id")
+        if ds_id:
+            by_ds.setdefault(ds_id, []).append(r)
+
+    for ds_id, group_runs in by_ds.items():
+        # Sort chronologically (oldest first) to assign v1, v2, ...
+        def _sort_key(item: Dict[str, Any]) -> float:
+            dt = _parse_ts(item.get("started_at"))
+            return dt.timestamp() if dt else 0.0
+
+        group_runs.sort(key=_sort_key)
+
+        # Check existing max version for this dataset among runs with explicit run_group_id
+        pattern = re.compile(rf"{re.escape(ds_id)}-run-v(\d+)", re.IGNORECASE)
+        v_idx = 0
+        for r in rows:
+            gid = str(r.get("run_group_id") or "")
+            m = pattern.search(gid)
+            if m:
+                try:
+                    v_idx = max(v_idx, int(m.group(1)))
+                except ValueError:
+                    pass
+
+        # Split into sessions by gap > 1800s (30m)
+        sessions: List[List[Dict[str, Any]]] = []
+        current_session: List[Dict[str, Any]] = []
+        last_ts: Optional[float] = None
+
+        for r in group_runs:
+            dt = _parse_ts(r.get("started_at"))
+            cur_ts = dt.timestamp() if dt else None
+            if current_session and cur_ts is not None and last_ts is not None:
+                if (cur_ts - last_ts) > 1800:
+                    sessions.append(current_session)
+                    current_session = []
+            current_session.append(r)
+            if cur_ts is not None:
+                last_ts = cur_ts
+
+        if current_session:
+            sessions.append(current_session)
+
+        for sess in sessions:
+            v_idx += 1
+            first_dt = None
+            ds_name = ds_id
+            for r in sess:
+                if not first_dt:
+                    first_dt = _parse_ts(r.get("started_at"))
+                if r.get("dataset_name"):
+                    ds_name = r["dataset_name"]
+            display_time = _format_display_ts(first_dt) if first_dt else ""
+            gid = f"{ds_id}-run-v{v_idx}"
+            gname = f"{ds_name}-run-v{v_idx}" + (f" ({display_time})" if display_time else "")
+            for r in sess:
+                r["run_group_id"] = gid
+                r["run_group_name"] = gname
+
+    return rows
+
+
+def _next_dataset_run_version(dataset_id: str) -> int:
+    max_v = 0
+    pattern = re.compile(rf"{re.escape(dataset_id)}-run-v(\d+)", re.IGNORECASE)
+    runs = list_runs()
+    for r in runs:
+        if r.get("dataset_id") != dataset_id:
+            continue
+        gid = str(r.get("run_group_id") or "")
+        m = pattern.search(gid)
+        if m:
+            try:
+                max_v = max(max_v, int(m.group(1)))
+            except ValueError:
+                pass
+    return max_v + 1
+
+
 @app.get("/api/runs")
 def list_runs() -> List[Dict[str, Any]]:
     RUNS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -215,6 +326,8 @@ def list_runs() -> List[Dict[str, Any]]:
                 "dataset_id": meta.get("dataset_id"),
                 "dataset_name": meta.get("dataset_name"),
                 "dataset_source": meta.get("dataset_source"),
+                "run_group_id": meta.get("run_group_id"),
+                "run_group_name": meta.get("run_group_name"),
                 "source_filename": meta.get("source_filename"),
                 "eval_summary": _eval_summary(eval_report),
                 "agentic_eval_summary": agentic_eval_summary(
@@ -222,7 +335,7 @@ def list_runs() -> List[Dict[str, Any]]:
                 ),
             }
         )
-    return rows
+    return _enrich_run_groups(rows)
 
 
 @app.get("/api/runs/{run_id}")
@@ -636,7 +749,11 @@ async def post_inference_job(
         payload.append((name, data))
 
     hooks_name = (hooks or "agentic_config").strip() or "agentic_config"
-    upload_dataset_id = str(uuid.uuid4())
+    now = datetime.now()
+    display_time = now.strftime("%Y-%m-%d %H:%M")
+    ts_slug = now.strftime("%Y%m%d-%H%M%S")
+    upload_dataset_id = f"upload-{ts_slug}-{uuid.uuid4().hex[:6]}"
+    upload_dataset_name = f"Upload ({display_time})"
     try:
         _DATASET_STORE.create(upload_dataset_id, payload)
         paths = _DATASET_STORE.pdf_paths("managed", upload_dataset_id)
@@ -644,8 +761,10 @@ async def post_inference_job(
             paths=paths,
             hooks=hooks_name,
             dataset_id=upload_dataset_id,
-            dataset_name=upload_dataset_id,
+            dataset_name=upload_dataset_name,
             dataset_source="managed",
+            run_group_id=upload_dataset_id,
+            run_group_name=upload_dataset_name,
         )
         result = job.to_dict()
         result["dataset_id"] = upload_dataset_id
@@ -676,13 +795,22 @@ def post_inference_job_from_dataset(body: Dict[str, Any] = Body(...)) -> Dict[st
     if not paths:
         raise HTTPException(status_code=400, detail="dataset has no PDF files")
     hooks_name = str((body or {}).get("hooks") or "agentic_config").strip() or "agentic_config"
+    next_v = _next_dataset_run_version(info["id"])
+    now = datetime.now()
+    display_time = now.strftime("%Y-%m-%d %H:%M")
+    ts_slug = now.strftime("%Y%m%d-%H%M%S")
+    ds_name = info.get("name") or info["id"]
+    run_group_id = f"{info['id']}-run-v{next_v}-{ts_slug}"
+    run_group_name = f"{ds_name}-run-v{next_v} ({display_time})"
     try:
         job = _INFERENCE_JOB_MANAGER.start(
             paths=paths,
             hooks=hooks_name,
             dataset_id=info["id"],
-            dataset_name=info.get("name") or info["id"],
+            dataset_name=ds_name,
             dataset_source=info["source"],
+            run_group_id=run_group_id,
+            run_group_name=run_group_name,
         )
         return job.to_dict()
     except ValueError as exc:
@@ -1364,11 +1492,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .dataset-group { border-bottom: 1px solid var(--line); }
     .dataset-group > summary {
       cursor: pointer; list-style: none; padding: 10px 14px;
-      display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+      display: flex; gap: 8px; align-items: baseline; justify-content: space-between;
       background: #151c26; color: var(--text); font-size: 12px; font-weight: 600;
     }
     .dataset-group > summary::-webkit-details-marker { display: none; }
-    .dataset-group > summary .count { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; }
+    .dataset-group > summary .group-title { flex: 1; word-break: break-word; }
+    .dataset-group > summary .count { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; white-space: nowrap; margin-left: auto; }
     .dataset-group .run { padding-left: 18px; }
     .upload-status {
       font-size: 11px; color: var(--muted); line-height: 1.45;
@@ -1653,7 +1782,7 @@ function renderUploadPanel() {
   const pct = job.progress_pct ?? (job.total ? Math.round(100 * job.completed / job.total) : 0);
   const cur = job.current ? ` · ${esc(job.current.filename)}` : "";
   const failed = job.failed ? ` · failed ${job.failed}` : "";
-  const ds = job.dataset_name ? ` · ${esc(job.dataset_name)}` : "";
+  const ds = (job.run_group_name || job.dataset_name) ? ` · ${esc(job.run_group_name || job.dataset_name)}` : "";
   statusEl.className = `upload-status ${job.status === "running" || job.status === "queued" ? "running" : (job.failed ? "error" : "done")}`;
   statusEl.innerHTML = `
     <div><b>${esc(job.status)}</b> ${job.completed}/${job.total} (${pct}%)${ds}${cur}${failed}</div>
@@ -1796,13 +1925,19 @@ function groupRuns(runs) {
   const groups = [];
   const index = new Map();
   for (const r of runs) {
-    const grouped = Boolean(r.dataset_id);
-    const key = grouped ? `${r.dataset_source || "managed"}/${r.dataset_id}` : "ungrouped";
+    const groupId = r.run_group_id || r.dataset_id;
+    const grouped = Boolean(groupId);
+    const key = grouped ? `${r.dataset_source || "managed"}/${groupId}` : "ungrouped";
     if (!index.has(key)) {
       index.set(key, groups.length);
+      const name = grouped
+        ? (r.run_group_name || r.dataset_name || r.dataset_id)
+        : "Ungrouped";
       groups.push({
         key,
-        name: grouped ? (r.dataset_name || r.dataset_id) : "Ungrouped",
+        name,
+        dataset_id: r.dataset_id,
+        run_group_id: r.run_group_id,
         runs: [],
         latest: 0,
       });
@@ -1846,7 +1981,7 @@ function renderRuns() {
       return `
         <details class="dataset-group" data-group="${esc(g.key)}" ${open ? "open" : ""}>
           <summary>
-            ${esc(g.name)}
+            <span class="group-title">${esc(g.name)}</span>
             <span class="count">${nOk}/${g.runs.length}</span>
           </summary>
           ${g.runs.map(runItemHtml).join("")}
@@ -3205,10 +3340,10 @@ function renderMasterOutput() {
       const text = ev.text || ev.evidence_quote || "";
       return page ? `[${page}] ${text}` : text;
     }).filter(Boolean).join(" · ") || (item.evidence_quote || "");
-    const reasons = item.search_reasons || item.page_reasons || {};
+    const reasons = item.search_reasons || item.page_reasons || (item.reason ? { not_found: item.reason } : {});
     const reasonText = (reasons && typeof reasons === "object")
-      ? Object.entries(reasons).map(([p, t]) => `p${p}: ${t}`).join(" · ")
-      : "";
+      ? Object.entries(reasons).map(([p, t]) => (String(p).match(/^\d+$/) ? `p${p}: ${t}` : `${p}: ${t}`)).join(" · ")
+      : (typeof reasons === "string" ? reasons : (item.reason || ""));
     const found = item.found;
     const foundBadge = found === true
       ? `<span class="tree-badge ok">found</span>`
@@ -3627,7 +3762,7 @@ function renderEval() {
           </div>
           <div class="ev-block">
             <span class="ev-label search">SearchAgent page_reasons</span>
-            <div class="ev-text">${esc(sr.pred || "(empty)")}</div>
+            <div class="ev-text">${esc(sr.pred || row.reason || "(empty)")}</div>
           </div>
           ${chunkJumpRows ? `<div class="ev-block">
             <span class="ev-label search">SearchAgent chunks</span>

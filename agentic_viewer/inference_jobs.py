@@ -81,6 +81,8 @@ class InferenceJob:
     dataset_id: Optional[str] = None
     dataset_name: Optional[str] = None
     dataset_source: Optional[str] = None
+    run_group_id: Optional[str] = None
+    run_group_name: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         total = len(self.tasks)
@@ -110,6 +112,8 @@ class InferenceJob:
             "dataset_id": self.dataset_id,
             "dataset_name": self.dataset_name,
             "dataset_source": self.dataset_source,
+            "run_group_id": self.run_group_id,
+            "run_group_name": self.run_group_name,
         }
 
 
@@ -146,6 +150,8 @@ class InferenceJobManager:
         dataset_id: Optional[str] = None,
         dataset_name: Optional[str] = None,
         dataset_source: Optional[str] = None,
+        run_group_id: Optional[str] = None,
+        run_group_name: Optional[str] = None,
     ) -> InferenceJob:
         tasks: List[InferenceTask] = []
         bytes_list: List[Optional[bytes]] = []
@@ -186,6 +192,8 @@ class InferenceJobManager:
             dataset_id=dataset_id,
             dataset_name=dataset_name,
             dataset_source=dataset_source,
+            run_group_id=run_group_id,
+            run_group_name=run_group_name,
         )
         with self._lock:
             self._jobs[job_id] = job
@@ -207,6 +215,10 @@ class InferenceJobManager:
             extra["dataset_id"] = job.dataset_id
             extra["dataset_name"] = job.dataset_name or job.dataset_id
             extra["dataset_source"] = job.dataset_source
+        if job.run_group_id:
+            extra["run_group_id"] = job.run_group_id
+        if job.run_group_name:
+            extra["run_group_name"] = job.run_group_name
         return extra
 
     def _run_job(self, job_id: str) -> None:

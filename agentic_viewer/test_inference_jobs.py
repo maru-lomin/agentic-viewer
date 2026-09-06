@@ -89,6 +89,8 @@ class InferenceJobManagerTests(unittest.TestCase):
                 dataset_id="evaluation-v2",
                 dataset_name="evaluation-v2",
                 dataset_source="folder",
+                run_group_id="evaluation-v2-run-v1",
+                run_group_name="evaluation-v2-run-v1 (2026-09-06 11:00)",
             )
             deadline = time.time() + 5
             while time.time() < deadline:
@@ -105,8 +107,11 @@ class InferenceJobManagerTests(unittest.TestCase):
             meta = json.loads((runs_root / run_id / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["dataset_id"], "evaluation-v2")
             self.assertEqual(meta["source_filename"], "doc.pdf")
+            self.assertEqual(meta["run_group_id"], "evaluation-v2-run-v1")
+            self.assertEqual(meta["run_group_name"], "evaluation-v2-run-v1 (2026-09-06 11:00)")
             extra = mock_invoke.call_args.kwargs.get("extra") or {}
             self.assertEqual(extra.get("dataset_id"), "evaluation-v2")
+            self.assertEqual(extra.get("run_group_id"), "evaluation-v2-run-v1")
         finally:
             tmp.cleanup()
 

@@ -59,7 +59,8 @@ def _format_search_reasons(reasons: Any) -> str:
         for page, text in sorted(reasons.items(), key=lambda kv: _page_key(kv[0])):
             note = str(text or "").strip()
             if note:
-                lines.append(f"p{page}: {note}")
+                prefix = f"p{page}" if str(page).isdigit() else str(page)
+                lines.append(f"{prefix}: {note}")
         return "\n".join(lines)
     if isinstance(reasons, list):
         return _join_evidence_texts(reasons)
@@ -81,7 +82,8 @@ def _format_page_chunk_ids(chunk_ids: Any) -> str:
         for page, cid in sorted(chunk_ids.items(), key=lambda kv: _page_key(kv[0])):
             text = str(cid or "").strip()
             if text:
-                lines.append(f"p{page}: {text}")
+                prefix = f"p{page}" if str(page).isdigit() else str(page)
+                lines.append(f"{prefix}: {text}")
         return "\n".join(lines)
     return str(chunk_ids).strip()
 
@@ -128,20 +130,64 @@ def resolve_document_name(
     )
 
 
+def extract_fallback_reasons(pred: Dict[str, Any]) -> Dict[str, str]:
+    """Extract per-key search reasons from agent_trace or search_agent_traces if not in kv_results."""
+    reasons: Dict[str, str] = {}
+    if not isinstance(pred, dict):
+        return reasons
+
+    for item in pred.get("search_agent_traces") or []:
+        if isinstance(item, dict):
+            k = str(item.get("key") or "").strip()
+            r = str(item.get("reason") or "").strip()
+            if k and r:
+                reasons[k] = r
+
+    for step in pred.get("agent_trace") or []:
+        if not isinstance(step, dict):
+            continue
+        for tc in step.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            prev = tc.get("result_preview")
+            if isinstance(prev, dict):
+                for c in prev.get("completed") or []:
+                    if isinstance(c, dict):
+                        k = str(c.get("key") or "").strip()
+                        r = str(c.get("reason") or "").strip()
+                        if k and r:
+                            reasons[k] = r
+    return reasons
+
+
 def index_pred_by_key(
     kv_results: Sequence[Dict[str, Any]],
+    *,
+    fallback_reasons: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
+    fallbacks = fallback_reasons or {}
     for row in kv_results or []:
         if not isinstance(row, dict) or "key" not in row:
             continue
-        out[str(row["key"])] = row
+        k = str(row["key"])
+        r = dict(row)
+        if (
+            k in fallbacks
+            and not r.get("search_reasons")
+            and not r.get("page_reasons")
+            and not r.get("reason")
+        ):
+            r["reason"] = fallbacks[k]
+        out[k] = r
     return out
 
 
 def evaluate_document(
     pred_rows: Dict[str, Dict[str, Any]],
     gold_doc: Dict[str, Any],
+    *,
+    fallback_reasons: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     per_key: List[Dict[str, Any]] = []
     em_flags: List[float] = []
@@ -180,9 +226,18 @@ def evaluate_document(
         # VLM extract_kv_vlm evidence_quote (not SearchAgent page_reasons).
         pred_evid = _join_evidence_texts(pred.get("evidence") or [])
         e_f1 = token_f1(pred_evid, gold_evid)
-        search_reasons = _format_search_reasons(
-            pred.get("search_reasons") or pred.get("page_reasons") or {}
+
+        key_fallback = (fallback_reasons or {}).get(key)
+        reason_val = pred.get("reason") or key_fallback or ""
+        raw_reasons = (
+            pred.get("search_reasons")
+            or pred.get("page_reasons")
+            or ({"not_found": reason_val} if reason_val else {})
         )
+        if isinstance(raw_reasons, str) and raw_reasons.strip():
+            raw_reasons = {"not_found": raw_reasons.strip()}
+
+        search_reasons = _format_search_reasons(raw_reasons)
         page_chunk_id = _format_page_chunk_ids(pred.get("page_chunk_id") or {})
 
         em_flags.append(1.0 if em else 0.0)
@@ -262,12 +317,17 @@ def build_pred_only_report(
     answer_sheet_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build an eval-shaped report from predictions when GT is missing."""
-    pred_rows = index_pred_by_key(pred.get("kv_results") or [])
+    fallback_reasons = extract_fallback_reasons(pred)
+    pred_rows = index_pred_by_key(
+        pred.get("kv_results") or [], fallback_reasons=fallback_reasons
+    )
     empty_gold = {
         k: {"value": "", "evidences": [], "evidence_pages": []}
         for k in pred_rows
     }
-    scored = evaluate_document(pred_rows, empty_gold)
+    scored = evaluate_document(
+        pred_rows, empty_gold, fallback_reasons=fallback_reasons
+    )
     return {
         "document": document,
         "has_gt": False,
@@ -290,8 +350,13 @@ def build_report(
     if not isinstance(gold_doc, dict):
         raise ValueError(f"invalid gold entry for {doc_name}")
 
-    pred_rows = index_pred_by_key(pred.get("kv_results") or [])
-    scored = evaluate_document(pred_rows, gold_doc)
+    fallback_reasons = extract_fallback_reasons(pred)
+    pred_rows = index_pred_by_key(
+        pred.get("kv_results") or [], fallback_reasons=fallback_reasons
+    )
+    scored = evaluate_document(
+        pred_rows, gold_doc, fallback_reasons=fallback_reasons
+    )
     return {
         "document": doc_name,
         "has_gt": True,
