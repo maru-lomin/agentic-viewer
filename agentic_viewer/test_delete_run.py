@@ -57,9 +57,53 @@ class DeleteRunTests(unittest.TestCase):
             status="running",
         )
         with self.assertRaises(HTTPException) as ctx:
-            app_module.delete_run("agentic-busy")
+            app_module.delete_run("agentic-busy", force=False)
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertTrue((self.runs_root / "agentic-busy").is_dir())
+
+    @patch.object(app_module._BATCH_MANAGER, "get_active_job")
+    def test_delete_run_force_when_batch_active(self, mock_active) -> None:
+        from agentic_viewer.evaluation.batch import BatchJob
+
+        run_dir = self._make_run("agentic-busy-force")
+        mock_active.return_value = BatchJob(
+            job_id="batch-1",
+            run_ids=["agentic-busy-force"],
+            skip_existing=True,
+            status="running",
+        )
+        result = app_module.delete_run("agentic-busy-force", force=True)
+        self.assertTrue(result["ok"])
+        self.assertFalse(run_dir.exists())
+
+    def test_delete_running_status_run(self) -> None:
+        run_dir = self.runs_root / "agentic-running-run"
+        run_dir.mkdir()
+        (run_dir / "meta.json").write_text(
+            json.dumps({"run_id": "agentic-running-run", "status": "running"}),
+            encoding="utf-8",
+        )
+        result = app_module.delete_run("agentic-running-run")
+        self.assertTrue(result["ok"])
+        self.assertFalse(run_dir.exists())
+
+    def test_delete_runs_batch(self) -> None:
+        r1 = self._make_run("batch-run-1")
+        r2 = self._make_run("batch-run-2")
+        r3 = self._make_run("batch-run-3")
+
+        result = app_module.delete_runs_batch({"run_ids": ["batch-run-1", "batch-run-2"]})
+        self.assertEqual(result["total_deleted"], 2)
+        self.assertIn("batch-run-1", result["deleted"])
+        self.assertIn("batch-run-2", result["deleted"])
+        self.assertFalse(r1.exists())
+        self.assertFalse(r2.exists())
+        self.assertTrue(r3.exists())
+
+    def test_delete_runs_batch_invalid_input(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.delete_runs_batch({"run_ids": "not-a-list"})
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 if __name__ == "__main__":

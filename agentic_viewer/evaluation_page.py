@@ -23,9 +23,11 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     * { box-sizing: border-box; }
     body {
       margin: 0; background: var(--bg); color: var(--text);
-      font-family: var(--sans); min-height: 100vh;
+      font-family: var(--sans); height: 100vh;
+      display: flex; flex-direction: column; overflow: hidden;
     }
     header {
+      flex: 0 0 auto;
       padding: 14px 20px; border-bottom: 1px solid var(--line);
       display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
     }
@@ -40,18 +42,37 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .topnav a.active {
       color: var(--text); background: var(--panel); border-color: var(--line);
     }
-    main { display: grid; grid-template-columns: 300px 1fr; min-height: calc(100vh - 54px); }
+    main {
+      flex: 1 1 0;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      overflow: hidden;
+    }
     aside {
-      border-right: 1px solid var(--line); overflow: auto; background: #121820;
+      border-right: 1px solid var(--line);
+      background: #121820;
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
       padding: 10px;
     }
-    section { overflow: auto; padding: 16px 20px; }
+    section {
+      overflow-y: auto;
+      overflow-x: hidden;
+      height: 100%;
+      min-height: 0;
+      padding: 16px 20px;
+    }
     .toolbar {
-      display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; align-items: center;
+      flex: 0 0 auto;
+      display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; align-items: center;
     }
     .toolbar button, .toolbar label.btn {
-      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
-      background: #152033; color: var(--text); font-size: 12px; cursor: pointer;
+      padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line);
+      background: #152033; color: var(--text); font-size: 11px; cursor: pointer;
     }
     .toolbar button:hover, .toolbar label.btn:hover { border-color: var(--accent); }
     .toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -62,9 +83,70 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
       background: #3a2024; border-color: #7a4048; color: #f0b0b4;
     }
     .toolbar label.btn { display: inline-flex; align-items: center; gap: 6px; }
+    #runList {
+      flex: 1 1 0;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line) transparent;
+      padding-right: 2px;
+    }
+    #runList::-webkit-scrollbar { width: 6px; }
+    #runList::-webkit-scrollbar-track { background: transparent; }
+    #runList::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+    #runList::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+    .dataset-group {
+      border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px;
+      background: #10151c; overflow: hidden;
+    }
+    .dataset-group > summary {
+      cursor: pointer; list-style: none; padding: 8px 10px;
+      display: flex; gap: 8px; align-items: center; justify-content: space-between;
+      background: #151c26; color: var(--text); font-size: 12px; font-weight: 600;
+      user-select: none;
+    }
+    .dataset-group > summary::-webkit-details-marker { display: none; }
+    .dataset-group > summary:hover { background: #1a2332; }
+    .dataset-group > summary .group-select-wrap {
+      display: flex; align-items: center; justify-content: center;
+    }
+    .dataset-group > summary .group-select-cb {
+      margin: 0; cursor: pointer;
+    }
+    .dataset-group > summary .group-title {
+      flex: 1; word-break: break-word; line-height: 1.3;
+    }
+    .dataset-group > summary .group-actions {
+      display: flex; align-items: center; gap: 6px; margin-left: auto;
+    }
+    .dataset-group > summary .count {
+      color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; white-space: nowrap;
+    }
+    .dataset-group > summary .count .sel-count {
+      color: var(--accent); font-weight: 600;
+    }
+    .dataset-group > summary .group-delete-btn {
+      background: transparent; border: 1px solid transparent; color: var(--muted);
+      border-radius: 4px; padding: 2px 6px; font-size: 11px; cursor: pointer; line-height: 1.2;
+    }
+    .dataset-group > summary .group-delete-btn:hover {
+      color: var(--err); border-color: #7a3a3f; background: rgba(240, 113, 120, 0.08);
+    }
+    .run-delete-btn {
+      flex: 0 0 auto; background: transparent; border: 1px solid transparent;
+      color: var(--muted); border-radius: 4px; cursor: pointer; font-size: 14px;
+      line-height: 1; padding: 1px 5px; margin-left: auto;
+    }
+    .run-delete-btn:hover {
+      color: var(--err); border-color: #7a3a3f; background: rgba(240, 113, 120, 0.08);
+    }
+    .dataset-group-body {
+      padding: 6px; display: flex; flex-direction: column; gap: 6px;
+    }
     .run-item {
       border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
-      margin-bottom: 8px; background: var(--panel); cursor: pointer;
+      background: var(--panel); cursor: pointer;
     }
     .run-item:hover { border-color: #3d4f66; }
     .run-item.selected { border-color: var(--accent); background: #1a2a40; }
@@ -75,6 +157,13 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
     .run-doc { font-size: 13px; font-weight: 600; line-height: 1.3; word-break: break-word; }
     .run-id { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
     .run-item .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+    @media (max-width: 960px) {
+      body { height: auto; min-height: 100vh; overflow: auto; }
+      main { display: flex; flex-direction: column; height: auto; overflow: visible; }
+      aside { height: auto; overflow: visible; }
+      #runList { max-height: 380px; }
+      section { height: auto; overflow: visible; }
+    }
     .badge {
       display: inline-block; padding: 1px 6px; border-radius: 4px;
       font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
@@ -210,6 +299,8 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
       <div class="toolbar">
         <button type="button" id="selectFinished">Select finished</button>
         <button type="button" id="clearSelection">Clear</button>
+        <button type="button" id="deleteSelectedRuns" class="danger">Delete selected</button>
+        <button type="button" id="toggleAllGroups">Expand all</button>
       </div>
       <div id="runList"></div>
     </aside>
@@ -221,6 +312,7 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
 const state = {
   runs: [],
   selected: new Set(),
+  expandedGroups: new Set(),
   summary: null,
   loading: false,
   error: null,
@@ -237,6 +329,39 @@ const state = {
   agenticInflight: null,
   agenticEvalError: null,
 };
+
+function groupRuns(runs) {
+  const groups = [];
+  const index = new Map();
+  for (const r of runs) {
+    const groupId = r.run_group_id || r.dataset_id;
+    const grouped = Boolean(groupId);
+    const key = grouped ? `${r.dataset_source || "managed"}/${groupId}` : "ungrouped";
+    if (!index.has(key)) {
+      index.set(key, groups.length);
+      const name = grouped
+        ? (r.run_group_name || r.dataset_name || r.dataset_id)
+        : "Ungrouped";
+      groups.push({
+        key,
+        name,
+        dataset_id: r.dataset_id,
+        run_group_id: r.run_group_id,
+        runs: [],
+        latest: 0,
+      });
+    }
+    const g = groups[index.get(key)];
+    g.runs.push(r);
+    const ts = Date.parse(r.started_at || "") || 0;
+    if (ts > g.latest) g.latest = ts;
+  }
+  groups.sort((a, b) => b.latest - a.latest);
+  for (const g of groups) {
+    g.runs.sort((a, b) => (Date.parse(b.started_at || "") || 0) - (Date.parse(a.started_at || "") || 0));
+  }
+  return groups;
+}
 
 function viewRunIds() {
   if (state.batchViewFocused && state.batchJob?.run_ids?.length) {
@@ -617,6 +742,15 @@ async function apiPost(path, body) {
   return data;
 }
 
+async function apiDelete(path) {
+  const r = await fetch(path, { method: "DELETE" });
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+  if (!r.ok) throw new Error(data.detail || text || r.statusText);
+  return data;
+}
+
 async function runAgenticEval(runId, key) {
   if (!runId || !key) return;
   if (batchIsActive()) return;
@@ -766,42 +900,112 @@ function renderBatchPanel() {
   return running ? statusHtml : `${statusHtml}${renderBatchStartControls()}`;
 }
 
+function renderRunItemHtml(r) {
+  const checked = state.selected.has(r.run_id) ? "checked" : "";
+  const inBatch = batchRunSet().has(r.run_id);
+  const sel = state.selected.has(r.run_id) ? "selected" : "";
+  const batchCls = inBatch && state.batchViewFocused ? " batch-run" : "";
+  const es = r.eval_summary;
+  const ae = r.agentic_eval_summary;
+  const baseline = es
+    ? `EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)}`
+    : "no baseline eval";
+  const agentic = ae
+    ? `agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · pred acc ${fmtPct(ae.accuracy)}` : ""}${ae.gold_validity != null ? ` · GT valid ${fmtPct(ae.gold_validity)}` : ""}`
+    : "agentic —";
+  const badgeCls = r.status === "ok" ? "ok" : (r.status === "error" ? "error" : "warn");
+  return `
+    <div class="run-item ${sel}${batchCls}" data-id="${esc(r.run_id)}">
+      <div class="row1">
+        <input type="checkbox" ${checked} data-run-check="${esc(r.run_id)}" />
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:6px">
+            <div class="id">${runLabelHtml(r)}</div>
+            <button type="button" class="run-delete-btn" data-delete-run="${esc(r.run_id)}"
+              title="Delete run" aria-label="Delete run">×</button>
+          </div>
+          <div class="sub">
+            <span class="badge ${badgeCls}">${esc(r.status)}</span>
+            ${r.seconds != null ? `${r.seconds}s` : ""} · kv=${r.n_kv ?? "?"}
+          </div>
+          <div class="sub">${esc(baseline)}</div>
+          <div class="sub">${esc(agentic)}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function updateGroupToggleBtn() {
+  const btn = document.getElementById("toggleAllGroups");
+  if (!btn) return;
+  const groups = groupRuns(state.runs);
+  if (!groups.length) return;
+  const allOpen = groups.length > 0 && groups.every(g => state.expandedGroups.has(g.key));
+  btn.textContent = allOpen ? "Collapse all" : "Expand all";
+}
+
 function renderRunList() {
   const el = document.getElementById("runList");
   if (!state.runs.length) {
     el.innerHTML = `<div class="empty">No runs found</div>`;
+    updateGroupToggleBtn();
     return;
   }
-  el.innerHTML = state.runs.map(r => {
-    const checked = state.selected.has(r.run_id) ? "checked" : "";
-    const inBatch = batchRunSet().has(r.run_id);
-    const sel = state.selected.has(r.run_id) ? "selected" : "";
-    const batchCls = inBatch && state.batchViewFocused ? " batch-run" : "";
-    const es = r.eval_summary;
-    const ae = r.agentic_eval_summary;
-    const baseline = es
-      ? `EM ${fmtPct(es.value_exact_match)} · pageF1 ${fmtPct(es.page_f1_macro)}`
-      : "no baseline eval";
-    const agentic = ae
-      ? `agentic ${ae.n_done}/${ae.n_total}${ae.accuracy != null ? ` · pred acc ${fmtPct(ae.accuracy)}` : ""}${ae.gold_validity != null ? ` · GT valid ${fmtPct(ae.gold_validity)}` : ""}`
-      : "agentic —";
-    const badgeCls = r.status === "ok" ? "ok" : (r.status === "error" ? "error" : "warn");
+  const prevScrollTop = el.scrollTop;
+  const groups = groupRuns(state.runs);
+  el.innerHTML = groups.map(g => {
+    const open = state.expandedGroups.has(g.key);
+    const nSel = g.runs.filter(r => state.selected.has(r.run_id)).length;
+    const allChecked = g.runs.length > 0 && nSel === g.runs.length;
     return `
-      <div class="run-item ${sel}${batchCls}" data-id="${esc(r.run_id)}">
-        <div class="row1">
-          <input type="checkbox" ${checked} data-run-check="${esc(r.run_id)}" />
-          <div>
-            <div class="id">${runLabelHtml(r)}</div>
-            <div class="sub">
-              <span class="badge ${badgeCls}">${esc(r.status)}</span>
-              ${r.seconds != null ? `${r.seconds}s` : ""} · kv=${r.n_kv ?? "?"}
-            </div>
-            <div class="sub">${esc(baseline)}</div>
-            <div class="sub">${esc(agentic)}</div>
-          </div>
+      <details class="dataset-group" data-group="${esc(g.key)}" ${open ? "open" : ""}>
+        <summary>
+          <span class="group-select-wrap">
+            <input type="checkbox" class="group-select-cb" data-group-check="${esc(g.key)}"
+              ${allChecked ? "checked" : ""} title="Select / deselect all in group" />
+          </span>
+          <span class="group-title" title="${esc(g.name)}">${esc(g.name)}</span>
+          <span class="group-actions">
+            <span class="count">${nSel ? `<span class="sel-count">${nSel}/</span>` : ""}${g.runs.length}</span>
+            <button type="button" class="group-delete-btn" data-delete-group="${esc(g.key)}"
+              title="Delete all ${g.runs.length} run(s) in this group">Delete</button>
+          </span>
+        </summary>
+        <div class="dataset-group-body">
+          ${g.runs.map(renderRunItemHtml).join("")}
         </div>
-      </div>`;
+      </details>`;
   }).join("");
+
+  el.scrollTop = prevScrollTop;
+
+  // Set indeterminate state for partially selected groups
+  el.querySelectorAll("[data-group-check]").forEach(cb => {
+    const gKey = cb.dataset.groupCheck;
+    const g = groups.find(x => x.key === gKey);
+    if (g) {
+      const nSel = g.runs.filter(r => state.selected.has(r.run_id)).length;
+      cb.indeterminate = nSel > 0 && nSel < g.runs.length;
+    }
+  });
+
+  el.querySelectorAll("[data-group-check]").forEach(cb => {
+    cb.onclick = (e) => {
+      e.stopPropagation();
+      const gKey = cb.dataset.groupCheck;
+      const g = groups.find(x => x.key === gKey);
+      if (!g) return;
+      const checkAll = cb.checked;
+      for (const r of g.runs) {
+        if (checkAll) state.selected.add(r.run_id);
+        else state.selected.delete(r.run_id);
+      }
+      state.batchViewFocused = false;
+      syncUrl();
+      renderRunList();
+      loadSummary();
+    };
+  });
 
   el.querySelectorAll("[data-run-check]").forEach(cb => {
     cb.onclick = (e) => {
@@ -809,18 +1013,130 @@ function renderRunList() {
       toggleRun(cb.dataset.runCheck, cb.checked);
     };
   });
+
+  el.querySelectorAll("[data-delete-run]").forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      deleteRun(btn.dataset.deleteRun, e);
+    };
+  });
+
+  el.querySelectorAll("[data-delete-group]").forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      deleteGroup(btn.dataset.deleteGroup, e);
+    };
+  });
+
   el.querySelectorAll(".run-item").forEach(node => {
     node.onclick = (e) => {
-      if (e.target.matches("input")) return;
+      if (e.target.matches("input") || e.target.matches("button")) return;
       const id = node.dataset.id;
       toggleRun(id, !state.selected.has(id));
     };
   });
+
+  el.querySelectorAll(".dataset-group").forEach(node => {
+    node.addEventListener("toggle", () => {
+      if (node.open) state.expandedGroups.add(node.dataset.group);
+      else state.expandedGroups.delete(node.dataset.group);
+      updateGroupToggleBtn();
+    });
+  });
+
+  updateGroupToggleBtn();
+}
+
+async function deleteRun(runId, ev) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  if (!runId) return;
+  const r = runRecord(runId);
+  const isRunning = r && r.status === "running";
+  const label = runLabelText(runId);
+  const msg = isRunning
+    ? `Delete this running run permanently?\n\n${label}\n\n(This will cancel active tasks and remove the run directory.)`
+    : `Delete this run permanently?\n\n${label}`;
+  if (!confirm(msg)) return;
+  try {
+    await apiDelete(`/api/runs/${encodeURIComponent(runId)}?force=true`);
+    state.runs = state.runs.filter(item => item.run_id !== runId);
+    state.selected.delete(runId);
+    renderRunList();
+    loadSummary();
+  } catch (err) {
+    alert("Failed to delete run: " + String(err.message || err));
+  }
+}
+
+async function deleteGroup(groupKey, ev) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  const groups = groupRuns(state.runs);
+  const grp = groups.find(g => g.key === groupKey);
+  if (!grp || !grp.runs.length) return;
+
+  const nRuns = grp.runs.length;
+  const hasRunning = grp.runs.some(r => r.status === "running");
+  const msg = hasRunning
+    ? `Delete all ${nRuns} run(s) in group "${grp.name}" permanently?\n\n(Includes running runs. This cannot be undone.)`
+    : `Delete all ${nRuns} run(s) in group "${grp.name}" permanently?\n\nThis cannot be undone.`;
+  if (!confirm(msg)) return;
+
+  try {
+    const runIds = grp.runs.map(r => r.run_id);
+    const res = await apiPost("/api/runs/delete-batch", { run_ids: runIds, force: true });
+    const deletedSet = new Set(res.deleted || runIds);
+    state.runs = state.runs.filter(r => !deletedSet.has(r.run_id));
+    for (const rid of deletedSet) state.selected.delete(rid);
+    state.expandedGroups.delete(groupKey);
+    renderRunList();
+    loadSummary();
+  } catch (err) {
+    alert("Failed to delete group: " + String(err.message || err));
+  }
+}
+
+async function deleteSelectedRuns() {
+  const ids = [...state.selected];
+  if (!ids.length) {
+    alert("No runs selected to delete.");
+    return;
+  }
+  const hasRunning = ids.some(id => {
+    const r = runRecord(id);
+    return r && r.status === "running";
+  });
+  const msg = hasRunning
+    ? `Delete ${ids.length} selected run(s) permanently?\n\n(Includes running runs. This cannot be undone.)`
+    : `Delete ${ids.length} selected run(s) permanently?\n\nThis cannot be undone.`;
+  if (!confirm(msg)) return;
+
+  try {
+    const res = await apiPost("/api/runs/delete-batch", { run_ids: ids, force: true });
+    const deletedSet = new Set(res.deleted || ids);
+    state.runs = state.runs.filter(r => !deletedSet.has(r.run_id));
+    state.selected.clear();
+    renderRunList();
+    loadSummary();
+  } catch (err) {
+    alert("Failed to delete selected runs: " + String(err.message || err));
+  }
 }
 
 function toggleRun(runId, on) {
-  if (on) state.selected.add(runId);
-  else state.selected.delete(runId);
+  if (on) {
+    state.selected.add(runId);
+    const groups = groupRuns(state.runs);
+    const grp = groups.find(g => g.runs.some(r => r.run_id === runId));
+    if (grp) state.expandedGroups.add(grp.key);
+  } else {
+    state.selected.delete(runId);
+  }
   state.batchViewFocused = false;
   syncUrl();
   renderRunList();
@@ -831,6 +1147,13 @@ function focusBatchJob() {
   if (!state.batchJob?.run_ids?.length) return;
   state.batchViewFocused = true;
   persistBatchJobId(state.batchJob.job_id);
+  const batchSet = new Set(state.batchJob.run_ids);
+  const groups = groupRuns(state.runs);
+  for (const g of groups) {
+    if (g.runs.some(r => batchSet.has(r.run_id))) {
+      state.expandedGroups.add(g.key);
+    }
+  }
   syncUrl();
   renderRunList();
   loadSummary();
@@ -846,8 +1169,14 @@ function renderSummaryBody() {
   const runRows = (s.per_run || []).map(r => {
     const b = r.baseline || {};
     const a = r.agentic || {};
+    const rec = runRecord(r.run_id);
+    const grpName = rec.run_group_name || rec.dataset_name;
+    const grpBadge = grpName ? `<div class="cell-sub" style="color:var(--accent);margin-top:2px">${esc(grpName)}</div>` : "";
     return `<tr>
-      <td><a href="/?run=${encodeURIComponent(r.run_id)}&tab=eval">${runLabelHtml({ run_id: r.run_id, document: r.document })}</a></td>
+      <td>
+        <a href="/?run=${encodeURIComponent(r.run_id)}&tab=eval">${runLabelHtml({ run_id: r.run_id, document: r.document })}</a>
+        ${grpBadge}
+      </td>
       <td>${r.has_baseline_eval ? fmtPct(b.value_exact_match) : "—"}</td>
       <td>${r.has_baseline_eval ? fmtPct(b.page_f1_macro) : "—"}</td>
       <td>${r.has_baseline_eval ? fmtPct(b.evidence_token_f1) : "—"}</td>
@@ -1236,7 +1565,14 @@ async function resumeActiveJob() {
 }
 
 document.getElementById("selectFinished").onclick = () => {
-  state.runs.filter(r => r.status === "ok").forEach(r => state.selected.add(r.run_id));
+  const okRuns = state.runs.filter(r => r.status === "ok");
+  okRuns.forEach(r => state.selected.add(r.run_id));
+  const groups = groupRuns(state.runs);
+  for (const g of groups) {
+    if (g.runs.some(r => r.status === "ok")) {
+      state.expandedGroups.add(g.key);
+    }
+  }
   state.batchViewFocused = false;
   syncUrl();
   renderRunList();
@@ -1251,6 +1587,25 @@ document.getElementById("clearSelection").onclick = () => {
   loadSummary();
 };
 
+const deleteSelectedBtn = document.getElementById("deleteSelectedRuns");
+if (deleteSelectedBtn) {
+  deleteSelectedBtn.onclick = deleteSelectedRuns;
+}
+
+const toggleAllBtn = document.getElementById("toggleAllGroups");
+if (toggleAllBtn) {
+  toggleAllBtn.onclick = () => {
+    const groups = groupRuns(state.runs);
+    const allOpen = groups.length > 0 && groups.every(g => state.expandedGroups.has(g.key));
+    if (allOpen) {
+      state.expandedGroups.clear();
+    } else {
+      for (const g of groups) state.expandedGroups.add(g.key);
+    }
+    renderRunList();
+  };
+}
+
 (async function init() {
   const params = new URLSearchParams(location.search);
   state.selected = parseSelectedFromUrl();
@@ -1261,6 +1616,17 @@ document.getElementById("clearSelection").onclick = () => {
   state.runs = await api("/api/runs");
   document.getElementById("headerMeta").textContent =
     `${state.runs.length} run(s) · ${location.origin}`;
+
+  // If runs are already selected (e.g. from URL), expand those groups
+  if (state.selected.size > 0) {
+    const groups = groupRuns(state.runs);
+    for (const g of groups) {
+      if (g.runs.some(r => state.selected.has(r.run_id))) {
+        state.expandedGroups.add(g.key);
+      }
+    }
+  }
+
   renderRunList();
   await resumeActiveJob();
   if (state.contentTab === "hierarchy") {

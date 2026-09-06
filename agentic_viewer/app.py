@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, Body, File, Form, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from agentic_viewer.datasets import DatasetStore
@@ -134,7 +134,24 @@ def _run_dir(run_id: str) -> Path:
     return path
 
 
-def _assert_run_deletable(run_id: str) -> None:
+def _assert_run_deletable(run_id: str, force: bool = False) -> None:
+    if force:
+        _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
+        active_infer = _INFERENCE_JOB_MANAGER.get_active_job()
+        if active_infer and active_infer.status in {"queued", "running"}:
+            for task in active_infer.tasks:
+                if task.run_id == run_id and task.status in {"pending", "running"}:
+                    task.status = "cancelled"
+                    task.error = "run deleted by user"
+        active_batch = _BATCH_MANAGER.get_active_job()
+        if (
+            active_batch
+            and active_batch.status in {"queued", "running"}
+            and run_id in active_batch.run_ids
+        ):
+            active_batch.run_ids = [r for r in active_batch.run_ids if r != run_id]
+        return
+
     inflight = _AGENTIC_EVAL_INFLIGHT.get(run_id)
     if inflight:
         raise HTTPException(
@@ -375,13 +392,37 @@ def get_run(run_id: str) -> Dict[str, Any]:
 
 
 @app.delete("/api/runs/{run_id}")
-def delete_run(run_id: str) -> Dict[str, Any]:
+def delete_run(run_id: str, force: bool = Query(default=False)) -> Dict[str, Any]:
     """Remove a run directory under outputs/runs/."""
     root = _run_dir(run_id)
-    _assert_run_deletable(run_id)
+    _assert_run_deletable(run_id, force=force)
     shutil.rmtree(root)
     _AGENTIC_EVAL_INFLIGHT.pop(run_id, None)
     return {"ok": True, "run_id": run_id}
+
+
+@app.post("/api/runs/delete-batch")
+def delete_runs_batch(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Remove multiple run directories under outputs/runs/."""
+    run_ids = body.get("run_ids")
+    if not isinstance(run_ids, list):
+        raise HTTPException(status_code=400, detail="run_ids must be a list of strings")
+    force = bool(body.get("force", False))
+    deleted: List[str] = []
+    errors: Dict[str, str] = {}
+    for rid in run_ids:
+        rid_str = str(rid).strip()
+        if not rid_str:
+            continue
+        try:
+            root = _run_dir(rid_str)
+            _assert_run_deletable(rid_str, force=force)
+            shutil.rmtree(root)
+            _AGENTIC_EVAL_INFLIGHT.pop(rid_str, None)
+            deleted.append(rid_str)
+        except Exception as exc:
+            errors[rid_str] = str(exc)
+    return {"deleted": deleted, "errors": errors, "total_deleted": len(deleted)}
 
 
 @app.get("/api/runs/{run_id}/timeline")
@@ -1142,9 +1183,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
     * { box-sizing: border-box; }
     body {
       margin: 0; background: var(--bg); color: var(--text);
-      font-family: var(--sans); min-height: 100vh;
+      font-family: var(--sans); height: 100vh;
+      display: flex; flex-direction: column; overflow: hidden;
     }
     header {
+      flex: 0 0 auto;
       padding: 14px 20px; border-bottom: 1px solid var(--line);
       display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
     }
@@ -1159,9 +1202,42 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .topnav a.active {
       color: var(--text); background: var(--panel); border-color: var(--line);
     }
-    main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 58px); }
+    main {
+      flex: 1 1 0;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      overflow: hidden;
+    }
     aside {
-      border-right: 1px solid var(--line); overflow: auto; background: #121820;
+      border-right: 1px solid var(--line);
+      background: #121820;
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
+    }
+    #runList {
+      flex: 1 1 0;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line) transparent;
+    }
+    #runList::-webkit-scrollbar {
+      width: 6px;
+    }
+    #runList::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    #runList::-webkit-scrollbar-thumb {
+      background: var(--line);
+      border-radius: 3px;
+    }
+    #runList::-webkit-scrollbar-thumb:hover {
+      background: var(--muted);
     }
     .run {
       padding: 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer;
@@ -1192,7 +1268,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .badge.ok { color: var(--ok); border-color: #2a6b4f; }
     .badge.error { color: var(--err); border-color: #7a3a3f; }
     .badge.warn { color: #e0a45c; border-color: #6b5530; }
-    section { padding: 16px 20px; overflow: auto; }
+    section {
+      padding: 16px 20px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      height: 100%;
+      min-height: 0;
+    }
     .tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
     .tab {
       background: transparent; border: 1px solid var(--line); color: var(--muted);
@@ -1206,7 +1288,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     @media (max-width: 960px) {
-      main { grid-template-columns: 1fr; }
+      body { height: auto; min-height: 100vh; overflow: auto; }
+      main { display: flex; flex-direction: column; height: auto; overflow: visible; }
+      aside { height: auto; overflow: visible; }
+      #runList { max-height: 380px; }
+      section { height: auto; overflow: visible; }
       .grid2 { grid-template-columns: 1fr; }
     }
     .event {
@@ -1512,11 +1598,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .timing-live .live-title { color: #e0a45c; font-weight: 600; font-size: 13px; }
     .timing-live .live-row { font-family: var(--mono); font-size: 12px; }
     .timing-live .live-row .sess { color: #e0a45c; }
+    body.embed { height: auto; min-height: 100vh; overflow: auto; }
     body.embed header,
     body.embed aside { display: none; }
-    body.embed main { grid-template-columns: 1fr; min-height: 100vh; }
-    body.embed section { padding: 12px 14px; }
+    body.embed main { display: block; height: auto; min-height: 100vh; }
+    body.embed section { padding: 12px 14px; height: auto; overflow: visible; }
     .upload-panel {
+      flex: 0 0 auto;
+      max-height: 50vh;
+      overflow-y: auto;
       padding: 12px 14px; border-bottom: 1px solid var(--line);
       background: #121820; display: flex; flex-direction: column; gap: 8px;
     }
@@ -1550,12 +1640,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .dataset-group { border-bottom: 1px solid var(--line); }
     .dataset-group > summary {
       cursor: pointer; list-style: none; padding: 10px 14px;
-      display: flex; gap: 8px; align-items: baseline; justify-content: space-between;
+      display: flex; gap: 8px; align-items: center; justify-content: space-between;
       background: #151c26; color: var(--text); font-size: 12px; font-weight: 600;
     }
     .dataset-group > summary::-webkit-details-marker { display: none; }
+    .dataset-group > summary:hover { background: #1a2332; }
     .dataset-group > summary .group-title { flex: 1; word-break: break-word; }
-    .dataset-group > summary .count { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; white-space: nowrap; margin-left: auto; }
+    .dataset-group > summary .group-actions {
+      display: flex; align-items: center; gap: 8px; margin-left: auto;
+    }
+    .dataset-group > summary .count { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+    .dataset-group > summary .group-delete-btn {
+      background: transparent; border: 1px solid transparent; color: var(--muted);
+      border-radius: 4px; padding: 2px 6px; font-size: 11px; cursor: pointer; line-height: 1.2;
+    }
+    .dataset-group > summary .group-delete-btn:hover {
+      color: var(--err); border-color: #7a3a3f; background: rgba(240, 113, 120, 0.08);
+    }
     .dataset-group .run { padding-left: 18px; }
     .upload-status {
       font-size: 11px; color: var(--muted); line-height: 1.45;
@@ -1619,7 +1720,7 @@ const state = {
   gtEdit: null,
   batchJob: null, batchPollTimer: null,
   inferenceJob: null,
-  datasets: [], inferSource: "files", inferDataset: "", collapsedGroups: new Set(),
+  datasets: [], inferSource: "files", inferDataset: "", expandedGroups: new Set(),
   evalKey: null, embed: false,
   evalHierarchyKeys: [], evalHierarchyKeysLoading: false,
   loadedRunId: null,
@@ -1738,24 +1839,8 @@ function runLabelText(runOrId) {
 }
 
 function isRunBusy(runId) {
-  const batch = state.batchJob;
-  if (batch && (batch.status === "queued" || batch.status === "running")
-      && (batch.run_ids || []).includes(runId)) {
-    return true;
-  }
-  const infer = state.inferenceJob;
-  if (infer && (infer.status === "queued" || infer.status === "running")) {
-    for (const task of infer.tasks || []) {
-      if (task.run_id === runId && (task.status === "pending" || task.status === "running")) {
-        return true;
-      }
-    }
-  }
-  if (state.runId === runId && (state.agenticEvalInflight || []).length) {
-    return true;
-  }
-  const run = runRecord(runId);
-  return run.status === "running";
+  // Allow deleting running or busy runs
+  return false;
 }
 
 async function apiDelete(path) {
@@ -1773,15 +1858,16 @@ async function deleteRun(runId, ev) {
     ev.stopPropagation();
   }
   if (!runId) return;
-  if (isRunBusy(runId)) {
-    alert("Cannot delete this run while extraction or evaluation is in progress.");
-    return;
-  }
+  const r = runRecord(runId);
+  const isRunning = r && r.status === "running";
   const label = runLabelText(runId);
-  if (!confirm(`Delete this run permanently?\n\n${label}`)) return;
+  const promptMsg = isRunning
+    ? `Delete this running run permanently?\n\n${label}\n\n(This will cancel any active tasks and remove the run directory.)`
+    : `Delete this run permanently?\n\n${label}`;
+  if (!confirm(promptMsg)) return;
   try {
-    await apiDelete(`/api/runs/${encodeURIComponent(runId)}`);
-    state.runs = state.runs.filter(r => r.run_id !== runId);
+    await apiDelete(`/api/runs/${encodeURIComponent(runId)}?force=true`);
+    state.runs = state.runs.filter(item => item.run_id !== runId);
     if (state.runId === runId) {
       state.runId = null;
       const next = state.runs[0];
@@ -1799,6 +1885,49 @@ async function deleteRun(runId, ev) {
     renderRuns();
   } catch (err) {
     alert(String(err.message || err));
+  }
+}
+
+async function deleteGroup(groupKey, ev) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  const groups = groupRuns(state.runs);
+  const grp = groups.find(g => g.key === groupKey);
+  if (!grp || !grp.runs.length) return;
+
+  const nRuns = grp.runs.length;
+  const hasRunning = grp.runs.some(r => r.status === "running");
+  const msg = hasRunning
+    ? `Delete all ${nRuns} run(s) in group "${grp.name}" permanently?\n\n(Includes running runs. This cannot be undone.)`
+    : `Delete all ${nRuns} run(s) in group "${grp.name}" permanently?\n\nThis cannot be undone.`;
+  if (!confirm(msg)) return;
+
+  try {
+    const runIds = grp.runs.map(r => r.run_id);
+    const res = await apiPost("/api/runs/delete-batch", { run_ids: runIds, force: true });
+    const deletedSet = new Set(res.deleted || runIds);
+    state.runs = state.runs.filter(r => !deletedSet.has(r.run_id));
+    state.expandedGroups.delete(groupKey);
+
+    if (state.runId && deletedSet.has(state.runId)) {
+      state.runId = null;
+      const next = state.runs[0];
+      if (next) {
+        await selectRun(next.run_id);
+      } else {
+        const detail = document.getElementById("detail");
+        if (detail) {
+          detail.innerHTML = '<div class="empty" id="detailPlaceholder">Select a run</div>';
+        }
+        renderRuns();
+      }
+      return;
+    }
+    renderRuns();
+  } catch (err) {
+    alert("Failed to delete group: " + String(err.message || err));
   }
 }
 
@@ -2042,10 +2171,13 @@ function bindRunList(el) {
   el.querySelectorAll("[data-delete-run]").forEach(btn => {
     btn.onclick = (ev) => deleteRun(btn.dataset.deleteRun, ev);
   });
+  el.querySelectorAll("[data-delete-group]").forEach(btn => {
+    btn.onclick = (ev) => deleteGroup(btn.dataset.deleteGroup, ev);
+  });
   el.querySelectorAll(".dataset-group").forEach(node => {
     node.addEventListener("toggle", () => {
-      if (node.open) state.collapsedGroups.delete(node.dataset.group);
-      else state.collapsedGroups.add(node.dataset.group);
+      if (node.open) state.expandedGroups.add(node.dataset.group);
+      else state.expandedGroups.delete(node.dataset.group);
     });
   });
 }
@@ -2053,22 +2185,29 @@ function bindRunList(el) {
 function renderRuns() {
   if (state.embed) return;
   const el = document.getElementById("runList");
+  if (!el) return;
+  const prevScrollTop = el.scrollTop;
   if (!state.runs.length) {
     el.innerHTML = `<div class="empty" style="padding:16px">No runs in outputs/runs</div>`;
   } else {
     el.innerHTML = groupRuns(state.runs).map(g => {
-      const open = !state.collapsedGroups.has(g.key);
+      const open = state.expandedGroups.has(g.key);
       const nOk = g.runs.filter(r => r.status === "ok").length;
       return `
         <details class="dataset-group" data-group="${esc(g.key)}" ${open ? "open" : ""}>
           <summary>
             <span class="group-title">${esc(g.name)}</span>
-            <span class="count">${nOk}/${g.runs.length}</span>
+            <span class="group-actions">
+              <span class="count">${nOk}/${g.runs.length}</span>
+              <button type="button" class="group-delete-btn" data-delete-group="${esc(g.key)}"
+                title="Delete all ${g.runs.length} run(s) in this group">Delete group</button>
+            </span>
           </summary>
           ${g.runs.map(runItemHtml).join("")}
         </details>`;
     }).join("");
     bindRunList(el);
+    el.scrollTop = prevScrollTop;
   }
   document.getElementById("headerMeta").textContent =
     `${state.runs.length} run(s) · ${location.origin}`;
@@ -2079,6 +2218,11 @@ async function selectRun(runId, opts = {}) {
   const keepTab = Boolean(opts.keepTab);
   const keepEvalKey = Boolean(opts.keepEvalKey);
   state.runId = runId;
+  if (runId) {
+    const groups = groupRuns(state.runs);
+    const grp = groups.find(g => g.runs.some(r => r.run_id === runId));
+    if (grp) state.expandedGroups.add(grp.key);
+  }
   if (!state.embed && !keepTab) state.tab = "hierarchy_kv";
   state.pagesSubtab = "pages";
   state.pages = [];
@@ -2105,6 +2249,8 @@ async function selectRun(runId, opts = {}) {
   }
   renderRuns();
   await renderDetail();
+  const detail = document.getElementById("detail");
+  if (detail) detail.scrollTop = 0;
 }
 
 async function loadEvalHierarchyKeys() {
@@ -3771,6 +3917,10 @@ function renderEval() {
   const batch = state.batchJob;
   const batchActive = batch && (batch.status === "queued" || batch.status === "running");
   const batchForRun = batch && batch.run_ids && batch.run_ids.includes(state.runId);
+  const aeByKey = state.agenticEvals || {};
+  const inflightKeys = Array.isArray(state.agenticEvalInflight)
+    ? state.agenticEvalInflight
+    : (state.agenticEvalInflight ? [state.agenticEvalInflight] : []);
 
   const rows = (report.per_key || []).map(row => {
     const em = row.value?.exact_match;
@@ -3786,10 +3936,7 @@ function renderEval() {
         <button type="button" class="chunk-jump" data-chunk-id="${esc(id)}">${esc(id)}</button>
       </div>`;
     }).filter(Boolean).join("");
-    const ae = (state.agenticEvals || {})[row.key];
-    const inflightKeys = Array.isArray(state.agenticEvalInflight)
-      ? state.agenticEvalInflight
-      : (state.agenticEvalInflight ? [state.agenticEvalInflight] : []);
+    const ae = aeByKey[row.key];
     const keyInflight = inflightKeys.includes(row.key);
     const batchActiveForKey = batchActive && batch && batch.active
       && batch.active.some(x => x.key === row.key);
@@ -3930,8 +4077,10 @@ function renderEval() {
 
 async function ensureEval(refresh=false) {
   if (!state.runId) return;
+  if (state.evalLoading) return;
   if (!refresh && state.evalReport && !state.evalError) {
     await ensureAgenticEvals();
+    paintDetail();
     return;
   }
   state.evalLoading = true;
