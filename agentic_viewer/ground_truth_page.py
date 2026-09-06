@@ -89,6 +89,27 @@ GROUND_TRUTH_HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--line); background: #0f1419; color: var(--text);
       font-size: 12px;
     }
+    .upload-box {
+      border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+      background: var(--panel); margin-bottom: 12px;
+    }
+    .upload-box h2 {
+      margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+      letter-spacing: 0.04em; color: var(--muted);
+    }
+    .upload-box .hint { margin: 0 0 8px; font-size: 11px; }
+    .upload-box input[type="file"] {
+      width: 100%; font-size: 11px; color: var(--muted); margin-bottom: 8px;
+    }
+    .upload-box label.mode {
+      display: flex; gap: 6px; align-items: center; font-size: 11px;
+      color: var(--muted); margin-bottom: 6px; cursor: pointer;
+    }
+    .upload-box button {
+      padding: 6px 12px; border-radius: 999px; border: 1px solid #3d6a9a;
+      background: #1a3a5c; color: var(--text); font-size: 12px; cursor: pointer;
+    }
+    .upload-box button:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -104,6 +125,18 @@ GROUND_TRUTH_HTML = r"""<!DOCTYPE html>
   </header>
   <main>
     <aside>
+      <div class="upload-box">
+        <h2>Upload JSON</h2>
+        <p class="hint">
+          Upload <code>answer_sheet.json</code> format:
+          document → key → {value, evidences, evidence_pages}.
+        </p>
+        <input type="file" id="gtUploadInput" accept=".json,application/json" />
+        <label class="mode"><input type="radio" name="gtUploadMode" value="merge" checked /> Merge (add/overwrite keys)</label>
+        <label class="mode"><input type="radio" name="gtUploadMode" value="replace" /> Replace entire sheet</label>
+        <button type="button" id="gtUploadBtn">Upload</button>
+        <div class="status-msg" id="gtUploadStatus"></div>
+      </div>
       <input type="search" class="search-box" id="docSearch" placeholder="Search documents…" />
       <div id="docList"></div>
     </aside>
@@ -315,21 +348,75 @@ document.getElementById("docSearch").oninput = (e) => {
   renderDocList();
 };
 
-(async function init() {
-  const params = new URLSearchParams(location.search);
+async function refreshDocumentList(preferredDocument) {
   const data = await api("/api/ground-truth");
   state.documents = data.documents || [];
   document.getElementById("headerMeta").textContent =
     `${state.documents.length} document(s) · ${esc(data.path || "")}`;
   renderDocList();
-  const docParam = params.get("document");
-  if (docParam && state.documents.some(d => d.document === docParam)) {
-    await selectDocument(docParam);
-  } else if (state.documents[0]) {
-    await selectDocument(state.documents[0].document);
+  const target = preferredDocument
+    || state.document
+    || (state.documents[0] && state.documents[0].document);
+  if (target && state.documents.some(d => d.document === target)) {
+    await selectDocument(target);
   } else {
+    state.document = null;
+    state.keys = [];
     renderContent();
   }
+}
+
+async function uploadGroundTruth() {
+  const input = document.getElementById("gtUploadInput");
+  const statusEl = document.getElementById("gtUploadStatus");
+  const btn = document.getElementById("gtUploadBtn");
+  const mode = document.querySelector('input[name="gtUploadMode"]:checked')?.value || "merge";
+  if (!input || !input.files || !input.files.length) {
+    if (statusEl) {
+      statusEl.className = "status-msg err";
+      statusEl.textContent = "Select a JSON file first.";
+    }
+    return;
+  }
+  if (mode === "replace" && !confirm("Replace the entire answer_sheet.json with the uploaded file?")) {
+    return;
+  }
+  const form = new FormData();
+  form.append("file", input.files[0], input.files[0].name);
+  form.append("mode", mode);
+  if (btn) btn.disabled = true;
+  if (statusEl) {
+    statusEl.className = "status-msg";
+    statusEl.textContent = "Uploading…";
+  }
+  try {
+    const result = await api("/api/ground-truth/upload", { method: "POST", body: form });
+    input.value = "";
+    const preferred = (result.documents || [])[0] || null;
+    await refreshDocumentList(preferred);
+    if (statusEl) {
+      statusEl.className = "status-msg ok";
+      statusEl.textContent =
+        `${result.mode}: ${result.n_documents} document(s), ${result.n_keys} key(s)`
+        + (result.invalidated_eval_caches
+          ? ` · invalidated ${result.invalidated_eval_caches} eval cache(s)`
+          : "");
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.className = "status-msg err";
+      statusEl.textContent = String(err.message || err);
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+document.getElementById("gtUploadBtn").onclick = () => uploadGroundTruth();
+
+(async function init() {
+  const params = new URLSearchParams(location.search);
+  await refreshDocumentList(params.get("document"));
 })();
 </script>
 </body>

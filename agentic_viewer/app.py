@@ -30,6 +30,7 @@ from agentic_viewer.evaluation.trace_paths import (
 from agentic_viewer.evaluation_page import EVALUATION_HTML
 from agentic_viewer.ground_truth import (
     get_document_gt,
+    import_answer_sheet,
     invalidate_eval_caches_for_document,
     list_documents,
     update_gt_key,
@@ -412,6 +413,43 @@ def put_ground_truth_key(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     invalidated = invalidate_eval_caches_for_document(RUNS_ROOT, document)
     return {**result, "invalidated_eval_caches": invalidated}
+
+
+@app.post("/api/ground-truth/upload")
+async def upload_ground_truth(
+    file: UploadFile = File(...),
+    mode: str = Form("merge"),
+) -> Dict[str, Any]:
+    """
+    Upload an answer_sheet.json file and merge/replace ground-truth entries.
+
+    Expected shape matches dataset/answer_sheet.json:
+      { "<document>.pdf": { "<key>": {value, evidences, evidence_pages}, ... }, ... }
+    """
+    name = (file.filename or "").strip() or "answer_sheet.json"
+    if not name.lower().endswith(".json"):
+        raise HTTPException(status_code=400, detail="only .json files are supported")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty file")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+    try:
+        result = import_answer_sheet(payload, mode=mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    invalidated = 0
+    for document in result.get("documents") or []:
+        invalidated += invalidate_eval_caches_for_document(RUNS_ROOT, str(document))
+    return {
+        **result,
+        "filename": name,
+        "invalidated_eval_caches": invalidated,
+        "documents_index": list_documents(),
+    }
 
 
 def _raise_dataset_error(exc: Exception) -> None:

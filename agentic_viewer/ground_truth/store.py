@@ -22,6 +22,113 @@ def load_answer_sheet() -> Dict[str, Any]:
     return data
 
 
+def load_answer_sheet_or_empty() -> Dict[str, Any]:
+    try:
+        return load_answer_sheet()
+    except FileNotFoundError:
+        return {}
+
+
+def validate_answer_sheet_payload(payload: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Validate answer_sheet.json shape:
+
+      {
+        "<document>.pdf": {
+          "<key>": {
+            "value": "...",
+            "evidences": ["..."],
+            "evidence_pages": [1, 2]
+          }
+        }
+      }
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("answer sheet must be a JSON object keyed by document name")
+    if not payload:
+        raise ValueError("answer sheet is empty")
+
+    normalized: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for doc_name, doc in payload.items():
+        name = str(doc_name or "").strip()
+        if not name:
+            raise ValueError("document name must be a non-empty string")
+        if not isinstance(doc, dict):
+            raise ValueError(f"document {name!r} must be an object of keys")
+        if not doc:
+            raise ValueError(f"document {name!r} has no keys")
+        keys: Dict[str, Dict[str, Any]] = {}
+        for key_name, entry in doc.items():
+            key = str(key_name or "").strip()
+            if not key:
+                raise ValueError(f"empty key under document {name!r}")
+            if not isinstance(entry, dict):
+                raise ValueError(f"entry for {name!r} / {key!r} must be an object")
+            keys[key] = normalize_gt_entry(entry)
+        normalized[name] = keys
+    return normalized
+
+
+def import_answer_sheet(
+    payload: Any,
+    *,
+    mode: str = "merge",
+) -> Dict[str, Any]:
+    """
+    Import GT documents from an answer_sheet.json payload.
+
+    mode:
+      - merge: add/overwrite keys per document (default)
+      - replace: replace the entire answer sheet with the uploaded payload
+    """
+    mode_name = (mode or "merge").strip().lower()
+    if mode_name not in {"merge", "replace"}:
+        raise ValueError("mode must be 'merge' or 'replace'")
+
+    incoming = validate_answer_sheet_payload(payload)
+    if mode_name == "replace":
+        sheet: Dict[str, Any] = {doc: dict(keys) for doc, keys in incoming.items()}
+        created_documents = list(incoming.keys())
+        updated_documents = []
+        added_keys = sum(len(keys) for keys in incoming.values())
+        updated_keys = 0
+    else:
+        sheet = load_answer_sheet_or_empty()
+        created_documents = []
+        updated_documents = []
+        added_keys = 0
+        updated_keys = 0
+        for doc_name, keys in incoming.items():
+            existing = sheet.get(doc_name)
+            if not isinstance(existing, dict):
+                created_documents.append(doc_name)
+                sheet[doc_name] = dict(keys)
+                added_keys += len(keys)
+                continue
+            updated_documents.append(doc_name)
+            merged = dict(existing)
+            for key, entry in keys.items():
+                if key in merged:
+                    updated_keys += 1
+                else:
+                    added_keys += 1
+                merged[key] = entry
+            sheet[doc_name] = merged
+
+    path = save_answer_sheet(sheet)
+    return {
+        "path": str(path),
+        "mode": mode_name,
+        "documents": sorted(incoming.keys()),
+        "n_documents": len(incoming),
+        "n_keys": sum(len(keys) for keys in incoming.values()),
+        "created_documents": created_documents,
+        "updated_documents": updated_documents,
+        "added_keys": added_keys,
+        "updated_keys": updated_keys,
+    }
+
+
 def save_answer_sheet(data: Dict[str, Any]) -> Path:
     path = answer_sheet_path()
     if not isinstance(data, dict):

@@ -10,9 +10,11 @@ from unittest import mock
 
 from agentic_viewer.ground_truth.store import (
     get_document_gt,
+    import_answer_sheet,
     list_documents,
     normalize_gt_entry,
     update_gt_key,
+    validate_answer_sheet_payload,
 )
 
 
@@ -102,6 +104,85 @@ class GroundTruthStoreTests(unittest.TestCase):
                 data = get_document_gt("new.pdf")
                 self.assertTrue(data["exists"])
                 self.assertEqual(data["keys"][0]["key"], "Some key")
+
+    def test_import_answer_sheet_merge_and_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "answer_sheet.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "keep.pdf": {
+                            "Old key": {
+                                "value": "old",
+                                "evidences": ["a"],
+                                "evidence_pages": [1],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "keep.pdf": {
+                    "Old key": {
+                        "value": "updated",
+                        "evidences": ["b"],
+                        "evidence_pages": [2],
+                    },
+                    "New key": {
+                        "value": "42",
+                        "evidences": ["c"],
+                        "evidence_pages": [3],
+                    },
+                },
+                "other.pdf": {
+                    "Only key": {
+                        "value": "x",
+                        "evidences": [],
+                        "evidence_pages": [],
+                    }
+                },
+            }
+            with mock.patch(
+                "agentic_viewer.ground_truth.store.answer_sheet_path",
+                return_value=path,
+            ):
+                validated = validate_answer_sheet_payload(payload)
+                self.assertEqual(validated["keep.pdf"]["Old key"]["value"], "updated")
+                merged = import_answer_sheet(payload, mode="merge")
+                self.assertEqual(merged["n_documents"], 2)
+                self.assertEqual(merged["added_keys"], 2)
+                self.assertEqual(merged["updated_keys"], 1)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["keep.pdf"]["Old key"]["value"], "updated")
+                self.assertEqual(saved["keep.pdf"]["New key"]["value"], "42")
+                self.assertEqual(saved["other.pdf"]["Only key"]["value"], "x")
+
+                replaced = import_answer_sheet(
+                    {
+                        "solo.pdf": {
+                            "K": {
+                                "value": "1",
+                                "evidences": ["e"],
+                                "evidence_pages": [9],
+                            }
+                        }
+                    },
+                    mode="replace",
+                )
+                self.assertEqual(replaced["mode"], "replace")
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(list(saved.keys()), ["solo.pdf"])
+
+    def test_import_answer_sheet_rejects_invalid_shape(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_answer_sheet_payload([])
+        with self.assertRaises(ValueError):
+            validate_answer_sheet_payload({"doc.pdf": "bad"})
+        with self.assertRaises(ValueError):
+            validate_answer_sheet_payload(
+                {"doc.pdf": {"key": {"value": "x", "evidences": "bad", "evidence_pages": []}}}
+            )
 
 
 if __name__ == "__main__":
