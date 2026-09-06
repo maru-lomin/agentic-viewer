@@ -69,6 +69,39 @@ class PdfSourceTests(unittest.TestCase):
         self.assertTrue(info["available"])
         self.assertEqual(info["filename"], "Albanesi - CT ROCA - 2024 (ING-1718-23-AR) - VF (English).pdf")
 
+    def test_ui_includes_chunk_pdf_highlight_support(self) -> None:
+        from agentic_viewer.app import INDEX_HTML
+
+        self.assertIn("renderChunkCard", INDEX_HTML)
+        self.assertIn("mountChunkPdfViewer", INDEX_HTML)
+        self.assertIn("pdf-chunk-host", INDEX_HTML)
+        self.assertIn("pdf-prev-btn", INDEX_HTML)
+        self.assertIn("pdf-next-btn", INDEX_HTML)
+        self.assertIn("pdf-page-input", INDEX_HTML)
+        self.assertIn("pdf-chunk-btn", INDEX_HTML)
+        self.assertIn("renderCurrentPage", INDEX_HTML)
+
+    def test_chunk_highlights_calibrated_from_pdf(self) -> None:
+        from agentic_viewer.highlights import chunk_highlights
+
+        repo = Path(__file__).resolve().parents[2]
+        target = repo / "outputs" / "runs" / "agentic-183ead9e-83df-4410-aaf3-4c567988c79b"
+        if not target.is_dir():
+            self.skipTest("target run not found")
+        hl = chunk_highlights(target, "4-1")
+        self.assertGreater(len(hl.get("regions", [])), 0)
+        r = hl["regions"][0]
+        self.assertEqual(r.get("width"), 2481)
+        self.assertIn(r.get("height"), (3508, 3509))
+        norm = r.get("bbox_norm", [])
+        self.assertEqual(len(norm), 4)
+        # Verify right boundary is calibrated (~89.7%) rather than uncalibrated marginless (~99.9%)
+        self.assertLess(norm[2], 0.92)
+        self.assertGreater(norm[2], 0.88)
+        # Verify bottom boundary is calibrated (~87.8%) rather than uncalibrated (~91.7%)
+        self.assertLess(norm[3], 0.89)
+        self.assertGreater(norm[3], 0.86)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1367,9 +1367,69 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .kv-table th:first-child { width: 180px; }
     .pdf-chunk-viewer { margin: 8px 0 12px; }
     .pdf-chunk-viewer .pdf-toolbar {
-      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      display: flex; flex-direction: column; gap: 8px;
       margin-bottom: 8px; font-size: 12px; color: var(--muted);
+      background: #0f1520; border: 1px solid var(--line); border-radius: 8px;
+      padding: 8px 12px;
     }
+    .pdf-toolbar-row {
+      display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: space-between;
+    }
+    .pdf-nav-row {
+      justify-content: flex-start; gap: 10px;
+    }
+    .pdf-nav-group {
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .pdf-nav-btn {
+      padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line);
+      background: #182232; color: var(--text); font-size: 11px; cursor: pointer;
+      display: inline-flex; align-items: center; transition: all 0.15s ease;
+    }
+    .pdf-nav-btn:hover:not(:disabled) {
+      border-color: var(--accent); color: var(--accent); background: #223044;
+    }
+    .pdf-nav-btn:disabled {
+      opacity: 0.35; cursor: not-allowed;
+    }
+    .pdf-chunk-btn {
+      background: #15273b; border-color: rgba(61, 156, 240, 0.4); color: #7cb9f7;
+      font-weight: 500;
+    }
+    .pdf-chunk-btn:hover:not(:disabled) {
+      background: #1b3450; border-color: var(--accent); color: #fff;
+    }
+    .pdf-chunk-btn.active {
+      background: rgba(61, 156, 240, 0.25); border-color: var(--accent); color: #fff;
+      box-shadow: 0 0 0 1px var(--accent) inset;
+    }
+    .pdf-nav-page-box {
+      font-family: var(--mono); font-size: 11px; color: var(--muted);
+      display: inline-flex; align-items: center; gap: 4px;
+    }
+    .pdf-page-input {
+      width: 52px; padding: 2px 4px; border-radius: 4px; border: 1px solid var(--line);
+      background: #0b1016; color: var(--text); font-family: var(--mono); font-size: 11px;
+      text-align: center;
+    }
+    .pdf-page-input:focus {
+      outline: none; border-color: var(--accent);
+    }
+    .pdf-status-badge {
+      font-size: 11px; font-family: var(--mono); padding: 2px 8px; border-radius: 999px;
+      margin-left: auto; display: inline-flex; align-items: center;
+    }
+    .pdf-status-badge.is-highlight {
+      background: rgba(61, 156, 240, 0.18); border: 1px solid rgba(61, 156, 240, 0.6);
+      color: #9cd0fc;
+    }
+    .pdf-status-badge.is-plain {
+      background: #18202b; border: 1px solid var(--line); color: var(--muted);
+    }
+    .pdf-open-link {
+      font-size: 11px; color: var(--accent); text-decoration: none;
+    }
+    .pdf-open-link:hover { text-decoration: underline; }
     .pdf-chunk-viewer .pdf-pages { display: flex; flex-direction: column; gap: 14px; }
     .pdf-page-wrap {
       border: 1px solid var(--line); border-radius: 8px; padding: 8px;
@@ -2790,11 +2850,20 @@ async function ensurePdfJs() {
   return _pdfJsPromise;
 }
 
-function regionToPctStyle(region) {
+function regionToPctStyle(region, pageSize = null) {
   let x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-  if (Array.isArray(region.bbox_norm) && region.bbox_norm.length === 4) {
+  const hasBbox = Array.isArray(region.bbox) && region.bbox.length === 4;
+  const isImagePx = (region.coord === "image_px") || (hasBbox && (region.bbox[2] > 1.5 || region.bbox[3] > 1.5));
+
+  if (isImagePx && pageSize && pageSize.width > 0 && pageSize.height > 0) {
+    const bb = region.bbox.map(Number);
+    x0 = bb[0] / pageSize.width;
+    y0 = bb[1] / pageSize.height;
+    x1 = bb[2] / pageSize.width;
+    y1 = bb[3] / pageSize.height;
+  } else if (Array.isArray(region.bbox_norm) && region.bbox_norm.length === 4) {
     [x0, y0, x1, y1] = region.bbox_norm.map(Number);
-  } else if (Array.isArray(region.bbox) && region.bbox.length === 4) {
+  } else if (hasBbox) {
     const w = Number(region.width || 0);
     const h = Number(region.height || 0);
     if (w > 0 && h > 0) {
@@ -2838,16 +2907,12 @@ async function mountChunkPdfViewer(host, runId, regions, fallbackPages=[]) {
     if (!grouped[page]) grouped[page] = [];
     grouped[page].push(r);
   }
-  let pages = Object.keys(grouped).map(Number).sort((a, b) => a - b);
-  if (!pages.length && Array.isArray(fallbackPages) && fallbackPages.length) {
-    pages = fallbackPages.map(Number).filter(p => Number.isFinite(p) && p > 0).sort((a, b) => a - b);
-    for (const p of pages) {
+  let chunkPages = Object.keys(grouped).map(Number).sort((a, b) => a - b);
+  if (!chunkPages.length && Array.isArray(fallbackPages) && fallbackPages.length) {
+    chunkPages = fallbackPages.map(Number).filter(p => Number.isFinite(p) && p > 0).sort((a, b) => a - b);
+    for (const p of chunkPages) {
       if (!grouped[p]) grouped[p] = [];
     }
-  }
-  if (!pages.length) {
-    host.innerHTML = `<div class="empty">No pages available for PDF view.</div>`;
-    return;
   }
 
   host.innerHTML = `<div class="empty">Loading PDF…</div>`;
@@ -2862,65 +2927,245 @@ async function mountChunkPdfViewer(host, runId, regions, fallbackPages=[]) {
     return;
   }
 
+  let pdf;
+  try {
+    pdf = await getPdfDocument(runId);
+  } catch (err) {
+    host.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)} · <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank">open full PDF</a></div>`;
+    return;
+  }
+
+  const totalPages = Number(pdf.numPages || (info && info.page_count) || 1);
+  let currentPage = (chunkPages.length > 0 && chunkPages[0] >= 1 && chunkPages[0] <= totalPages)
+    ? chunkPages[0]
+    : 1;
+
   const shell = document.createElement("div");
   shell.className = "pdf-chunk-viewer";
-  shell.innerHTML = `<div class="pdf-toolbar">
-    <span>Source: ${esc(info.filename || "document.pdf")}</span>
-    <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank">open full PDF</a>
-  </div><div class="pdf-pages"></div>`;
+
+  const chunkButtonsHtml = chunkPages.map(p =>
+    `<button type="button" class="pdf-nav-btn pdf-chunk-btn" data-page="${p}" title="Jump to chunk page ${p}">🎯 Chunk p.${p}</button>`
+  ).join(" ");
+
+  shell.innerHTML = `
+    <div class="pdf-toolbar">
+      <div class="pdf-toolbar-row">
+        <span>Source: <b>${esc(info.filename || "document.pdf")}</b></span>
+        <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank" class="pdf-open-link">open full PDF ↗</a>
+      </div>
+      <div class="pdf-toolbar-row pdf-nav-row">
+        <div class="pdf-nav-group">
+          <button type="button" class="pdf-nav-btn pdf-prev-btn" title="Previous page">◀ Prev</button>
+          <span class="pdf-nav-page-box">
+            Page <input type="number" class="pdf-page-input" min="1" max="${totalPages}" value="${currentPage}"> / ${totalPages}
+          </span>
+          <button type="button" class="pdf-nav-btn pdf-next-btn" title="Next page">Next ▶</button>
+        </div>
+        ${chunkButtonsHtml ? `<div class="pdf-nav-group">${chunkButtonsHtml}</div>` : ""}
+        <span class="pdf-status-badge"></span>
+      </div>
+    </div>
+    <div class="pdf-pages">
+      <div class="pdf-page-wrap">
+        <div class="pdf-page-label"></div>
+        <div class="pdf-canvas-wrap">
+          <canvas></canvas>
+          <div class="pdf-overlay"></div>
+        </div>
+      </div>
+    </div>
+  `;
+
   host.innerHTML = "";
   host.appendChild(shell);
-  const pagesHost = shell.querySelector(".pdf-pages");
 
-  try {
-    const pdf = await getPdfDocument(runId);
-    const scale = 1.35;
-    for (const pageNum of pages) {
-      const page = await pdf.getPage(pageNum);
+  const prevBtn = shell.querySelector(".pdf-prev-btn");
+  const nextBtn = shell.querySelector(".pdf-next-btn");
+  const pageInput = shell.querySelector(".pdf-page-input");
+  const statusBadge = shell.querySelector(".pdf-status-badge");
+  const pageLabel = shell.querySelector(".pdf-page-label");
+  const canvasWrap = shell.querySelector(".pdf-canvas-wrap");
+  const canvas = shell.querySelector("canvas");
+  const overlay = shell.querySelector(".pdf-overlay");
+
+  let activeRenderTask = null;
+  let currentRenderSeq = 0;
+
+  async function renderCurrentPage() {
+    const seq = ++currentRenderSeq;
+    if (activeRenderTask) {
+      try {
+        activeRenderTask.cancel();
+      } catch (_) {}
+      activeRenderTask = null;
+    }
+
+    if (prevBtn) prevBtn.disabled = (currentPage <= 1);
+    if (nextBtn) nextBtn.disabled = (currentPage >= totalPages);
+    if (pageInput) pageInput.value = currentPage;
+
+    const hlRegions = grouped[currentPage] || [];
+
+    shell.querySelectorAll(".pdf-chunk-btn").forEach(btn => {
+      const p = Number(btn.dataset.page);
+      btn.classList.toggle("active", p === currentPage);
+    });
+
+    if (statusBadge) {
+      if (hlRegions.length > 0) {
+        statusBadge.className = "pdf-status-badge is-highlight";
+        statusBadge.textContent = `🎯 Chunk highlight (${hlRegions.length})`;
+        statusBadge.title = "Highlight active on this page for the selected chunk";
+      } else {
+        statusBadge.className = "pdf-status-badge is-plain";
+        statusBadge.textContent = "Original PDF";
+        statusBadge.title = "Showing original PDF without highlight";
+      }
+    }
+
+    if (pageLabel) {
+      pageLabel.textContent = `Page ${currentPage} of ${totalPages}${hlRegions.length > 0 ? " — Chunk highlight" : ""}`;
+    }
+
+    try {
+      const page = await pdf.getPage(currentPage);
+      if (seq !== currentRenderSeq) return;
+
+      const scale = 1.35;
       const viewport = page.getViewport({ scale });
-      const wrap = document.createElement("div");
-      wrap.className = "pdf-page-wrap";
+      const unscaled = page.getViewport({ scale: 1.0 });
+      const pageSize = {
+        width: unscaled.width * (300 / 72),
+        height: unscaled.height * (300 / 72),
+      };
 
-      const label = document.createElement("div");
-      label.className = "pdf-page-label";
-      label.textContent = `Page ${pageNum}`;
-
-      const canvasWrap = document.createElement("div");
-      canvasWrap.className = "pdf-canvas-wrap";
       canvasWrap.style.width = `${Math.round(viewport.width)}px`;
       canvasWrap.style.height = `${Math.round(viewport.height)}px`;
-
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.round(viewport.width);
-      canvas.height = Math.round(viewport.height);
-      const ctx = canvas.getContext("2d");
-      await page.render({ canvasContext: ctx, viewport }).promise;
-
-      const overlay = document.createElement("div");
-      overlay.className = "pdf-overlay";
       overlay.style.width = `${Math.round(viewport.width)}px`;
       overlay.style.height = `${Math.round(viewport.height)}px`;
 
-      for (const region of (grouped[pageNum] || [])) {
-        const style = regionToPctStyle(region);
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext("2d");
+
+      overlay.innerHTML = "";
+
+      const renderTask = page.render({ canvasContext: ctx, viewport });
+      activeRenderTask = renderTask;
+      await renderTask.promise;
+      if (seq !== currentRenderSeq) return;
+
+      for (const region of hlRegions) {
+        const style = regionToPctStyle(region, pageSize);
         if (!style) continue;
         const box = document.createElement("div");
         box.className = "hl-box";
         Object.assign(box.style, style);
         overlay.appendChild(box);
       }
+    } catch (err) {
+      if (err && err.name === "RenderingCancelledException") {
+        return;
+      }
+      if (pageLabel) {
+        pageLabel.textContent = `Error loading page ${currentPage}: ${err.message || err}`;
+      }
+    }
+  }
 
-      canvasWrap.appendChild(canvas);
-      canvasWrap.appendChild(overlay);
-      wrap.appendChild(label);
-      wrap.appendChild(canvasWrap);
-      pagesHost.appendChild(wrap);
-    }
-    if (!pagesHost.children.length) {
-      pagesHost.innerHTML = `<div class="empty">Could not render PDF pages. <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank">Open full PDF</a></div>`;
-    }
-  } catch (err) {
-    host.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)} · <a href="/api/runs/${encodeURIComponent(runId)}/pdf" target="_blank">open full PDF</a></div>`;
+  if (prevBtn) {
+    prevBtn.onclick = () => {
+      if (currentPage > 1) {
+        currentPage--;
+        renderCurrentPage();
+      }
+    };
+  }
+
+  if (nextBtn) {
+    nextBtn.onclick = () => {
+      if (currentPage < totalPages) {
+        currentPage++;
+        renderCurrentPage();
+      }
+    };
+  }
+
+  if (pageInput) {
+    pageInput.onchange = () => {
+      let p = parseInt(pageInput.value, 10);
+      if (!Number.isFinite(p)) p = currentPage;
+      p = Math.max(1, Math.min(totalPages, p));
+      if (p !== currentPage) {
+        currentPage = p;
+        renderCurrentPage();
+      } else {
+        pageInput.value = currentPage;
+      }
+    };
+    pageInput.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        pageInput.blur();
+      }
+    };
+  }
+
+  shell.querySelectorAll(".pdf-chunk-btn").forEach(btn => {
+    btn.onclick = () => {
+      const p = Number(btn.dataset.page);
+      if (Number.isFinite(p) && p >= 1 && p <= totalPages && p !== currentPage) {
+        currentPage = p;
+        renderCurrentPage();
+      }
+    };
+  });
+
+  await renderCurrentPage();
+}
+
+function renderChunkCard(container, row, hl, runId) {
+  const regions = (hl && hl.regions) || row.regions || [];
+  const regionRows = regions.length
+    ? regions.map(r => {
+        const bbox = Array.isArray(r.bbox) ? r.bbox.map(n => Number(n).toFixed(1)).join(", ") : "";
+        const norm = Array.isArray(r.bbox_norm)
+          ? r.bbox_norm.map(n => Number(n).toFixed(3)).join(", ")
+          : "";
+        const layout = (hl && hl.layout_paths && hl.layout_paths[String(r.page)]) || "";
+        return `<tr>
+          <td>${esc(String(r.page))}</td>
+          <td><code>${esc(bbox)}</code></td>
+          <td>${norm ? `<code>${esc(norm)}</code>` : "—"}</td>
+          <td>${esc(String(r.n_elements || (r.element_ids || []).length || ""))}</td>
+          <td>${layout ? `<a href="/api/runs/${encodeURIComponent(runId)}/file?path=${encodeURIComponent(layout)}" target="_blank">layout</a>` : "—"}</td>
+        </tr>`;
+      }).join("")
+    : `<tr><td colspan="5" class="empty">No highlight regions (layout missing or no match).</td></tr>`;
+  const source = hl && hl.source ? ` · regions=${esc(hl.source)}` : "";
+  container.innerHTML = `<details class="tree-node" open style="margin:0">
+    <summary><span class="title">${esc(row.chunk_id)}</span>
+      <span class="tree-badge">${esc((row.pages || [row.page]).join(","))}</span>
+      <span class="tree-kv">${esc(row.heading_path || "")}${source}</span>
+    </summary>
+    <div class="tree-body">
+      <div class="viz-section" style="margin:6px 0">
+        <h3 style="margin:0 0 4px">PDF highlight</h3>
+        <div class="pdf-chunk-host"></div>
+      </div>
+      <div class="viz-section" style="margin:6px 0">
+        <h3 style="margin:0 0 4px">Highlight regions</h3>
+        <table class="kv-table">
+          <thead><tr><th>Page</th><th>bbox (px)</th><th>bbox (norm)</th><th>#el</th><th>layout</th></tr></thead>
+          <tbody>${regionRows}</tbody>
+        </table>
+      </div>
+      <pre class="pretty">${esc(row.text || "")}</pre>
+    </div>
+  </details>`;
+  const pdfHost = container.querySelector(".pdf-chunk-host");
+  const fallbackPages = (hl && hl.pages) || row.pages || (row.page ? [row.page] : []);
+  if (pdfHost && (regions.length || (fallbackPages && fallbackPages.length))) {
+    mountChunkPdfViewer(pdfHost, runId, regions, fallbackPages);
   }
 }
 
@@ -2944,49 +3189,7 @@ async function openChunkPreview(chunkId, anchorEl) {
       api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}`),
       api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}/highlights`).catch(() => null),
     ]);
-    const regions = (hl && hl.regions) || row.regions || [];
-    const regionRows = regions.length
-      ? regions.map(r => {
-          const bbox = Array.isArray(r.bbox) ? r.bbox.map(n => Number(n).toFixed(1)).join(", ") : "";
-          const norm = Array.isArray(r.bbox_norm)
-            ? r.bbox_norm.map(n => Number(n).toFixed(3)).join(", ")
-            : "";
-          const layout = (hl && hl.layout_paths && hl.layout_paths[String(r.page)]) || "";
-          return `<tr>
-            <td>${esc(String(r.page))}</td>
-            <td><code>${esc(bbox)}</code></td>
-            <td>${norm ? `<code>${esc(norm)}</code>` : "—"}</td>
-            <td>${esc(String(r.n_elements || (r.element_ids || []).length || ""))}</td>
-            <td>${layout ? `<a href="/api/runs/${encodeURIComponent(state.runId)}/file?path=${encodeURIComponent(layout)}" target="_blank">layout</a>` : "—"}</td>
-          </tr>`;
-        }).join("")
-      : `<tr><td colspan="5" class="empty">No highlight regions (layout missing or no match).</td></tr>`;
-    const source = hl && hl.source ? ` · regions=${esc(hl.source)}` : "";
-    box.innerHTML = `<details class="tree-node" open style="margin:0">
-      <summary><span class="title">${esc(row.chunk_id)}</span>
-        <span class="tree-badge">${esc((row.pages || [row.page]).join(","))}</span>
-        <span class="tree-kv">${esc(row.heading_path || "")}${source}</span>
-      </summary>
-      <div class="tree-body">
-        <div class="viz-section" style="margin:6px 0">
-          <h3 style="margin:0 0 4px">PDF highlight</h3>
-          <div class="pdf-chunk-host"></div>
-        </div>
-        <div class="viz-section" style="margin:6px 0">
-          <h3 style="margin:0 0 4px">Highlight regions</h3>
-          <table class="kv-table">
-            <thead><tr><th>Page</th><th>bbox (px)</th><th>bbox (norm)</th><th>#el</th><th>layout</th></tr></thead>
-            <tbody>${regionRows}</tbody>
-          </table>
-        </div>
-        <pre class="pretty">${esc(row.text || "")}</pre>
-      </div>
-    </details>`;
-    const pdfHost = box.querySelector(".pdf-chunk-host");
-    const fallbackPages = (hl && hl.pages) || row.pages || (row.page ? [row.page] : []);
-    if (pdfHost && (regions.length || (fallbackPages && fallbackPages.length))) {
-      mountChunkPdfViewer(pdfHost, state.runId, regions, fallbackPages);
-    }
+    renderChunkCard(box, row, hl, state.runId);
   } catch (err) {
     box.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)}</div>`;
   }
@@ -4445,16 +4648,13 @@ function paintDetail() {
       previewRow.innerHTML = `<td colspan="6"><div class="empty">Loading ${esc(id)}…</div></td>`;
       dataRow.after(previewRow);
       try {
-        const row = await api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}`);
-        previewRow.innerHTML = `<td colspan="6" style="padding:8px 10px;background:#121820">
-          <details class="tree-node" open style="margin:0">
-            <summary><span class="title">${esc(row.chunk_id)}</span>
-              <span class="tree-badge">${esc((row.pages || [row.page]).join(","))}</span>
-              <span class="tree-kv">${esc(row.heading_path || "")}</span>
-            </summary>
-            <div class="tree-body"><pre class="pretty">${esc(row.text || "")}</pre></div>
-          </details>
-        </td>`;
+        const [row, hl] = await Promise.all([
+          api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}`),
+          api(`/api/runs/${encodeURIComponent(state.runId)}/chunks/${encodeURIComponent(id)}/highlights`).catch(() => null),
+        ]);
+        const cell = previewRow.querySelector("td");
+        cell.style.cssText = "padding:8px 10px;background:#121820";
+        renderChunkCard(cell, row, hl, state.runId);
       } catch (err) {
         previewRow.innerHTML = `<td colspan="6"><div class="empty" style="color:var(--err)">${esc(err.message || err)}</div></td>`;
       }

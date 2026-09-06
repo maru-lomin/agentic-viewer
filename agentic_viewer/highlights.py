@@ -60,8 +60,8 @@ def _enrich_regions(
     for region in regions:
         page = int(region.get("page") or 0)
         layout = layouts_by_page.get(page) or {}
-        width = int(region.get("width") or layout.get("width") or 0)
-        height = int(region.get("height") or layout.get("height") or 0)
+        width = int(layout.get("width") or region.get("width") or 0)
+        height = int(layout.get("height") or region.get("height") or 0)
         out.append(
             enrich_region_bbox_norm(region, width=width, height=height)
         )
@@ -91,8 +91,10 @@ def chunk_highlights(run_dir: Path, chunk_id: str) -> Dict[str, Any]:
         load_layouts_from_run_dir,
         regions_from_page_char_ranges,
     )
+    from agentic_viewer.pdf_source import infer_pdf_path
 
-    layouts = load_layouts_from_run_dir(root)
+    pdf_path = infer_pdf_path(root)
+    layouts = load_layouts_from_run_dir(root, pdf_path=pdf_path)
 
     if page_char_ranges and layouts:
         regions = regions_from_page_char_ranges(page_char_ranges, layouts)

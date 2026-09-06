@@ -9,4 +9,5 @@ outputs/
 dist/
 *.egg-info/
 .DS_Store
+*.log
 uv.lock
