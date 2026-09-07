@@ -121,6 +121,7 @@ GROUND_TRUTH_HTML = r"""<!DOCTYPE html>
       <a href="/evaluation">Evaluation</a>
       <a href="/ground-truth" class="active">Ground Truth</a>
       <a href="/wrong-cases">Wrong Cases</a>
+      <a href="/prompts">Prompts</a>
     </nav>
     <div class="meta" id="headerMeta">Loading…</div>
   </header>
