@@ -18,7 +18,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from agentic_viewer.datasets import DatasetStore
 from agentic_viewer.datasets_page import DATASETS_HTML
 from agentic_viewer.eval.paths import answer_sheet_path
-from agentic_viewer.evaluation.agentic_client import AgenticEvalError, invoke_agentic_eval
+from agentic_viewer.evaluation.agentic_client import (
+    AgenticEvalError,
+    invoke_agentic_eval,
+    invoke_agentic_eval_chat,
+    get_agentic_eval_chat,
+    delete_agentic_eval_chat,
+)
 from agentic_viewer.evaluation.batch import enrich_batch_job_dict, make_batch_manager
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
 from agentic_viewer.evaluation.status_cleanup import (
@@ -969,6 +975,86 @@ def post_cleanup_stale_eval(
     return {"run_id": run_id, "cleaned": count}
 
 
+@app.post("/api/runs/{run_id}/agentic-eval/chat")
+def post_agentic_eval_chat(
+    run_id: str, body: Dict[str, Any] = Body(...)
+) -> Dict[str, Any]:
+    """Send a follow-up chat message to the EvalMasterAgent for an evaluated key."""
+    _run_dir(run_id)
+    key = str((body or {}).get("key") or "").strip()
+    message = str((body or {}).get("message") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    try:
+        return invoke_agentic_eval_chat(INFERENCE_API_URL, run_id, key, message)
+    except AgenticEvalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/agentic-eval/chat")
+def get_agentic_eval_chat_api(
+    run_id: str,
+    key: str = Query(...),
+) -> Dict[str, Any]:
+    """Retrieve chat history for an evaluated key."""
+    root = _run_dir(run_id)
+    key = str(key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    from agentic_viewer.evaluation.live_progress import _safe_key_filename
+    safe = _safe_key_filename(key)
+    chat_file = root / "06_agentic_eval" / safe / "chat_history.json"
+    if chat_file.is_file():
+        try:
+            data = json.loads(chat_file.read_text(encoding="utf-8"))
+            return {
+                "ok": True,
+                "key": key,
+                "has_history": bool(data.get("messages")),
+                "history": data.get("messages") or [],
+            }
+        except Exception:
+            pass
+
+    try:
+        return get_agentic_eval_chat(INFERENCE_API_URL, run_id, key)
+    except AgenticEvalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.delete("/api/runs/{run_id}/agentic-eval/chat")
+def delete_agentic_eval_chat_api(
+    run_id: str,
+    key: str = Query(...),
+) -> Dict[str, Any]:
+    """Clear chat history for an evaluated key."""
+    root = _run_dir(run_id)
+    key = str(key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    from agentic_viewer.evaluation.live_progress import _safe_key_filename
+    safe = _safe_key_filename(key)
+    eval_dir = root / "06_agentic_eval" / safe
+    for fname in ("chat_history.json", "chat_context.json"):
+        p = eval_dir / fname
+        if p.is_file():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    try:
+        return delete_agentic_eval_chat(INFERENCE_API_URL, run_id, key)
+    except Exception:
+        return {"ok": True, "key": key, "cleared": True}
+
+
+
 def _serve_run_file(root: Path, rel: str):
     """Serve a file under ``root`` (JSON as JSONResponse, text as HTML pre)."""
     rel = rel.lstrip("/")
@@ -1711,16 +1797,156 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .agentic-eval-summary {
       font-size: 12px; margin: 0 0 6px; line-height: 1.35;
-      max-width: 320px;
+      max-width: 460px;
+    }
+    .agentic-eval-detail {
+      margin-top: 6px;
+      min-width: 280px;
+      max-width: 460px;
     }
     .agentic-eval-text {
       white-space: pre-wrap; word-break: break-word; font-family: var(--mono);
       font-size: 11px; max-height: 220px; overflow: auto;
       background: #121820; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
-      min-width: 180px; max-width: 320px;
+      min-width: 240px; max-width: 460px;
     }
     .agentic-eval-detail details summary {
       cursor: pointer; color: var(--accent); font-size: 11px;
+    }
+    .eval-chat-section {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+      min-width: 260px;
+      max-width: 460px;
+    }
+    .eval-chat-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    .eval-chat-clear-btn {
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 10px;
+      cursor: pointer;
+    }
+    .eval-chat-clear-btn:hover {
+      color: var(--err);
+      border-color: var(--err);
+    }
+    .eval-chat-msgs-box {
+      max-height: 260px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 6px;
+      background: #090d14;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+    .eval-chat-empty {
+      font-size: 11px;
+      color: var(--muted);
+      padding: 8px 4px;
+      line-height: 1.4;
+      text-align: center;
+    }
+    .eval-chat-msg {
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    .eval-chat-msg.user {
+      align-self: flex-end;
+      background: #19385c;
+      color: #e2eeff;
+      border: 1px solid #2b568c;
+      max-width: 90%;
+    }
+    .eval-chat-msg.assistant {
+      align-self: flex-start;
+      background: #141c28;
+      color: #dbe4ee;
+      border: 1px solid #28374d;
+      max-width: 95%;
+    }
+    .eval-chat-msg.assistant.loading {
+      color: var(--accent);
+      font-style: italic;
+    }
+    .eval-chat-msg-header {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 2px;
+    }
+    .eval-chat-msg.user .eval-chat-msg-header {
+      color: #8bbce8;
+      text-align: right;
+    }
+    .eval-chat-msg-body {
+      white-space: pre-wrap;
+    }
+    .eval-chat-tools-badge {
+      font-size: 10px;
+      color: #6ee7b7;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 4px;
+      padding: 2px 5px;
+      margin-bottom: 4px;
+      display: inline-block;
+    }
+    .eval-chat-error {
+      color: var(--err);
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .eval-chat-input-row {
+      display: flex;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .eval-chat-input {
+      flex: 1;
+      min-width: 0;
+      background: #0f172a;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      color: var(--text);
+      font-size: 11px;
+      padding: 4px 8px;
+      font-family: inherit;
+    }
+    .eval-chat-input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .eval-chat-send-btn {
+      background: #1d4ed8;
+      border: 1px solid #3b82f6;
+      color: #fff;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .eval-chat-send-btn:disabled, .eval-chat-input:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
     }
     .agentic-eval-verdict {
       display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.03em;
@@ -2050,6 +2276,7 @@ const state = {
   agentTree: null, info: null,
   evalReport: null, evalError: null, evalLoading: false,
   agenticEvals: {}, agenticEvalInflight: [], agenticEvalError: null,
+  agenticChats: {},
   evalOpenDetails: new Set(),
   gtEdit: null,
   batchJob: null, batchPollTimer: null,
@@ -2137,9 +2364,14 @@ function runFileUrl(relPath) {
   return `/api/runs/${encRun}/file?path=${encPath}`;
 }
 
-async function api(path) {
-  const r = await fetch(path);
-  if (!r.ok) throw new Error(await r.text());
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+    throw new Error(data.detail || text || r.statusText);
+  }
   const ct = r.headers.get("content-type") || "";
   if (ct.includes("application/json")) return r.json();
   return r.text();
@@ -4476,8 +4708,15 @@ function bindEvalDetailToggles(root) {
     el.addEventListener("toggle", () => {
       const id = el.getAttribute("data-eval-detail");
       if (!id) return;
-      if (el.open) state.evalOpenDetails.add(id);
-      else state.evalOpenDetails.delete(id);
+      if (el.open) {
+        state.evalOpenDetails.add(id);
+        if (id.startsWith("agentic:")) {
+          const key = id.slice("agentic:".length);
+          ensureEvalChat(key);
+        }
+      } else {
+        state.evalOpenDetails.delete(id);
+      }
     });
   });
 }
@@ -4775,6 +5014,7 @@ function renderEval() {
         ${detail ? `<div class="agentic-eval-detail"><details${evalDetailAttrs("agentic", row.key)}>
           <summary>상세</summary>
           <div class="agentic-eval-text">${formattedDetail}</div>
+          ${renderAgenticEvalChat(row.key)}
         </details></div>` : ""}
         <div style="margin-top:6px;display:flex;gap:6px;align-items:center">
           <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
@@ -4942,6 +5182,153 @@ async function ensureEval(refresh=false) {
   }
 }
 
+async function ensureEvalChat(key) {
+  if (!state.runId || !key) return;
+  if (!state.agenticChats[key]) {
+    state.agenticChats[key] = { messages: [], loading: false, loaded: false, input: "", error: null };
+  }
+  const chat = state.agenticChats[key];
+  if (chat.loaded || chat.loading) return;
+  chat.loading = true;
+  try {
+    const res = await api(`/api/runs/${encodeURIComponent(state.runId)}/agentic-eval/chat?key=${encodeURIComponent(key)}`);
+    if (res && res.history) {
+      chat.messages = res.history;
+    }
+    chat.loaded = true;
+  } catch (err) {
+    console.warn("Failed to load chat history for key", key, err);
+  } finally {
+    chat.loading = false;
+    paintDetail();
+  }
+}
+
+async function sendEvalChatMessage(key) {
+  if (!state.runId || !key) return;
+  if (!state.agenticChats[key]) {
+    state.agenticChats[key] = { messages: [], loading: false, loaded: true, input: "", error: null };
+  }
+  const chat = state.agenticChats[key];
+  const text = (chat.input || "").trim();
+  if (!text || chat.loading) return;
+
+  chat.loading = true;
+  chat.error = null;
+  const now = new Date().toISOString();
+  chat.messages.push({ role: "user", content: text, timestamp: now });
+  chat.input = "";
+  paintDetail();
+
+  setTimeout(() => {
+    try {
+      const box = document.querySelector(`[data-chat-box="${CSS.escape(key)}"]`);
+      if (box) box.scrollTop = box.scrollHeight;
+    } catch (_) {}
+  }, 10);
+
+  try {
+    const res = await apiPost(`/api/runs/${encodeURIComponent(state.runId)}/agentic-eval/chat`, {
+      key: key,
+      message: text,
+    });
+    if (res && res.history) {
+      chat.messages = res.history;
+    } else if (res && res.reply) {
+      chat.messages.push({
+        role: "assistant",
+        content: res.reply,
+        timestamp: new Date().toISOString(),
+        tool_calls: res.tool_calls,
+      });
+    }
+  } catch (err) {
+    chat.error = err.message || "답변 생성 중 오류가 발생했습니다.";
+  } finally {
+    chat.loading = false;
+    paintDetail();
+    setTimeout(() => {
+      try {
+        const box = document.querySelector(`[data-chat-box="${CSS.escape(key)}"]`);
+        if (box) box.scrollTop = box.scrollHeight;
+        const inp = document.querySelector(`[data-chat-input="${CSS.escape(key)}"]`);
+        if (inp) inp.focus();
+      } catch (_) {}
+    }, 20);
+  }
+}
+
+async function clearEvalChat(key) {
+  if (!state.runId || !key) return;
+  if (!confirm(`"${key}"의 대화 기록을 초기화하시겠습니까?`)) return;
+  try {
+    await apiDelete(`/api/runs/${encodeURIComponent(state.runId)}/agentic-eval/chat?key=${encodeURIComponent(key)}`);
+    state.agenticChats[key] = { messages: [], loading: false, loaded: true, input: "", error: null };
+    showToast("대화 기록이 초기화되었습니다.");
+    paintDetail();
+  } catch (err) {
+    showToast("대화 초기화 실패: " + err.message);
+  }
+}
+
+function renderAgenticEvalChat(key) {
+  if (!state.agenticChats[key]) {
+    state.agenticChats[key] = { messages: [], loading: false, loaded: false, input: "", error: null };
+  }
+  const chat = state.agenticChats[key];
+  if (!chat.loaded && !chat.loading && state.evalOpenDetails.has(`agentic:${key}`)) {
+    setTimeout(() => ensureEvalChat(key), 0);
+  }
+
+  const msgs = chat.messages || [];
+  const msgListHtml = msgs.length > 0
+    ? msgs.map(m => {
+        const isUser = m.role === "user";
+        const bubbleCls = isUser ? "eval-chat-msg user" : "eval-chat-msg assistant";
+        const roleLabel = isUser ? "👤 질문" : "🤖 평가 에이전트";
+        let toolCallsHtml = "";
+        if (!isUser && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+          const names = m.tool_calls.map(tc => tc.name).join(", ");
+          toolCallsHtml = `<div class="eval-chat-tools-badge" title="${esc(JSON.stringify(m.tool_calls))}">
+            🔍 도구 실행: ${esc(names)}
+          </div>`;
+        }
+        return `<div class="${bubbleCls}">
+          <div class="eval-chat-msg-header">${esc(roleLabel)}</div>
+          ${toolCallsHtml}
+          <div class="eval-chat-msg-body">${esc(m.content || "")}</div>
+        </div>`;
+      }).join("")
+    : `<div class="eval-chat-empty">
+        채점 결과나 근거에 대해 질문해보세요.<br/>
+        <span style="font-size:10px;color:var(--muted)">예: "Transformer라는 명시가 p.14에 실제로 어디에 있나요?", "무엇을 근거로 판단했나요?"</span>
+      </div>`;
+
+  return `
+    <div class="eval-chat-section">
+      <div class="eval-chat-header">
+        <span>💬 평가 에이전트와 대화하기</span>
+        ${msgs.length > 0 ? `<button type="button" class="eval-chat-clear-btn" data-chat-clear="${esc(key)}" title="대화 내역 초기화">대화 초기화</button>` : ""}
+      </div>
+      <div class="eval-chat-msgs-box" data-chat-box="${esc(key)}">
+        ${msgListHtml}
+        ${chat.loading ? `<div class="eval-chat-msg assistant loading"><div class="eval-chat-msg-header">🤖 평가 에이전트</div><div class="eval-chat-msg-body">답변을 생각하고 필요한 문서를 검색하는 중입니다… ⏳</div></div>` : ""}
+      </div>
+      ${chat.error ? `<div class="eval-chat-error">${esc(chat.error)}</div>` : ""}
+      <div class="eval-chat-input-row">
+        <input type="text" class="eval-chat-input" data-chat-input="${esc(key)}"
+          placeholder="질문을 입력하세요 (Enter로 전송)"
+          value="${esc(chat.input || "")}"
+          ${chat.loading ? "disabled" : ""} />
+        <button type="button" class="eval-chat-send-btn" data-chat-send="${esc(key)}"
+          ${chat.loading ? "disabled" : ""}>
+          ${chat.loading ? "전송 중…" : "전송"}
+        </button>
+      </div>
+    </div>
+  `;
+}
+
 async function ensureAgenticEvals() {
   if (!state.runId) return;
   try {
@@ -4959,6 +5346,7 @@ async function ensureAgenticEvals() {
 async function runAgenticEval(key) {
   if (!state.runId || !key) return;
   if (state.batchJob && (state.batchJob.status === "queued" || state.batchJob.status === "running")) return;
+  delete state.agenticChats[key];
   const inflightKeys = Array.isArray(state.agenticEvalInflight) ? [...state.agenticEvalInflight] : [];
   if (!inflightKeys.includes(key)) inflightKeys.push(key);
   state.agenticEvalInflight = inflightKeys;
@@ -5284,6 +5672,29 @@ function paintDetail() {
         }
       };
     }
+
+    detail.querySelectorAll("[data-chat-send]").forEach(btn => {
+      btn.onclick = () => sendEvalChatMessage(btn.dataset.chatSend);
+    });
+    detail.querySelectorAll("[data-chat-clear]").forEach(btn => {
+      btn.onclick = () => clearEvalChat(btn.dataset.chatClear);
+    });
+    detail.querySelectorAll("[data-chat-input]").forEach(input => {
+      input.oninput = (e) => {
+        const k = input.dataset.chatInput;
+        if (!state.agenticChats[k]) state.agenticChats[k] = { messages: [], loading: false, loaded: true, input: "", error: null };
+        state.agenticChats[k].input = e.target.value;
+      };
+      input.onkeydown = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendEvalChatMessage(input.dataset.chatInput);
+        }
+      };
+    });
+    detail.querySelectorAll(".eval-chat-msgs-box").forEach(box => {
+      box.scrollTop = box.scrollHeight;
+    });
 
     const urlParams = new URLSearchParams(window.location.search);
     const targetKey = urlParams.get("key") || urlParams.get("highlight_key");

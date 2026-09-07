@@ -114,3 +114,127 @@ def cancel_agentic_eval_safe(api_url: str, run_id: str) -> None:
         cancel_agentic_eval(api_url, run_id)
     except AgenticEvalError:
         pass
+
+
+def invoke_agentic_eval_chat(
+    api_url: str,
+    run_id: str,
+    key: str,
+    message: str,
+    *,
+    timeout: float = 300,
+) -> Dict[str, Any]:
+    """Call POST /agentic-eval/chat on the inference API."""
+    payload = json.dumps(
+        {
+            "run_id": run_id,
+            "key": key,
+            "message": message,
+            "hooks": "agentic-evaluation_config",
+            "protocol": "grpc",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{api_url.rstrip('/')}/agentic-eval/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            data = json.loads(body)
+            if not isinstance(data, dict):
+                raise AgenticEvalError("invalid response from inference API", status_code=502)
+            return data
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and "detail" in parsed:
+                detail = str(parsed["detail"])
+        except Exception:
+            pass
+        raise AgenticEvalError(detail, status_code=exc.code) from exc
+    except urllib.error.URLError as exc:
+        raise AgenticEvalError(
+            f"Cannot reach inference API at {api_url}/agentic-eval/chat: {exc.reason}",
+            status_code=502,
+        ) from exc
+
+
+def get_agentic_eval_chat(
+    api_url: str,
+    run_id: str,
+    key: str,
+    *,
+    timeout: float = 30,
+) -> Dict[str, Any]:
+    """Call GET /agentic-eval/chat on the inference API."""
+    import urllib.parse
+    qs = urllib.parse.urlencode({"run_id": run_id, "key": key})
+    req = urllib.request.Request(
+        f"{api_url.rstrip('/')}/agentic-eval/chat?{qs}",
+        headers={"Content-Type": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            data = json.loads(body)
+            if not isinstance(data, dict):
+                raise AgenticEvalError("invalid response from inference API", status_code=502)
+            return data
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and "detail" in parsed:
+                detail = str(parsed["detail"])
+        except Exception:
+            pass
+        raise AgenticEvalError(detail, status_code=exc.code) from exc
+    except urllib.error.URLError as exc:
+        raise AgenticEvalError(
+            f"Cannot reach inference API at {api_url}/agentic-eval/chat: {exc.reason}",
+            status_code=502,
+        ) from exc
+
+
+def delete_agentic_eval_chat(
+    api_url: str,
+    run_id: str,
+    key: str,
+    *,
+    timeout: float = 30,
+) -> Dict[str, Any]:
+    """Call DELETE /agentic-eval/chat on the inference API."""
+    import urllib.parse
+    qs = urllib.parse.urlencode({"run_id": run_id, "key": key})
+    req = urllib.request.Request(
+        f"{api_url.rstrip('/')}/agentic-eval/chat?{qs}",
+        headers={"Content-Type": "application/json"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            data = json.loads(body)
+            if not isinstance(data, dict):
+                raise AgenticEvalError("invalid response from inference API", status_code=502)
+            return data
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and "detail" in parsed:
+                detail = str(parsed["detail"])
+        except Exception:
+            pass
+        raise AgenticEvalError(detail, status_code=exc.code) from exc
+    except urllib.error.URLError as exc:
+        raise AgenticEvalError(
+            f"Cannot reach inference API at {api_url}/agentic-eval/chat: {exc.reason}",
+            status_code=502,
+        ) from exc
+
