@@ -49,6 +49,15 @@ from agentic_viewer.highlights import chunk_highlights, page_highlights
 from agentic_viewer.image_tokens import replace_base64_images
 from agentic_viewer.pdf_source import infer_pdf_path, infer_run_document, pdf_info
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
+from agentic_viewer.wrong_cases import (
+    add_or_update_wrong_case,
+    batch_add_wrong_cases,
+    delete_wrong_case,
+    get_wrong_case_detail,
+    list_wrong_cases,
+    update_wrong_case_status,
+)
+from agentic_viewer.wrong_cases_page import WRONG_CASES_HTML
 
 def default_runs_root() -> Path:
     """Prefer shared repo outputs/runs, else legacy inference-pipeline path."""
@@ -1160,6 +1169,103 @@ def get_conversation(run_id: str) -> List[Dict[str, Any]]:
     return rows
 
 
+# --- Wrong Cases endpoints ---
+
+@app.get("/api/wrong-cases")
+def api_list_wrong_cases(
+    run_id: Optional[str] = None,
+    document: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+) -> Dict[str, Any]:
+    return list_wrong_cases(
+        run_id=run_id,
+        document=document,
+        status=status,
+        search=search,
+    )
+
+
+@app.get("/api/wrong-cases/{case_id}")
+def api_get_wrong_case_detail(case_id: str) -> Dict[str, Any]:
+    detail = get_wrong_case_detail(RUNS_ROOT, case_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"wrong case not found: {case_id}")
+    return detail
+
+
+@app.post("/api/wrong-cases")
+def api_create_wrong_case(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    run_id = str(body.get("run_id") or "").strip()
+    key = str(body.get("key") or "").strip()
+    note = str(body.get("note") or "").strip()
+    status = str(body.get("status") or "open").strip()
+    tags = body.get("tags")
+    user_snapshot = body.get("snapshot")
+    if not run_id or not key:
+        raise HTTPException(status_code=400, detail="run_id and key are required")
+    try:
+        return add_or_update_wrong_case(
+            RUNS_ROOT,
+            run_id,
+            key,
+            note=note,
+            status=status,
+            tags=tags,
+            user_snapshot=user_snapshot,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/wrong-cases/batch")
+def api_batch_create_wrong_cases(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    run_id = str(body.get("run_id") or "").strip()
+    keys = body.get("keys")
+    note = str(body.get("note") or "").strip()
+    status = str(body.get("status") or "open").strip()
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+    if not isinstance(keys, list) or not keys:
+        raise HTTPException(status_code=400, detail="keys must be a non-empty list of strings")
+    try:
+        added = batch_add_wrong_cases(
+            RUNS_ROOT,
+            run_id,
+            keys,
+            note=note,
+            status=status,
+        )
+        return {"cases": added, "count": len(added)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/wrong-cases/{case_id}")
+@app.put("/api/wrong-cases/{case_id}")
+def api_update_wrong_case(case_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    status = body.get("status")
+    note = body.get("note")
+    tags = body.get("tags")
+    updated = update_wrong_case_status(
+        case_id,
+        status=status,
+        note=note,
+        tags=tags,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"wrong case not found: {case_id}")
+    return updated
+
+
+@app.delete("/api/wrong-cases/{case_id}")
+def api_delete_wrong_case(case_id: str) -> Dict[str, Any]:
+    deleted = delete_wrong_case(case_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"wrong case not found: {case_id}")
+    return {"ok": True, "id": case_id}
+
+
 def _escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -1538,6 +1644,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--line); background: #152033; color: var(--text);
       font-size: 11px; cursor: pointer;
     }
+    .wrong-case-btn {
+      margin-top: 6px; padding: 3px 10px; border-radius: 999px;
+      border: 1px solid var(--line); background: #152033; color: var(--muted);
+      font-size: 11px; cursor: pointer; transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .wrong-case-btn:hover {
+      border-color: var(--warn); color: var(--warn);
+    }
+    .wrong-case-btn.active {
+      border-color: rgba(224, 164, 92, 0.6); background: rgba(224, 164, 92, 0.15);
+      color: var(--warn); font-weight: 600;
+    }
+    .eval-row.row-highlight td {
+      animation: evalRowPulse 3s ease-out;
+    }
+    @keyframes evalRowPulse {
+      0% { background: rgba(224, 164, 92, 0.4); }
+      30% { background: rgba(224, 164, 92, 0.25); }
+      100% { background: transparent; }
+    }
     .eval-page-chips {
       display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 4px 0 6px;
     }
@@ -1779,6 +1906,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <a href="/datasets">Datasets</a>
       <a href="/evaluation">Evaluation</a>
       <a href="/ground-truth">Ground Truth</a>
+      <a href="/wrong-cases">Wrong Cases</a>
     </nav>
     <div class="meta" id="headerMeta">Loading runs…</div>
   </header>
@@ -1831,7 +1959,43 @@ const state = {
   agentTreeCache: { runId: null, kv: null, eval: {} },
   agentTreeLoading: false,
   pagesChunksLoadedFor: null,
+  wrongCaseKeys: new Set(),
+  wrongCasesByKey: {},
 };
+
+function showToast(msg, actionText, actionFn) {
+  let toast = document.getElementById("appToast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "appToast";
+    toast.style.cssText = "position:fixed;bottom:24px;right:24px;background:#152438;color:#e7ecf3;padding:10px 18px;border-radius:8px;border:1px solid #3d86c6;box-shadow:0 6px 20px rgba(0,0,0,0.5);font-size:12px;z-index:9999;display:flex;align-items:center;gap:12px;transition:opacity 0.2s ease;font-family:var(--sans);";
+    document.body.appendChild(toast);
+  }
+  toast.innerHTML = `<span>${esc(msg)}</span>` + (actionText ? `<button type="button" style="background:#1a4971;border:1px solid #3d86c6;color:#fff;border-radius:999px;padding:3px 10px;cursor:pointer;font-size:11px">${esc(actionText)}</button>` : "");
+  if (actionText && actionFn) {
+    toast.querySelector("button").onclick = actionFn;
+  }
+  toast.style.opacity = "1";
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => { toast.style.opacity = "0"; }, 4500);
+}
+
+async function loadWrongCasesForRun() {
+  if (!state.runId) {
+    state.wrongCaseKeys = new Set();
+    state.wrongCasesByKey = {};
+    return;
+  }
+  try {
+    const res = await api(`/api/wrong-cases?run_id=${encodeURIComponent(state.runId)}`);
+    state.wrongCaseKeys = new Set((res.cases || []).map(c => c.key));
+    state.wrongCasesByKey = {};
+    (res.cases || []).forEach(c => { state.wrongCasesByKey[c.key] = c; });
+  } catch (_) {
+    state.wrongCaseKeys = new Set();
+    state.wrongCasesByKey = {};
+  }
+}
 
 function resetAgentTreeCache(runId) {
   state.agentTreeCache = { runId: runId, kv: null, eval: {} };
@@ -2348,6 +2512,8 @@ async function selectRun(runId, opts = {}) {
     state.agenticEvalInflight = [];
     state.agenticEvalError = null;
     state.evalOpenDetails = new Set();
+    state.wrongCaseKeys = new Set();
+    state.wrongCasesByKey = {};
     state.batchJob = null;
     stopBatchPoll();
   }
@@ -4517,7 +4683,13 @@ function renderEval() {
       agenticCell = `<button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
         ${batchActive ? "disabled" : ""}>agentic-evaluation</button>`;
     }
-    return `<tr>
+    const isWc = state.wrongCaseKeys && state.wrongCaseKeys.has(row.key);
+    const wcCase = isWc ? state.wrongCasesByKey[row.key] : null;
+    const wcBtn = isWc
+      ? `<button type="button" class="wrong-case-btn active" data-wc-key="${esc(row.key)}" data-wc-id="${esc(wcCase?.id || "")}" title="Registered in Wrong Cases. Click to view or manage.">✓ In Wrong Cases</button>`
+      : `<button type="button" class="wrong-case-btn" data-wc-key="${esc(row.key)}" title="Send this key to Wrong Cases">+ Wrong Case</button>`;
+
+    return `<tr class="eval-row" data-key-row="${esc(row.key)}">
       <td class="key">${esc(row.key)}</td>
       <td class="${hasGt ? (em ? "em-y" : "em-n") : ""}">${hasGt ? (em ? "Y" : "N") : "—"}</td>
       <td>${hasGt ? fmtPct(sp.f1) : "—"}<div class="sub">pred [${esc((sp.pred||[]).join(", "))}]${hasGt ? ` · gold [${esc((sp.gold||[]).join(", "))}]` : ""}</div></td>
@@ -4541,7 +4713,10 @@ function renderEval() {
             <div class="ev-text">${esc(et.gold || "(empty)")}${goldPageBtns}</div>
           </div>
         </details>
-        ${gtEditBtn}
+        <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          ${gtEditBtn}
+          ${wcBtn}
+        </div>
       </td>
       <td>${agenticCell}</td>
     </tr>`;
@@ -4612,6 +4787,7 @@ function renderEval() {
       ${incompleteKeys.length > 0 ? `<button type="button" class="agentic-eval-btn" id="evalRetryIncomplete"
         style="margin-left:8px" ${allKeysDisabled ? "disabled" : ""}>Retry incomplete (${incompleteKeys.length})</button>` : ""}
       ${hasStale ? `<button type="button" class="tab" id="cleanStaleEval" style="margin-left:8px;color:var(--warn,#e0a45c)" title="Clean up interrupted or dead running tasks">Clear Stale</button>` : ""}
+      <button type="button" class="tab" id="sendAllWrongCases" style="margin-left:8px;border-color:var(--warn,#e0a45c);color:var(--warn,#e0a45c)" title="Send all keys with EM=N to Wrong Cases">Send EM=N to Wrong Cases</button>
     </p>
     ${batchHtml}
     ${aeErr}
@@ -4630,7 +4806,7 @@ async function ensureEval(refresh=false) {
   if (!state.runId) return;
   if (state.evalLoading) return;
   if (!refresh && state.evalReport && !state.evalError) {
-    await ensureAgenticEvals();
+    await Promise.all([ensureAgenticEvals(), loadWrongCasesForRun()]);
     paintDetail();
     return;
   }
@@ -4654,7 +4830,7 @@ async function ensureEval(refresh=false) {
       document: state.evalReport?.document || r.document,
     } : r);
     renderRuns();
-    await ensureAgenticEvals();
+    await Promise.all([ensureAgenticEvals(), loadWrongCasesForRun()]);
   } catch (err) {
     state.evalReport = null;
     state.evalError = String(err.message || err);
@@ -4927,6 +5103,97 @@ function paintDetail() {
     });
     bindGtEditor(detail);
     resumeInferenceBatchJob();
+
+    detail.querySelectorAll(".wrong-case-btn").forEach(btn => {
+      btn.onclick = async () => {
+        const key = btn.dataset.wcKey;
+        const isWc = btn.classList.contains("active");
+        if (isWc) {
+          const caseId = btn.dataset.wcId;
+          const choice = confirm(`"${key}" is registered in Wrong Cases.\n\nClick OK to open the Wrong Cases page, or Cancel to remove it from Wrong Cases.`);
+          if (choice) {
+            window.location.href = `/wrong-cases?id=${encodeURIComponent(caseId)}`;
+          } else {
+            if (confirm(`Remove "${key}" from Wrong Cases?`)) {
+              try {
+                await api(`/api/wrong-cases/${encodeURIComponent(caseId)}`, { method: "DELETE" });
+                state.wrongCaseKeys.delete(key);
+                delete state.wrongCasesByKey[key];
+                paintDetail();
+                showToast(`Removed "${key}" from Wrong Cases`);
+              } catch (err) {
+                alert(`Failed to remove: ${err.message}`);
+              }
+            }
+          }
+          return;
+        }
+
+        try {
+          btn.textContent = "Adding…";
+          btn.disabled = true;
+          const res = await apiPost("/api/wrong-cases", {
+            run_id: state.runId,
+            key: key,
+          });
+          state.wrongCaseKeys.add(key);
+          state.wrongCasesByKey[key] = res;
+          paintDetail();
+          showToast(`Added "${key}" to Wrong Cases`, "View in Wrong Cases", () => {
+            window.location.href = `/wrong-cases?id=${encodeURIComponent(res.id)}`;
+          });
+        } catch (err) {
+          alert(`Failed to add to Wrong Cases: ${err.message}`);
+          btn.textContent = "+ Wrong Case";
+          btn.disabled = false;
+        }
+      };
+    });
+
+    const sendAllBtn = document.getElementById("sendAllWrongCases");
+    if (sendAllBtn) {
+      sendAllBtn.onclick = async () => {
+        const report = state.evalReport;
+        if (!report || !Array.isArray(report.per_key)) return;
+        const incorrectKeys = report.per_key
+          .filter(r => r.value?.exact_match === false)
+          .map(r => r.key);
+        if (incorrectKeys.length === 0) {
+          alert("No incorrect keys (EM=N) found in this run.");
+          return;
+        }
+        if (!confirm(`Send ${incorrectKeys.length} incorrect keys to Wrong Cases?`)) return;
+        try {
+          sendAllBtn.textContent = "Sending…";
+          sendAllBtn.disabled = true;
+          const res = await apiPost("/api/wrong-cases/batch", {
+            run_id: state.runId,
+            keys: incorrectKeys,
+          });
+          await loadWrongCasesForRun();
+          paintDetail();
+          showToast(`Added ${res.count} keys to Wrong Cases`, "View in Wrong Cases", () => {
+            window.location.href = "/wrong-cases";
+          });
+        } catch (err) {
+          alert(`Failed to batch add: ${err.message}`);
+          sendAllBtn.textContent = "Send all EM=N to Wrong Cases";
+          sendAllBtn.disabled = false;
+        }
+      };
+    }
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const targetKey = urlParams.get("key") || urlParams.get("highlight_key");
+    if (targetKey) {
+      setTimeout(() => {
+        const row = detail.querySelector(`tr[data-key-row="${CSS.escape(targetKey)}"]`);
+        if (row) {
+          row.scrollIntoView({ behavior: "smooth", block: "center" });
+          row.classList.add("row-highlight");
+        }
+      }, 100);
+    }
   }
   const chunkSearchBtn = document.getElementById("chunkSearchBtn");
   if (chunkSearchBtn) {
@@ -5094,6 +5361,12 @@ def datasets_page() -> str:
 @app.get("/ground-truth", response_class=HTMLResponse)
 def ground_truth_page() -> str:
     return GROUND_TRUTH_HTML
+
+
+@app.get("/wrong-cases", response_class=HTMLResponse)
+@app.get("/wrong-case", response_class=HTMLResponse)
+def wrong_cases_page() -> str:
+    return WRONG_CASES_HTML
 
 
 def main() -> None:

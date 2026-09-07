@@ -302,6 +302,7 @@ EVALUATION_HTML = r"""<!DOCTYPE html>
       <a href="/datasets">Datasets</a>
       <a href="/evaluation" class="active">Evaluation</a>
       <a href="/ground-truth">Ground Truth</a>
+      <a href="/wrong-cases">Wrong Cases</a>
     </nav>
     <div class="meta" id="headerMeta">Loading…</div>
   </header>

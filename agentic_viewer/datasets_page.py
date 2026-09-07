@@ -105,6 +105,7 @@ DATASETS_HTML = r"""<!DOCTYPE html>
       <a href="/datasets" class="active">Datasets</a>
       <a href="/evaluation">Evaluation</a>
       <a href="/ground-truth">Ground Truth</a>
+      <a href="/wrong-cases">Wrong Cases</a>
     </nav>
     <div class="meta" id="headerMeta">Loading…</div>
   </header>

@@ -120,6 +120,7 @@ GROUND_TRUTH_HTML = r"""<!DOCTYPE html>
       <a href="/datasets">Datasets</a>
       <a href="/evaluation">Evaluation</a>
       <a href="/ground-truth" class="active">Ground Truth</a>
+      <a href="/wrong-cases">Wrong Cases</a>
     </nav>
     <div class="meta" id="headerMeta">Loading…</div>
   </header>
