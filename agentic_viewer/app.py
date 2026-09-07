@@ -4268,16 +4268,61 @@ function renderSubmitEvaluation(tool) {
 
 function renderPageImageChatVlm(tool) {
   const args = tool.arguments || {};
-  const result = tool.result || {};
-  const parsed = result.result || result.parsed || {};
-  return `
+  const rawResult = tool.result != null ? tool.result : tool.result_preview;
+  const result = (typeof rawResult === "object" && rawResult !== null) ? rawResult : deepParse(rawResult || {});
+  const prompt = args.prompt || "";
+  const pages = Array.isArray(args.pages)
+    ? args.pages
+    : (args.page != null ? [args.page] : (Array.isArray(result.pages_attached) && result.pages_attached.length ? result.pages_attached : []));
+  const ok = result.ok;
+  const isErr = ok === false || Boolean(result.error);
+  const statusBadge = isErr
+    ? `<span class="tree-badge err">${esc(result.error ? "error" : "failed")}</span>`
+    : (ok === true ? `<span class="tree-badge ok">ok</span>` : "");
+
+  const attached = Array.isArray(result.pages_attached) ? result.pages_attached : [];
+  const missing = Array.isArray(result.pages_missing) ? result.pages_missing : [];
+  const responseText = result.response || result.response_preview || result.text || result.answer || result.result?.answer || result.result?.summary || "";
+
+  let html = `
     <div class="tree-kv">
-      page=${esc(args.page ?? "?")}
+      ${statusBadge}
+      pages=${esc(pages.length ? JSON.stringify(pages) : (args.page ?? "?"))}
+      ${attached.length ? ` · attached=${esc(JSON.stringify(attached))}` : ""}
+      ${missing.length ? ` · missing=${esc(JSON.stringify(missing))}` : ""}
       ${result.input_tokens != null ? ` · VLM in=${esc(result.input_tokens)} out=${esc(result.output_tokens ?? "—")}` : ""}
     </div>
-    ${parsed.answer || parsed.summary ? `<pre class="pretty" style="max-height:200px;margin-top:6px">${esc(parsed.answer || parsed.summary)}</pre>` : ""}
-    ${tool.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>` : ""}
   `;
+
+  if (prompt) {
+    html += `
+      <div class="viz-section" style="margin-top:6px">
+        <h3 style="margin:0 0 4px;font-size:11px;color:var(--muted)">Prompt</h3>
+        <pre class="pretty" style="max-height:160px;margin:0">${esc(prompt)}</pre>
+      </div>
+    `;
+  }
+
+  if (result.error) {
+    html += `
+      <div class="viz-section" style="margin-top:6px">
+        <h3 style="margin:0 0 4px;font-size:11px;color:var(--err)">Error</h3>
+        <pre class="pretty" style="max-height:160px;margin:0;color:var(--err)">${esc(result.error)}</pre>
+      </div>
+    `;
+  } else if (responseText) {
+    html += `
+      <div class="viz-section" style="margin-top:6px">
+        <h3 style="margin:0 0 4px;font-size:11px;color:var(--ok)">Response</h3>
+        <pre class="pretty" style="max-height:240px;margin:0">${esc(responseText)}</pre>
+      </div>
+    `;
+  }
+
+  if (tool.filename) {
+    html += `<div class="tree-kv" style="margin-top:6px"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>`;
+  }
+  return html;
 }
 
 function renderGenericToolResult(tool) {
