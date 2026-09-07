@@ -80,6 +80,26 @@ class PdfSourceTests(unittest.TestCase):
         self.assertIn("pdf-page-input", INDEX_HTML)
         self.assertIn("pdf-chunk-btn", INDEX_HTML)
         self.assertIn("renderCurrentPage", INDEX_HTML)
+        self.assertIn("renderPageCard", INDEX_HTML)
+        self.assertIn("openPagePreview", INDEX_HTML)
+        self.assertIn("extractPageNumbersFromText", INDEX_HTML)
+        self.assertIn("formatAgenticDetailText", INDEX_HTML)
+        self.assertIn("pdf-page-btn", INDEX_HTML)
+        self.assertIn("pdf-page-inline-btn", INDEX_HTML)
+
+    def test_page_highlights_api_endpoint(self) -> None:
+        from agentic_viewer.app import get_page_highlights
+
+        repo = Path(__file__).resolve().parents[2]
+        target = repo / "outputs" / "runs" / "agentic-183ead9e-83df-4410-aaf3-4c567988c79b"
+        if not target.is_dir():
+            self.skipTest("target run not found")
+
+        data = get_page_highlights("agentic-183ead9e-83df-4410-aaf3-4c567988c79b", 4)
+        self.assertEqual(data.get("page"), 4)
+        self.assertGreater(data.get("chunk_count", 0), 0)
+        self.assertIsInstance(data.get("regions"), list)
+        self.assertGreater(len(data.get("regions")), 0)
 
     def test_chunk_highlights_calibrated_from_pdf(self) -> None:
         from agentic_viewer.highlights import chunk_highlights
@@ -101,6 +121,19 @@ class PdfSourceTests(unittest.TestCase):
         # Verify bottom boundary is calibrated (~87.8%) rather than uncalibrated (~91.7%)
         self.assertLess(norm[3], 0.89)
         self.assertGreater(norm[3], 0.86)
+
+    def test_page_highlights_without_chunk_search(self) -> None:
+        from agentic_viewer.highlights import page_highlights
+
+        repo = Path(__file__).resolve().parents[2]
+        target = repo / "outputs" / "runs" / "agentic-183ead9e-83df-4410-aaf3-4c567988c79b"
+        if not target.is_dir():
+            self.skipTest("target run not found")
+        hl = page_highlights(target, 4)
+        self.assertEqual(hl.get("page"), 4)
+        self.assertGreater(hl.get("chunk_count", 0), 0)
+        self.assertGreater(len(hl.get("regions", [])), 0)
+        self.assertIn("4", hl.get("layout_paths", {}))
 
 
 if __name__ == "__main__":

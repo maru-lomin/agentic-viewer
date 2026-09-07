@@ -45,7 +45,7 @@ from agentic_viewer.ground_truth import (
 from agentic_viewer.ground_truth_page import GROUND_TRUTH_HTML
 from agentic_viewer.hierarchy import build_agent_tree
 from agentic_viewer.inference_jobs import make_inference_job_manager
-from agentic_viewer.highlights import chunk_highlights
+from agentic_viewer.highlights import chunk_highlights, page_highlights
 from agentic_viewer.image_tokens import replace_base64_images
 from agentic_viewer.pdf_source import infer_pdf_path, infer_run_document, pdf_info
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
@@ -1080,6 +1080,17 @@ def get_chunk_highlights(run_id: str, chunk_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.get("/api/runs/{run_id}/pages/{page_no}/highlights")
+def get_page_highlights(
+    run_id: str, page_no: int, q: Optional[str] = None
+) -> Dict[str, Any]:
+    root = _run_dir(run_id)
+    try:
+        return page_highlights(root, page_no, query=q)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/api/runs/{run_id}/pdf/info")
 def get_pdf_info(run_id: str) -> Dict[str, Any]:
     root = _run_dir(run_id)
@@ -1527,6 +1538,39 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--line); background: #152033; color: var(--text);
       font-size: 11px; cursor: pointer;
     }
+    .eval-page-chips {
+      display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 4px 0 6px;
+    }
+    .pdf-page-btn {
+      padding: 2px 8px; border-radius: 6px; border: 1px solid #2a4a6a;
+      background: #152033; color: #9ad0ff; font-size: 11px; cursor: pointer;
+      font-family: var(--mono); transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .pdf-page-btn:hover {
+      background: #1e3352; border-color: var(--accent); color: #fff;
+    }
+    .pdf-page-inline-btn {
+      display: inline-flex; align-items: center; gap: 2px;
+      padding: 0 4px; border-radius: 4px; border: 1px solid rgba(77, 170, 252, 0.4);
+      background: rgba(77, 170, 252, 0.12); color: var(--accent);
+      font-size: 11px; cursor: pointer; font-family: var(--mono);
+      vertical-align: baseline; margin: 0 2px;
+    }
+    .pdf-page-inline-btn:hover {
+      background: rgba(77, 170, 252, 0.28); border-color: var(--accent);
+    }
+    .chunk-preview-inline {
+      margin-top: 8px; padding: 8px 10px; background: #121820;
+      border: 1px solid var(--line); border-radius: 8px;
+      min-width: 360px; max-width: 100%; overflow-x: auto;
+    }
+    .preview-close-btn {
+      cursor: pointer; background: transparent; border: none;
+      color: var(--muted); font-size: 14px; font-weight: bold; padding: 2px 6px;
+      border-radius: 4px; line-height: 1;
+    }
+    .preview-close-btn:hover { color: var(--text); background: rgba(255,255,255,0.1); }
     .gt-edit-btn:hover { border-color: var(--accent); }
     .gt-edit-btn.warn {
       border-color: #7a5530; color: #e0c090; background: rgba(224, 164, 92, 0.12);
@@ -3143,9 +3187,13 @@ function renderChunkCard(container, row, hl, runId) {
     : `<tr><td colspan="5" class="empty">No highlight regions (layout missing or no match).</td></tr>`;
   const source = hl && hl.source ? ` · regions=${esc(hl.source)}` : "";
   container.innerHTML = `<details class="tree-node" open style="margin:0">
-    <summary><span class="title">${esc(row.chunk_id)}</span>
-      <span class="tree-badge">${esc((row.pages || [row.page]).join(","))}</span>
-      <span class="tree-kv">${esc(row.heading_path || "")}${source}</span>
+    <summary style="display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <span class="title">${esc(row.chunk_id)}</span>
+        <span class="tree-badge">${esc((row.pages || [row.page]).join(","))}</span>
+        <span class="tree-kv">${esc(row.heading_path || "")}${source}</span>
+      </div>
+      <button type="button" class="preview-close-btn" title="닫기">✕</button>
     </summary>
     <div class="tree-body">
       <div class="viz-section" style="margin:6px 0">
@@ -3162,11 +3210,176 @@ function renderChunkCard(container, row, hl, runId) {
       <pre class="pretty">${esc(row.text || "")}</pre>
     </div>
   </details>`;
+  const closeBtn = container.querySelector(".preview-close-btn");
+  if (closeBtn) {
+    closeBtn.onclick = (e) => {
+      e.stopPropagation();
+      container.remove();
+    };
+  }
   const pdfHost = container.querySelector(".pdf-chunk-host");
   const fallbackPages = (hl && hl.pages) || row.pages || (row.page ? [row.page] : []);
   if (pdfHost && (regions.length || (fallbackPages && fallbackPages.length))) {
     mountChunkPdfViewer(pdfHost, runId, regions, fallbackPages);
   }
+  bindChunkJumpButtons(container);
+  bindPageJumpButtons(container);
+}
+
+function renderPageCard(container, page, hl, runId, opts = {}) {
+  const regions = (hl && hl.regions) || [];
+  const chunks = (hl && hl.chunks) || [];
+  const chunkCount = hl ? (hl.chunk_count || chunks.length) : 0;
+  const keyLabel = opts.key ? ` · ${esc(opts.key)}` : "";
+  const source = hl && hl.source ? ` · regions=${esc(hl.source)}` : "";
+
+  let chunkSummaryHtml = "";
+  if (chunks.length > 0) {
+    chunkSummaryHtml = `
+      <div class="viz-section" style="margin:6px 0">
+        <h3 style="margin:0 0 4px">Page chunks (${chunks.length})</h3>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+          ${chunks.map(c => `
+            <button type="button" class="chunk-jump" data-chunk-id="${esc(c.chunk_id)}" style="padding:2px 8px;border-radius:6px;border:1px solid var(--line);background:#152033;color:var(--accent);font-size:11px;cursor:pointer" title="${esc(c.heading_path || c.chunk_id)}">
+              🎯 ${esc(c.chunk_id)}${c.heading_path ? ` (${esc(c.heading_path)})` : ""}
+            </button>
+          `).join("")}
+        </div>
+      </div>`;
+  }
+
+  const regionRows = regions.length
+    ? regions.map(r => {
+        const bbox = Array.isArray(r.bbox) ? r.bbox.map(n => Number(n).toFixed(1)).join(", ") : "";
+        const norm = Array.isArray(r.bbox_norm) ? r.bbox_norm.map(n => Number(n).toFixed(3)).join(", ") : "";
+        const cid = r.chunk_id ? `<code>${esc(r.chunk_id)}</code>` : "—";
+        return `<tr>
+          <td>${esc(String(r.page))}</td>
+          <td>${cid}</td>
+          <td><code>${esc(bbox)}</code></td>
+          <td>${norm ? `<code>${esc(norm)}</code>` : "—"}</td>
+          <td>${esc(String(r.n_elements || (r.element_ids || []).length || ""))}</td>
+        </tr>`;
+      }).join("")
+    : `<tr><td colspan="5" class="empty">No highlight regions on page ${page}.</td></tr>`;
+
+  container.innerHTML = `<details class="tree-node" open style="margin:0">
+    <summary style="display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <span class="title">Page ${page}${keyLabel}</span>
+        <span class="tree-badge ok">PDF Page ${page}</span>
+        ${chunkCount ? `<span class="tree-badge">${chunkCount} chunk(s)</span>` : ""}
+        <span class="tree-kv">${source}</span>
+      </div>
+      <button type="button" class="preview-close-btn" title="닫기">✕</button>
+    </summary>
+    <div class="tree-body">
+      <div class="viz-section" style="margin:6px 0">
+        <h3 style="margin:0 0 4px">PDF highlight</h3>
+        <div class="pdf-chunk-host"></div>
+      </div>
+      ${chunkSummaryHtml}
+      ${regions.length > 0 ? `
+      <div class="viz-section" style="margin:6px 0">
+        <h3 style="margin:0 0 4px">Highlight regions</h3>
+        <table class="kv-table">
+          <thead><tr><th>Page</th><th>Chunk</th><th>bbox (px)</th><th>bbox (norm)</th><th>#el</th></tr></thead>
+          <tbody>${regionRows}</tbody>
+        </table>
+      </div>` : ""}
+    </div>
+  </details>`;
+
+  const closeBtn = container.querySelector(".preview-close-btn");
+  if (closeBtn) {
+    closeBtn.onclick = (e) => {
+      e.stopPropagation();
+      container.remove();
+    };
+  }
+
+  const pdfHost = container.querySelector(".pdf-chunk-host");
+  if (pdfHost) {
+    mountChunkPdfViewer(pdfHost, runId, regions, [page]);
+  }
+
+  bindChunkJumpButtons(container);
+  bindPageJumpButtons(container);
+}
+
+function extractPageNumbersFromText(text) {
+  if (!text || typeof text !== "string") return [];
+  const found = new Set();
+  
+  // 1) 한국어 슬래시: 36/37페이지, 36/37/38페이지
+  const pSlash = /(\d+)(?:\s*\/\s*(\d+))+\s*페이지/g;
+  let m;
+  while ((m = pSlash.exec(text)) !== null) {
+    const nums = m[0].match(/\d+/g) || [];
+    for (const n of nums) {
+      const p = parseInt(n, 10);
+      if (p > 0 && p < 2000) found.add(p);
+    }
+  }
+
+  // 2) 한국어 쉼표: (10, 56페이지) 또는 10, 56페이지
+  const pComma = /(\d+)(?:\s*,\s*\d+)+\s*페이지/g;
+  while ((m = pComma.exec(text)) !== null) {
+    const nums = m[0].match(/\d+/g) || [];
+    for (const n of nums) {
+      const p = parseInt(n, 10);
+      if (p > 0 && p < 2000) found.add(p);
+    }
+  }
+
+  // 3) 한국어 단순: 59페이지, 24 페이지
+  const pSingle = /(\d+)\s*페이지/g;
+  while ((m = pSingle.exec(text)) !== null) {
+    const p = parseInt(m[1], 10);
+    if (p > 0 && p < 2000) found.add(p);
+  }
+
+  // 4) 영어: pages 11, 59 또는 page 24 또는 p. 59
+  const pEng = /\b(?:pages?|p\.)\s*(\d+(?:\s*(?:,|and|&)\s*\d+)*)/gi;
+  while ((m = pEng.exec(text)) !== null) {
+    const nums = m[1].match(/\d+/g) || [];
+    for (const n of nums) {
+      const p = parseInt(n, 10);
+      if (p > 0 && p < 2000) found.add(p);
+    }
+  }
+
+  return Array.from(found).sort((a, b) => a - b);
+}
+
+function formatAgenticDetailText(detailText, key="") {
+  if (!detailText) return "";
+  let safe = esc(String(detailText));
+
+  // 한국어 슬래시: 36/37페이지
+  safe = safe.replace(/(\d+)\s*\/\s*(\d+)\s*페이지/g, (match, p1, p2) => {
+    return `<button type="button" class="pdf-page-inline-btn" data-page="${p1}" data-key="${esc(key)}" title="${p1}페이지 원문 PDF 보기">${p1}</button>/<button type="button" class="pdf-page-inline-btn" data-page="${p2}" data-key="${esc(key)}" title="${p2}페이지 원문 PDF 보기">${p2}페이지 📄</button>`;
+  });
+
+  // 한국어 "N페이지"
+  safe = safe.replace(/(\d+)\s*페이지/g, (match, p) => {
+    return `<button type="button" class="pdf-page-inline-btn" data-page="${p}" data-key="${esc(key)}" title="${p}페이지 원문 PDF 보기">${match} 📄</button>`;
+  });
+
+  // 영어 "pages 11, 59" 또는 "page 24"
+  safe = safe.replace(/\b(pages?|p\.)\s*([0-9]+(?:\s*(?:,|&amp;|&)\s*[0-9]+)*)/gi, (fullMatch, prefix, numsStr) => {
+    const parts = numsStr.replace(/&amp;/g, '&').split(/([,\s&]+)/);
+    const linked = parts.map(part => {
+      const num = parseInt(part.trim(), 10);
+      if (Number.isFinite(num) && num > 0 && num < 2000) {
+        return `<button type="button" class="pdf-page-inline-btn" data-page="${num}" data-key="${esc(key)}" title="${num}페이지 원문 PDF 보기">${num} 📄</button>`;
+      }
+      return part;
+    }).join("");
+    return `${prefix} ${linked}`;
+  });
+
+  return safe;
 }
 
 async function openChunkPreview(chunkId, anchorEl) {
@@ -3174,13 +3387,23 @@ async function openChunkPreview(chunkId, anchorEl) {
   if (!id || !state.runId) return;
   const detail = document.getElementById("detail");
   if (!detail) return;
-  detail.querySelectorAll(".chunk-preview-inline").forEach(r => r.remove());
+
   const host = anchorEl && anchorEl.closest
-    ? (anchorEl.closest(".ev-block, .tree-body, td, .viz-section") || anchorEl.parentElement)
+    ? (anchorEl.closest(".agentic-eval-detail, .agentic-eval-text, .ev-block, .tree-body, td, .viz-section") || anchorEl.parentElement)
     : detail;
+
+  // Toggle closed if same preview already open
+  const existing = host.querySelector(".chunk-preview-inline");
+  if (existing && existing.dataset.previewChunk === id) {
+    existing.remove();
+    return;
+  }
+
+  detail.querySelectorAll(".chunk-preview-inline").forEach(r => r.remove());
+
   const box = document.createElement("div");
   box.className = "chunk-preview-inline";
-  box.style.cssText = "margin-top:8px;padding:8px 10px;background:#121820;border:1px solid var(--line);border-radius:8px";
+  box.dataset.previewChunk = id;
   box.innerHTML = `<div class="empty">Loading ${esc(id)}…</div>`;
   if (host && host.appendChild) host.appendChild(box);
   else detail.appendChild(box);
@@ -3195,9 +3418,58 @@ async function openChunkPreview(chunkId, anchorEl) {
   }
 }
 
+async function openPagePreview(pageNo, anchorEl, opts = {}) {
+  const page = parseInt(pageNo, 10);
+  if (!Number.isFinite(page) || page <= 0 || !state.runId) return;
+
+  const detail = document.getElementById("detail");
+  if (!detail) return;
+
+  const host = anchorEl && anchorEl.closest
+    ? (anchorEl.closest(".agentic-eval-detail, .agentic-eval-text, .ev-block, .tree-body, td, .viz-section") || anchorEl.parentElement)
+    : detail;
+
+  // Toggle closed if same preview already open
+  const existing = host.querySelector(".chunk-preview-inline");
+  if (existing && existing.dataset.previewPage === String(page)) {
+    existing.remove();
+    return;
+  }
+
+  detail.querySelectorAll(".chunk-preview-inline").forEach(r => r.remove());
+
+  const box = document.createElement("div");
+  box.className = "chunk-preview-inline";
+  box.dataset.previewPage = String(page);
+  box.innerHTML = `<div class="empty">Loading Page ${page}…</div>`;
+
+  if (host && host.appendChild) host.appendChild(box);
+  else detail.appendChild(box);
+
+  try {
+    const qParam = opts.quote ? `?q=${encodeURIComponent(opts.quote)}` : "";
+    const hl = await api(`/api/runs/${encodeURIComponent(state.runId)}/pages/${page}/highlights${qParam}`).catch(() => null);
+    renderPageCard(box, page, hl, state.runId, opts);
+  } catch (err) {
+    box.innerHTML = `<div class="empty" style="color:var(--err)">${esc(err.message || err)}</div>`;
+  }
+}
+
 function bindChunkJumpButtons(root) {
   (root || document).querySelectorAll(".chunk-jump").forEach(btn => {
     btn.onclick = () => openChunkPreview(btn.dataset.chunkId, btn);
+  });
+}
+
+function bindPageJumpButtons(root) {
+  (root || document).querySelectorAll(".pdf-page-btn, .pdf-page-inline-btn").forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const page = btn.dataset.page;
+      const key = btn.dataset.key || "";
+      const quote = btn.dataset.quote || "";
+      openPagePreview(page, btn, { key, quote });
+    };
   });
 }
 
@@ -4150,10 +4422,43 @@ function renderEval() {
         <button type="button" class="chunk-jump" data-chunk-id="${esc(id)}">${esc(id)}</button>
       </div>`;
     }).filter(Boolean).join("");
+
+    const predPages = Array.isArray(sp.pred) ? sp.pred : [];
+    const goldPages = Array.isArray(sp.gold) ? sp.gold : [];
+
+    let chunkBlockHtml;
+    if (chunkJumpRows) {
+      chunkBlockHtml = `<div class="ev-block">
+        <span class="ev-label search">SearchAgent chunks</span>
+        <div class="ev-text">${chunkJumpRows}</div>
+      </div>`;
+    } else {
+      const predPageBtns = predPages.map(p =>
+        `<button type="button" class="pdf-page-btn" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} 원문 PDF 보기">p.${p} 원문</button>`
+      ).join(" ");
+      chunkBlockHtml = `<div class="ev-block">
+        <span class="ev-label search">SearchAgent chunks</span>
+        <div class="ev-text" style="color:var(--muted)">
+          ${predPages.length > 0
+            ? `청크 미지정 (검색 페이지: ${predPageBtns})`
+            : `검색된 청크 없음 <button type="button" class="pdf-page-btn" data-page="1" data-key="${esc(row.key)}" title="PDF 1페이지부터 원문 열기" style="margin-left:4px">PDF 원문 보기</button>`}
+        </div>
+      </div>`;
+    }
+
+    const goldPageBtns = goldPages.length > 0
+      ? `<div style="margin-top:4px">
+          <span style="color:var(--muted);font-size:10px">gold pages:</span>
+          ${goldPages.map(p => `<button type="button" class="pdf-page-btn" data-page="${p}" data-key="${esc(row.key)}" title="Gold Page ${p} 원문 PDF 보기" style="margin-left:2px;border-color:#4a4020;background:#2a2618;color:#e0d0a0">p.${p}</button>`).join(" ")}
+        </div>`
+      : "";
+
     const ae = aeByKey[row.key];
     const keyInflight = inflightKeys.includes(row.key);
-    const batchActiveForKey = batchActive && batch && batch.active
-      && batch.active.some(x => x.key === row.key);
+    const batchActiveForKey = Boolean(batchActive && batch && (
+      (batch.current && batch.current.run_id === state.runId && batch.current.key === row.key) ||
+      (batch.active || []).some(x => x.run_id === state.runId && x.key === row.key)
+    ));
     const isActuallyRunning = Boolean(keyInflight || batchActiveForKey);
     const goldVerdictForBtn = String((ae && ae.is_valid_gold) || "").toLowerCase();
     const gtEditCls = goldVerdictForBtn === "invalid" ? " warn" : (hasGt ? "" : " warn");
@@ -4179,6 +4484,16 @@ function renderEval() {
       const detail = ae.reason_detail || ae.text || "";
       const isIncomplete = summary.includes("평가가 완료되지 않았습니다")
         || detail.includes("submit_evaluation을 호출하지 않았습니다");
+
+      const mentionedPages = extractPageNumbersFromText(detail + " " + summary);
+      const pageChipsHtml = mentionedPages.length > 0
+        ? `<div class="eval-page-chips">
+            <span style="color:var(--muted);font-size:11px">검증 페이지:</span>
+            ${mentionedPages.map(p => `<button type="button" class="pdf-page-btn" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} 원문 PDF 열기">p.${p} 원문</button>`).join("")}
+          </div>`
+        : "";
+      const formattedDetail = formatAgenticDetailText(detail, row.key);
+
       agenticCell = `
         <div class="agentic-eval-verdicts">
           ${verdict === "correct" || verdict === "incorrect"
@@ -4188,13 +4503,15 @@ function renderEval() {
           ${isIncomplete ? `<div class="agentic-eval-verdict warn" style="color:var(--warn,#e0a45c);background:rgba(224,164,92,0.15);border:1px solid rgba(224,164,92,0.4)">미완료</div>` : ""}
         </div>
         ${summary ? `<div class="agentic-eval-summary">${esc(summary)}</div>` : ""}
+        ${pageChipsHtml}
         ${detail ? `<div class="agentic-eval-detail"><details${evalDetailAttrs("agentic", row.key)}>
           <summary>상세</summary>
-          <div class="agentic-eval-text">${esc(detail)}</div>
+          <div class="agentic-eval-text">${formattedDetail}</div>
         </details></div>` : ""}
-        <div style="margin-top:6px">
+        <div style="margin-top:6px;display:flex;gap:6px;align-items:center">
           <button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
             ${batchActive ? "disabled" : ""}>Retry</button>
+          ${mentionedPages.length === 0 ? `<button type="button" class="pdf-page-btn" data-page="1" data-key="${esc(row.key)}" title="PDF 원문 열기">원문 PDF</button>` : ""}
         </div>`;
     } else {
       agenticCell = `<button type="button" class="agentic-eval-btn" data-agentic-key="${esc(row.key)}"
@@ -4218,13 +4535,10 @@ function renderEval() {
             <span class="ev-label search">SearchAgent page_reasons</span>
             <div class="ev-text">${esc(sr.pred || row.reason || "(empty)")}</div>
           </div>
-          ${chunkJumpRows ? `<div class="ev-block">
-            <span class="ev-label search">SearchAgent chunks</span>
-            <div class="ev-text">${chunkJumpRows}</div>
-          </div>` : ""}
+          ${chunkBlockHtml}
           <div class="ev-block">
             <span class="ev-label gold">gold evidences</span>
-            <div class="ev-text">${esc(et.gold || "(empty)")}</div>
+            <div class="ev-text">${esc(et.gold || "(empty)")}${goldPageBtns}</div>
           </div>
         </details>
         ${gtEditBtn}
@@ -4258,8 +4572,10 @@ function renderEval() {
   const hasStale = (report.per_key || []).some(row => {
     const ae = aeByKey[row.key];
     const keyInflight = inflightKeys.includes(row.key);
-    const batchActiveForKey = Boolean(batchActive && batch && batch.active
-      && batch.active.some(x => x.key === row.key));
+    const batchActiveForKey = Boolean(batchActive && batch && (
+      (batch.current && batch.current.run_id === state.runId && batch.current.key === row.key) ||
+      (batch.active || []).some(x => x.run_id === state.runId && x.key === row.key)
+    ));
     return Boolean(ae && ae.status === "running" && !keyInflight && !batchActiveForKey);
   });
 
@@ -4661,6 +4977,7 @@ function paintDetail() {
     };
   });
   bindChunkJumpButtons(detail);
+  bindPageJumpButtons(detail);
   const openJsonDump = async (relPath) => {
     const data = await api(runFileUrl(relPath));
     const w = window.open("", "_blank");
