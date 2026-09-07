@@ -2108,6 +2108,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .tree-node.session.shared > summary { border-left: 4px solid #7eb8da; margin-left: 32px; }
     .tree-node.key-result > summary { border-left: 4px solid #5a9b6a; margin-left: 32px; }
     .tree-node.turn > summary { border-left: 4px solid #6b7c93; margin-left: 48px; }
+    .tree-node.search-prompts > summary { border-left: 4px solid #f0a85c; margin-left: 48px; }
+    .search-cues-pill {
+      display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: rgba(224, 164, 92, 0.15); color: #f0c060; border: 1px solid rgba(224, 164, 92, 0.35);
+      margin-right: 4px; margin-bottom: 2px; word-break: break-word;
+    }
+    .allowed-values-tag {
+      display: inline-block; font-size: 11px; padding: 2px 6px; border-radius: 4px;
+      background: rgba(62, 207, 142, 0.12); color: #3ecf8e; border: 1px solid rgba(62, 207, 142, 0.3);
+      font-family: var(--mono); word-break: break-word;
+    }
     .tree-node.output > summary { border-left: 4px solid #3ecf8e; }
     .tree-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
     .tree-tool {
@@ -3237,6 +3248,136 @@ function renderMasterPrompts(prompts) {
   </details>`;
 }
 
+function renderSearchInitialState(initialState, prompts, opts = {}) {
+  if (!initialState && !prompts) return "";
+  const init = initialState || {};
+  const p = prompts || {};
+  const keys = Array.isArray(init.keys) ? init.keys : [];
+  const outline = init.document_outline || "";
+  const prior = init.prior_context || null;
+  const taskInstr = init.task_instruction || "";
+  const completionInstr = init.completion_instruction || "";
+  const sys = p.system || "";
+  const user = p.user || "";
+
+  if (!keys.length && !outline && !prior && !sys && !user && !taskInstr) {
+    return "";
+  }
+
+  const nKeys = keys.length;
+  const outlineLines = outline ? outline.split("\n").length : 0;
+
+  // 1. Target Keys & Search Cues table
+  let keysHtml = "";
+  if (nKeys > 0) {
+    const rows = keys.map(k => {
+      const cuesPills = k.search_cues
+        ? `<div style="margin-bottom:4px">
+            <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Search Cues:</span>
+            <span class="search-cues-pill">${esc(k.search_cues)}</span>
+          </div>`
+        : "";
+      const allowedTags = k.allowed_values
+        ? `<div>
+            <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Allowed Values:</span>
+            <span class="allowed-values-tag">${esc(k.allowed_values)}</span>
+          </div>`
+        : "";
+      const cuesAllowedCell = (cuesPills || allowedTags)
+        ? `${cuesPills}${allowedTags}`
+        : `<span class="muted" style="font-size:11px">—</span>`;
+
+      return `<tr>
+        <td style="font-weight:600;color:var(--text);font-family:var(--mono);font-size:12px;vertical-align:top">${esc(k.key)}</td>
+        <td style="vertical-align:top">${cuesAllowedCell}</td>
+        <td style="font-size:11px;line-height:1.45;color:var(--muted);vertical-align:top">${esc(k.description || "")}</td>
+      </tr>`;
+    }).join("");
+
+    keysHtml = `
+      <div class="viz-section" style="margin-top:6px">
+        <h3 style="margin:0 0 6px;color:var(--text);display:flex;align-items:center;gap:8px">
+          Target Keys & Search Cues
+          <span class="tree-badge ok" style="font-weight:normal">${esc(nKeys)} key(s)</span>
+        </h3>
+        <table class="kv-table" style="margin:0">
+          <thead>
+            <tr>
+              <th style="width:26%">Key</th>
+              <th style="width:34%">Search Cues & Allowed Values</th>
+              <th>Schema Description</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  // 2. Pre-injected Document Outline (Compact TOC)
+  let outlineHtml = "";
+  if (outline) {
+    outlineHtml = `
+      <details class="viz-section" style="margin-top:8px" open>
+        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:6px;user-select:none">
+          Document outline (compact table of contents)
+          <span class="tree-badge">${esc(outlineLines)} lines / sections</span>
+        </summary>
+        <pre class="pretty" style="max-height:180px;margin:6px 0 0;font-size:11px;line-height:1.4">${esc(outline)}</pre>
+      </details>`;
+  }
+
+  // 3. Task Instruction
+  let instrHtml = "";
+  if (taskInstr) {
+    instrHtml = `
+      <div class="hint" style="margin:4px 0 6px;line-height:1.4">
+        <b>Assigned Search Task:</b> ${esc(taskInstr)}
+      </div>`;
+  }
+
+  // 4. Raw Full Prompts (User and System)
+  let promptsHtml = "";
+  if (sys || user) {
+    promptsHtml = `
+      <details class="viz-section" style="margin-top:8px">
+        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:6px;user-select:none">
+          Raw LLM Prompts (User & System)
+          <span class="tree-badge">request payload</span>
+        </summary>
+        <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px">
+          ${user ? `
+            <div class="flow-item user">
+              <div class="label" style="font-weight:600;font-size:11px;color:var(--accent);margin-bottom:2px">User Prompt (Initial Prompt)</div>
+              <pre class="pretty" style="max-height:260px;margin:0;font-size:11px;line-height:1.4">${esc(user)}</pre>
+            </div>
+          ` : ""}
+          ${sys ? `
+            <div class="flow-item system">
+              <div class="label" style="font-weight:600;font-size:11px;color:#9b7bd4;margin-bottom:2px">System Prompt</div>
+              <pre class="pretty" style="max-height:260px;margin:0;font-size:11px;line-height:1.4">${esc(sys)}</pre>
+            </div>
+          ` : ""}
+        </div>
+      </details>`;
+  }
+
+  return `<details class="tree-node search-prompts" open>
+    <summary>
+      <span class="title">SearchAgent initial state & prompts</span>
+      ${nKeys ? `<span class="tree-badge ok">${esc(nKeys)} target key(s)</span>` : ""}
+      ${outline ? `<span class="tree-badge">outline (${esc(outlineLines)}p)</span>` : ""}
+      ${prior ? `<span class="tree-badge warn">prior progress</span>` : ""}
+      ${(sys || user) ? `<span class="tree-badge">system + user</span>` : ""}
+    </summary>
+    <div class="tree-body">
+      ${instrHtml}
+      ${keysHtml}
+      ${outlineHtml}
+      ${promptsHtml}
+    </div>
+  </details>`;
+}
+
 function renderSearchTurn(turn) {
   const err = turn.error ? `<span class="tree-badge err">error</span>` : "";
   const tools = (turn.tool_results || []).map(tr =>
@@ -3312,6 +3453,7 @@ function renderSearchSession(session, opts = {}) {
       ${err}
     </summary>
     <div class="tree-body">
+      ${renderSearchInitialState(session.initial_state, session.prompts, { shared })}
       ${renderHandoffBox(
         "Received from previous session (prior_context_in)",
         session.prior_context_in
@@ -4049,6 +4191,8 @@ function renderSearchAgent(node) {
     : (pages.length
       ? `<span class="tree-badge ok">pages=${esc(pages.join(","))}</span>`
       : `<span class="tree-badge warn">pages=∅</span>`);
+  const hasOutline = !!(node.initial_state && node.initial_state.document_outline);
+  const outlineBadge = hasOutline ? `<span class="tree-badge">TOC outline</span>` : "";
   const sharedHint = shared
     ? `<p class="hint" style="margin:4px 0 8px">
         One shared SearchAgent ReAct loop for ${esc(nKeys)} keys
@@ -4066,6 +4210,7 @@ function renderSearchAgent(node) {
       <span class="tree-kv">${esc(node.key)}</span>
       ${timingBadge(node.timing, "warn")}
       ${summaryBadge}
+      ${outlineBadge}
     </summary>
     <div class="tree-body">
       ${shared ? "" : renderSearchOutput(output)}
@@ -4079,7 +4224,7 @@ function renderSearchAgent(node) {
         nSessions: sessions.length,
         shared,
       })).join("") :
-        `<div class="tree-kv">Search turn dumps not linked (legacy run).</div>`}
+        `${renderSearchInitialState(node.initial_state, node.prompts, { shared })}<div class="tree-kv">Search turn dumps not linked (legacy run).</div>`}
       ${shared ? renderKeyResultsSection(keyResults) : ""}
     </div>
   </details>`;

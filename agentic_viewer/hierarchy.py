@@ -386,8 +386,9 @@ def _compact_step(step: Dict[str, Any], *, filename: str) -> Dict[str, Any]:
         "tool_results": compact_tool_results,
         "tool_message_est_tokens": tool_message_est_tokens or None,
         "submit_output": _extract_submit_output(compact_tool_results),
-        # Keep first user message for prior_context reconstruction (legacy runs).
+        # Keep first user and system messages for SearchAgent prompt / initial state reconstruction
         "first_user_content": _first_user_content(step.get("request_messages") or []),
+        "first_system_content": _first_system_content(step.get("request_messages") or []),
         "request_summary": _summarize_request_messages(
             step.get("request_messages") or []
         ),
@@ -502,6 +503,97 @@ def _extract_prior_from_user(content: str) -> Optional[Dict[str, Any]]:
         return obj if isinstance(obj, dict) else None
     except json.JSONDecodeError:
         return None
+
+
+def _parse_key_description(desc: str) -> Dict[str, Optional[str]]:
+    """Extract search cues and allowed values from schema key description."""
+    cues = None
+    m_cues = re.search(
+        r"Search cues:\s*([\s\S]*?)(?=(?:\.\s*(?:Allowed values|Prefer|Convert|If|Map)|[.,;]?\s*(?:OEM\s*)?\(choose|\n|\Z))",
+        desc,
+        re.IGNORECASE,
+    )
+    if m_cues:
+        cues = m_cues.group(1).strip().rstrip(".,;")
+
+    allowed = None
+    m_allowed = re.search(
+        r"(?:Allowed values(?:\s*\([^)]*\))?|\(choose exactly one\)):\s*([^\n]+?)(?=\.\s*If|\Z)",
+        desc,
+        re.IGNORECASE,
+    )
+    if m_allowed:
+        allowed = m_allowed.group(1).strip().rstrip(".,;")
+
+    return {"cues": cues, "allowed": allowed}
+
+
+def _parse_search_user_prompt(content: str) -> Dict[str, Any]:
+    """Parse target keys, outline TOC, prior context, and instructions from SearchAgent user prompt."""
+    if not content:
+        return {}
+    out: Dict[str, Any] = {}
+
+    # 1. Document outline / compact TOC
+    m_toc = re.search(
+        r"Document outline \(compact table of contents\):\s*```[^\n]*\n([\s\S]*?)\n```",
+        content,
+    )
+    if m_toc:
+        out["document_outline"] = m_toc.group(1).strip()
+
+    # 2. Prior progress / context
+    prior = _extract_prior_from_user(content)
+    if prior:
+        out["prior_context"] = prior
+
+    # 3. Keys and descriptions
+    keys: List[Dict[str, Any]] = []
+    multi_matches = re.findall(
+        r"- key:\s*(.+?)\n\s+description:\s*([\s\S]*?)(?=(?:\n- key:|\nDocument outline|\nPrior search|\nUse tools|\Z))",
+        content,
+    )
+    if multi_matches:
+        for k, d in multi_matches:
+            k_clean = k.strip()
+            d_clean = d.strip()
+            parsed_meta = _parse_key_description(d_clean)
+            keys.append({
+                "key": k_clean,
+                "description": d_clean,
+                "search_cues": parsed_meta["cues"],
+                "allowed_values": parsed_meta["allowed"],
+            })
+    else:
+        single_match = re.search(
+            r"(?:^|\n)key:\s*(.+?)\n(?:description:\s*)?([\s\S]*?)(?=(?:\nDocument outline|\nPrior search|\nUse tools|\Z))",
+            content,
+        )
+        if single_match:
+            k_clean = single_match.group(1).strip()
+            d_clean = single_match.group(2).strip()
+            parsed_meta = _parse_key_description(d_clean)
+            keys.append({
+                "key": k_clean,
+                "description": d_clean,
+                "search_cues": parsed_meta["cues"],
+                "allowed_values": parsed_meta["allowed"],
+            })
+
+    out["keys"] = keys
+
+    # 4. Leading / trailing instructions
+    lead_m = re.match(r"^([\s\S]*?)(?=(?:Keys:|key:|\Z))", content)
+    if lead_m:
+        lead = lead_m.group(1).strip()
+        if lead:
+            out["task_instruction"] = lead
+
+    trail_m = re.search(r"(Use tools as needed[\s\S]*)$", content)
+    if trail_m:
+        out["completion_instruction"] = trail_m.group(1).strip()
+
+    return out
 
 
 def _is_eval_master_step(filename: str, label: Any) -> bool:
@@ -824,7 +916,7 @@ def _load_priors_from_conversation(
         master_step = 0
         prefix = ""
         sess = 0
-        m = re.match(r"^m(\d+)(?:_t\d+_k\d+)?_search_(.+)_s(\d+)_user$", kind)
+        m = re.match(r"^m(\d+)(?:_t\d+(?:_k\d+)?)?_search_(.+)_s(\d+)_user$", kind)
         if m:
             master_step, prefix, sess = int(m.group(1)), m.group(2), int(m.group(3))
         else:
@@ -838,6 +930,52 @@ def _load_priors_from_conversation(
         prior = _extract_prior_from_user(content)
         if prior:
             out[(master_step, prefix, sess)] = prior
+            out.setdefault((0, prefix, sess), prior)
+    return out
+
+
+def _load_search_prompts_from_conversation(
+    agent_dir: Path,
+) -> Dict[Tuple[int, str, int], Dict[str, str]]:
+    """
+    Map (master_step, key_prefix, session_index) → {"system": str, "user": str}
+    for SearchAgent sessions recorded in conversation.jsonl.
+    """
+    path = agent_dir / "conversation.jsonl"
+    out: Dict[Tuple[int, str, int], Dict[str, str]] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = str(row.get("kind") or "")
+        m = re.match(
+            r"^m(\d+)(?:_t\d+(?:_k\d+)?)?_search_(.+)_s(\d+)_(system|user)$",
+            kind,
+        )
+        if m:
+            master_step, prefix, sess, role = (
+                int(m.group(1)),
+                m.group(2),
+                int(m.group(3)),
+                m.group(4),
+            )
+            content = row.get("content")
+            if isinstance(content, str) and content.strip():
+                out.setdefault((master_step, prefix, sess), {})[role] = content
+                out.setdefault((0, prefix, sess), {})[role] = content
+        else:
+            m2 = re.match(r"^search_(.+)_s(\d+)_(system|user)$", kind)
+            if m2:
+                prefix, sess, role = m2.group(1), int(m2.group(2)), m2.group(3)
+                content = row.get("content")
+                if isinstance(content, str) and content.strip():
+                    out.setdefault((0, prefix, sess), {})[role] = content
     return out
 
 
@@ -848,6 +986,7 @@ def _group_search_sessions(
     final_handoff_summary: str = "",
     final_prior_context: Optional[Dict[str, Any]] = None,
     conversation_priors: Optional[Dict[Tuple[int, str, int], Dict[str, Any]]] = None,
+    conversation_prompts: Optional[Dict[Tuple[int, str, int], Dict[str, str]]] = None,
     key_prefix: str = "",
     master_step: int = 0,
 ) -> List[Dict[str, Any]]:
@@ -864,16 +1003,43 @@ def _group_search_sessions(
         turns = sessions[sess]
         meta = meta_by_session.get(sess) or {}
 
+        # Resolve system and user prompts for this session
+        conv_prompt = (conversation_prompts or {}).get(
+            (master_step, key_prefix, sess)
+        ) or (conversation_prompts or {}).get((0, key_prefix, sess)) or {}
+        system_prompt = conv_prompt.get("system")
+        user_prompt = conv_prompt.get("user")
+
+        if (not user_prompt or not system_prompt) and turns:
+            for t in turns:
+                if not user_prompt:
+                    user_prompt = t.get("first_user_content")
+                if not system_prompt:
+                    system_prompt = t.get("first_system_content")
+                if user_prompt and system_prompt:
+                    break
+
         # What this session received.
         prior_in = meta.get("prior_context_in")
         if prior_in is None:
             prior_in = conversation_priors.get((master_step, key_prefix, sess))
-        if prior_in is None and turns:
+        if prior_in is None:
             prior_in = _extract_prior_from_user(
-                turns[0].get("first_user_content") or ""
+                user_prompt
+                or (turns[0].get("first_user_content") if turns else "")
+                or ""
             )
+
+        # Parse initial state from user prompt
+        initial_state = _parse_search_user_prompt(user_prompt or "")
+        if prior_in and not initial_state.get("prior_context"):
+            initial_state["prior_context"] = prior_in
+        elif initial_state.get("prior_context") and not prior_in:
+            prior_in = initial_state["prior_context"]
+
         for t in turns:
             t.pop("first_user_content", None)
+            t.pop("first_system_content", None)
 
         prior_out = meta.get("prior_context_out")
         handoff_summary = str(meta.get("handoff_summary") or "")
@@ -899,6 +1065,23 @@ def _group_search_sessions(
             else:
                 status = "complete" if pages else "unknown"
 
+        prompts_dict = None
+        if system_prompt or user_prompt:
+            prompts_dict = {
+                "system": system_prompt,
+                "user": user_prompt,
+            }
+
+        has_initial_state = bool(
+            initial_state
+            and (
+                initial_state.get("keys")
+                or initial_state.get("document_outline")
+                or initial_state.get("prior_context")
+                or initial_state.get("task_instruction")
+            )
+        )
+
         out.append(
             {
                 "session_index": sess,
@@ -913,6 +1096,8 @@ def _group_search_sessions(
                 "prior_context_in": prior_in,
                 "prior_context_out": prior_out,
                 "handoff_summary": handoff_summary,
+                "prompts": prompts_dict,
+                "initial_state": initial_state if has_initial_state else None,
             }
         )
 
@@ -1258,6 +1443,8 @@ def _build_batch_search_agent(
     master_step: int = 0,
     default_status: str = "unknown",
     key_batch_prefixes: Optional[Dict[str, str]] = None,
+    conversation_priors: Optional[Dict[Tuple[int, str, int], Dict[str, Any]]] = None,
+    conversation_prompts: Optional[Dict[Tuple[int, str, int], Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """
     One SearchAgent node for a multi-key ``search_pages`` batch.
@@ -1333,6 +1520,8 @@ def _build_batch_search_agent(
             str((batch_items[0] or {}).get("key") or "")
         ),
         master_step=master_step,
+        conversation_priors=conversation_priors,
+        conversation_prompts=conversation_prompts,
     )
     n_turns = sum(len(s.get("turns") or []) for s in shared_sessions)
     n_runtime_sessions = len(shared_sessions) or 1
@@ -1367,6 +1556,7 @@ def _build_batch_search_agent(
         else ("accepted" if default_status in {"accepted", "running", "queued"} else default_status)
     )
 
+    first_sess = shared_sessions[0] if shared_sessions else {}
     return {
         "type": "search_agent",
         "key": (
@@ -1377,6 +1567,8 @@ def _build_batch_search_agent(
         "batch": True,
         "shared": is_shared_batch,
         "key_results": key_results,
+        "prompts": first_sess.get("prompts"),
+        "initial_state": first_sess.get("initial_state"),
         "output": {
             "status": batch_status,
             "pages": [],
@@ -1409,6 +1601,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
     master_steps, search_by_prefix = _load_steps(agent_dir)
     master_prompts = _load_master_prompts(agent_dir)
     conversation_priors = _load_priors_from_conversation(agent_dir)
+    conversation_prompts = _load_search_prompts_from_conversation(agent_dir)
     tool_dumps = _load_tool_dumps(tools_dir)
     conversation_tools = _load_master_tool_results_from_conversation(agent_dir)
     # Mutable queues so repeated same-name tools in one turn consume in order.
@@ -1509,6 +1702,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
             ),
             final_prior_context=call["result"].get("prior_context"),
             conversation_priors=conversation_priors,
+            conversation_prompts=conversation_prompts,
             key_prefix=prefix,
             master_step=int(call["master_step"] or 0),
         )
@@ -1622,6 +1816,8 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                         master_step=mstep,
                         default_status="running",
                         key_batch_prefixes=key_batch_prefixes,
+                        conversation_priors=conversation_priors,
+                        conversation_prompts=conversation_prompts,
                     )
                     # Reflect enqueue status when nothing finished yet.
                     n_done = sum(
@@ -1701,6 +1897,8 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                                 search_by_prefix=search_by_prefix,
                                 master_step=mstep,
                                 key_batch_prefixes=key_batch_prefixes,
+                                conversation_priors=conversation_priors,
+                                conversation_prompts=conversation_prompts,
                             )
                         )
                         remaining_ids = {id(c) for c in cross_queue}
@@ -1721,6 +1919,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                         tool_node["filename"] = call.get("filename") or tool_node.get(
                             "filename"
                         )
+                        first_sess = (call.get("search_sessions") or [{}])[0]
                         tool_node["children"].append(
                             {
                                 "type": "search_agent",
@@ -1744,6 +1943,8 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                                         "n_search_sessions"
                                     ),
                                 },
+                                "prompts": first_sess.get("prompts"),
+                                "initial_state": first_sess.get("initial_state"),
                                 "sessions": call.get("search_sessions") or [],
                                 "filename": call.get("filename"),
                                 "note": call.get("note"),
@@ -1757,6 +1958,7 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                     tool_node["filename"] = call.get("filename") or tool_node.get(
                         "filename"
                     )
+                    first_sess = (call.get("search_sessions") or [{}])[0]
                     tool_node["children"].append(
                         {
                             "type": "search_agent",
@@ -1778,6 +1980,8 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                                     "n_search_sessions"
                                 ),
                             },
+                            "prompts": first_sess.get("prompts"),
+                            "initial_state": first_sess.get("initial_state"),
                             "sessions": call.get("search_sessions") or [],
                             "filename": call.get("filename"),
                             "note": call.get("note"),
