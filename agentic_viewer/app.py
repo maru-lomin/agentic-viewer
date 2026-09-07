@@ -3255,79 +3255,17 @@ function renderSearchInitialState(initialState, prompts, opts = {}) {
   const keys = Array.isArray(init.keys) ? init.keys : [];
   const outline = init.document_outline || "";
   const prior = init.prior_context || null;
-  const taskInstr = init.task_instruction || "";
-  const completionInstr = init.completion_instruction || "";
   const sys = p.system || "";
   const user = p.user || "";
 
-  if (!keys.length && !outline && !prior && !sys && !user && !taskInstr) {
+  if (!keys.length && !outline && !prior && !sys && !user) {
     return "";
   }
 
   const nKeys = keys.length;
   const outlineLines = outline ? outline.split("\n").length : 0;
 
-  // 1. Structured Table (Parsed View for quick reference)
-  let parsedSectionHtml = "";
-  if (nKeys > 0 || outline) {
-    let rows = "";
-    if (nKeys > 0) {
-      rows = keys.map(k => {
-        const cuesPills = k.search_cues
-          ? `<div style="margin-bottom:4px">
-              <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Search Cues:</span>
-              <span class="search-cues-pill">${esc(k.search_cues)}</span>
-            </div>`
-          : "";
-        const allowedTags = k.allowed_values
-          ? `<div>
-              <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Allowed Values:</span>
-              <span class="allowed-values-tag">${esc(k.allowed_values)}</span>
-            </div>`
-          : "";
-        const cuesAllowedCell = (cuesPills || allowedTags)
-          ? `${cuesPills}${allowedTags}`
-          : `<span class="muted" style="font-size:11px">—</span>`;
-
-        return `<tr>
-          <td style="font-weight:600;color:var(--text);font-family:var(--mono);font-size:12px;vertical-align:top">${esc(k.key)}</td>
-          <td style="vertical-align:top">${cuesAllowedCell}</td>
-          <td style="font-size:11px;line-height:1.45;color:var(--muted);vertical-align:top">${esc(k.description || "")}</td>
-        </tr>`;
-      }).join("");
-    }
-
-    parsedSectionHtml = `
-      <details class="viz-section" style="margin-top:8px">
-        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:6px;user-select:none">
-          Parsed Key & Schema Summary Table (Quick Reference)
-          <span class="tree-badge ok">${esc(nKeys)} key(s)</span>
-          ${outline ? `<span class="tree-badge">TOC: ${esc(outlineLines)} lines</span>` : ""}
-        </summary>
-        <div style="margin-top:8px">
-          ${nKeys > 0 ? `
-            <table class="kv-table" style="margin:0 0 10px">
-              <thead>
-                <tr>
-                  <th style="width:26%">Key</th>
-                  <th style="width:34%">Search Cues & Allowed Values</th>
-                  <th>Schema Description</th>
-                </tr>
-              </thead>
-              <tbody>${rows}</tbody>
-            </table>
-          ` : ""}
-          ${outline ? `
-            <div style="margin-top:6px">
-              <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px">Document Outline (Compact TOC):</div>
-              <pre class="pretty" style="max-height:160px;margin:0;font-size:11px;line-height:1.4">${esc(outline)}</pre>
-            </div>
-          ` : ""}
-        </div>
-      </details>`;
-  }
-
-  // 2. User Prompt Internal Sequence Bar
+  // 1. User Prompt Internal Sequence Bar
   const userSeqBar = `
     <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;margin:8px 0 10px;padding:6px 10px;background:rgba(0,0,0,0.3);border-radius:6px;border:1px solid var(--line);line-height:1.4">
       <span style="color:var(--muted);font-weight:600">User Prompt Section Sequence:</span>
@@ -3341,11 +3279,11 @@ function renderSearchInitialState(initialState, prompts, opts = {}) {
       <span class="tree-badge ok" title="Tool rules & submit_pages requirements">${prior ? '5' : '4'}. Tool Rules & Submit Instructions</span>
     </div>`;
 
-  // 3. Raw LLM Messages (system first, then user)
+  // 2. Raw LLM Messages (system first, then user)
   const messagesHtml = `
     <div style="display:flex;flex-direction:column;gap:10px;margin-top:4px">
       <!-- Message 0: system -->
-      <details class="viz-section" style="margin:0" ${sys ? "" : ""}>
+      <details class="viz-section" style="margin:0">
         <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;user-select:none">
           <span class="tree-badge" style="color:#b197fc;border-color:#5c3e9e;background:rgba(155,123,212,0.12)">Message [0] · role: "system"</span>
           <span>SearchAgent System Prompt</span>
@@ -3366,7 +3304,7 @@ function renderSearchInitialState(initialState, prompts, opts = {}) {
         </summary>
         <div style="margin-top:8px">
           ${userSeqBar}
-          <pre class="pretty" style="max-height:360px;margin:0;font-size:11px;line-height:1.45;white-space:pre-wrap">${esc(user || "(user prompt not recorded in trace)")}</pre>
+          <pre class="pretty" style="max-height:420px;margin:0;font-size:11px;line-height:1.45;white-space:pre-wrap">${esc(user || "(user prompt not recorded in trace)")}</pre>
         </div>
       </details>
     </div>`;
@@ -3384,7 +3322,6 @@ function renderSearchInitialState(initialState, prompts, opts = {}) {
         SearchAgent 실행 시 LLM에 전달되는 <b>messages 배열 (role: system ➔ role: user)</b>의 실제 원문 및 주입 순서입니다.
       </div>
       ${messagesHtml}
-      ${parsedSectionHtml}
     </div>
   </details>`;
 }
