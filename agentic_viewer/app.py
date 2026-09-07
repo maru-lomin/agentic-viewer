@@ -3618,7 +3618,7 @@ function renderExtractKvVlm(tool) {
     `<tr>
       <td>${esc(ex.key)}</td>
       <td>${esc(ex.value)}</td>
-      <td>${esc(ex.evidence_quote || "")}</td>
+      <td>${esc(ex.value_reason || ex.evidence_quote || "")}</td>
     </tr>`
   ).join("");
   const files = tool.extra_files || {};
@@ -3644,7 +3644,7 @@ function renderExtractKvVlm(tool) {
     ${renderPageReasonsTable(pageReasons, pageChunkIds)}
     ${hintsHtml}
     ${rows ? `<table class="kv-table" style="margin-top:8px">
-      <thead><tr><th>Key</th><th>Value</th><th>Evidence</th></tr></thead>
+      <thead><tr><th>Key</th><th>Value</th><th>Reason / Evidence</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>` : ""}
     ${!rows ? `<pre class="pretty" style="margin-top:6px">${esc(pretty(result.result || result || tool.result_preview || {}, 4000))}</pre>` : ""}
@@ -4050,9 +4050,9 @@ function renderMasterOutput() {
     const evidence = Array.isArray(item.evidence) ? item.evidence : [];
     const evidenceText = evidence.map(ev => {
       const page = ev.page != null ? `p${ev.page}` : (ev.chunk_id || "");
-      const text = ev.text || ev.evidence_quote || "";
+      const text = ev.text || ev.value_reason || ev.evidence_quote || "";
       return page ? `[${page}] ${text}` : text;
-    }).filter(Boolean).join(" · ") || (item.evidence_quote || "");
+    }).filter(Boolean).join(" · ") || (item.value_reason || item.evidence_quote || "");
     const reasons = item.search_reasons || item.page_reasons || (item.reason ? { not_found: item.reason } : {});
     const reasonText = (reasons && typeof reasons === "object")
       ? Object.entries(reasons).map(([p, t]) => (String(p).match(/^\d+$/) ? `p${p}: ${t}` : `${p}: ${t}`)).join(" · ")
@@ -4526,9 +4526,9 @@ function renderEval() {
         <div><b>pred</b> ${esc(row.value?.pred ?? "")}</div>
         <div><b>gold</b> ${hasGt ? esc(row.value?.gold ?? "") : `<span style="color:var(--muted)">(none)</span>`}</div>
         <details${evalDetailAttrs("evidence", row.key)}>
-          <summary>VLM evidence · Search reasons</summary>
+          <summary>VLM reason / evidence · Search reasons</summary>
           <div class="ev-block">
-            <span class="ev-label vlm">VLM evidence_quote</span>
+            <span class="ev-label vlm">VLM value_reason</span>
             <div class="ev-text">${esc(et.pred || "(empty)")}</div>
           </div>
           <div class="ev-block">
@@ -4603,7 +4603,7 @@ function renderEval() {
     <p class="hint">
       Baseline metrics vs <code>dataset/answer_sheet.json</code>.
       Cached as <code>05_eval.json</code> in the run directory.
-      Evid F1 uses <b>VLM evidence_quote</b> only; SearchAgent <b>page_reasons</b> are shown separately.
+      Evid F1 uses <b>VLM value_reason</b> only; SearchAgent <b>page_reasons</b> are shown separately.
       Agentic-evaluation runs up to 8 keys in parallel via the inference API and saves under <code>06_agentic_eval/</code>.
       Use <b>${hasGt ? "Edit GT" : "Add GT"}</b> when agentic eval marks gold as invalid or GT is missing.
       <button class="tab" id="evalRefresh" style="margin-left:8px">Recompute</button>

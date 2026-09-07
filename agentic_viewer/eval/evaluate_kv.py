@@ -35,7 +35,10 @@ def _join_evidence_texts(items: Sequence[Any]) -> str:
             text = item.strip()
         elif isinstance(item, dict):
             text = str(
-                item.get("text") or item.get("evidence_quote") or ""
+                item.get("text")
+                or item.get("value_reason")
+                or item.get("evidence_quote")
+                or ""
             ).strip()
         else:
             text = ""
@@ -223,8 +226,12 @@ def evaluate_document(
         micro_gold += len(gold_set)
 
         gold_evid = _join_evidence_texts(gold.get("evidences") or [])
-        # VLM extract_kv_vlm evidence_quote (not SearchAgent page_reasons).
+        # VLM extract_kv_vlm value_reason / evidence_quote (not SearchAgent page_reasons).
         pred_evid = _join_evidence_texts(pred.get("evidence") or [])
+        if not pred_evid:
+            pred_evid = str(
+                pred.get("value_reason") or pred.get("evidence_quote") or ""
+            ).strip()
         e_f1 = token_f1(pred_evid, gold_evid)
 
         key_fallback = (fallback_reasons or {}).get(key)
@@ -262,11 +269,11 @@ def evaluate_document(
                     "f1": round(p_f1, 6),
                 },
                 "evidence_text": {
-                    # VLM evidence_quote only — used for token F1 vs gold evidences.
+                    # VLM value_reason / evidence_quote only — used for token F1 vs gold evidences.
                     "pred": pred_evid,
                     "gold": gold_evid,
                     "token_f1": round(e_f1, 6),
-                    "source": "vlm_evidence_quote",
+                    "source": "vlm_value_reason",
                 },
                 "search_reasons": {
                     # SearchAgent submit_pages page_reasons (page selection rationale).
