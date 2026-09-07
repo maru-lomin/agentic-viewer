@@ -89,7 +89,7 @@ PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
         "category": "retrieval",
         "tags": ["Shared", "Retrieval", "Worker"],
         "pipeline_file": "inference-pipeline/agentic/search_agent.py",
-        "description": "BM25 텍스트 청크 검색 및 페이지 텍스트 조회를 통해 각 추출 키에 대한 유력 근거 페이지(1~3장)를 찾아 사유와 함께 제출합니다.",
+        "description": "BM25 텍스트 청크 검색 및 페이지 텍스트 조회를 통해 각 추출 키에 대한 유력 근거 페이지(1~3장)를 찾아 사유와 함께 제출합니다. 시작 시 문서 개요(Compact TOC)가 기본 제공됩니다.",
         "contract": {
             "completion_type": "tool_call",
             "completion_description": "SearchAgent는 자유 형식 텍스트만으로 종료할 수 없으며, 반드시 submit_pages 또는 no_relevant_pages 도구를 호출하여 세션을 완료해야 합니다.",
@@ -126,7 +126,7 @@ PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
                 {
                     "name": "get_page_text",
                     "args": "page: int",
-                    "description": "특정 페이지 전체 텍스트를 조회합니다 (page 0은 목차, 1 이상은 실제 본문 페이지)."
+                    "description": "특정 페이지 전체 텍스트를 조회합니다 (page 0은 상세 목차, 1 이상은 실제 본문 페이지)."
                 },
                 {
                     "name": "submit_pages",
