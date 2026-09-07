@@ -3267,113 +3267,124 @@ function renderSearchInitialState(initialState, prompts, opts = {}) {
   const nKeys = keys.length;
   const outlineLines = outline ? outline.split("\n").length : 0;
 
-  // 1. Target Keys & Search Cues table
-  let keysHtml = "";
-  if (nKeys > 0) {
-    const rows = keys.map(k => {
-      const cuesPills = k.search_cues
-        ? `<div style="margin-bottom:4px">
-            <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Search Cues:</span>
-            <span class="search-cues-pill">${esc(k.search_cues)}</span>
-          </div>`
-        : "";
-      const allowedTags = k.allowed_values
-        ? `<div>
-            <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Allowed Values:</span>
-            <span class="allowed-values-tag">${esc(k.allowed_values)}</span>
-          </div>`
-        : "";
-      const cuesAllowedCell = (cuesPills || allowedTags)
-        ? `${cuesPills}${allowedTags}`
-        : `<span class="muted" style="font-size:11px">—</span>`;
+  // 1. Structured Table (Parsed View for quick reference)
+  let parsedSectionHtml = "";
+  if (nKeys > 0 || outline) {
+    let rows = "";
+    if (nKeys > 0) {
+      rows = keys.map(k => {
+        const cuesPills = k.search_cues
+          ? `<div style="margin-bottom:4px">
+              <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Search Cues:</span>
+              <span class="search-cues-pill">${esc(k.search_cues)}</span>
+            </div>`
+          : "";
+        const allowedTags = k.allowed_values
+          ? `<div>
+              <span style="font-size:10px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px">Allowed Values:</span>
+              <span class="allowed-values-tag">${esc(k.allowed_values)}</span>
+            </div>`
+          : "";
+        const cuesAllowedCell = (cuesPills || allowedTags)
+          ? `${cuesPills}${allowedTags}`
+          : `<span class="muted" style="font-size:11px">—</span>`;
 
-      return `<tr>
-        <td style="font-weight:600;color:var(--text);font-family:var(--mono);font-size:12px;vertical-align:top">${esc(k.key)}</td>
-        <td style="vertical-align:top">${cuesAllowedCell}</td>
-        <td style="font-size:11px;line-height:1.45;color:var(--muted);vertical-align:top">${esc(k.description || "")}</td>
-      </tr>`;
-    }).join("");
+        return `<tr>
+          <td style="font-weight:600;color:var(--text);font-family:var(--mono);font-size:12px;vertical-align:top">${esc(k.key)}</td>
+          <td style="vertical-align:top">${cuesAllowedCell}</td>
+          <td style="font-size:11px;line-height:1.45;color:var(--muted);vertical-align:top">${esc(k.description || "")}</td>
+        </tr>`;
+      }).join("");
+    }
 
-    keysHtml = `
-      <div class="viz-section" style="margin-top:6px">
-        <h3 style="margin:0 0 6px;color:var(--text);display:flex;align-items:center;gap:8px">
-          Target Keys & Search Cues
-          <span class="tree-badge ok" style="font-weight:normal">${esc(nKeys)} key(s)</span>
-        </h3>
-        <table class="kv-table" style="margin:0">
-          <thead>
-            <tr>
-              <th style="width:26%">Key</th>
-              <th style="width:34%">Search Cues & Allowed Values</th>
-              <th>Schema Description</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
-  }
-
-  // 2. Pre-injected Document Outline (Compact TOC)
-  let outlineHtml = "";
-  if (outline) {
-    outlineHtml = `
-      <details class="viz-section" style="margin-top:8px" open>
-        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:6px;user-select:none">
-          Document outline (compact table of contents)
-          <span class="tree-badge">${esc(outlineLines)} lines / sections</span>
-        </summary>
-        <pre class="pretty" style="max-height:180px;margin:6px 0 0;font-size:11px;line-height:1.4">${esc(outline)}</pre>
-      </details>`;
-  }
-
-  // 3. Task Instruction
-  let instrHtml = "";
-  if (taskInstr) {
-    instrHtml = `
-      <div class="hint" style="margin:4px 0 6px;line-height:1.4">
-        <b>Assigned Search Task:</b> ${esc(taskInstr)}
-      </div>`;
-  }
-
-  // 4. Raw Full Prompts (User and System)
-  let promptsHtml = "";
-  if (sys || user) {
-    promptsHtml = `
+    parsedSectionHtml = `
       <details class="viz-section" style="margin-top:8px">
         <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:6px;user-select:none">
-          Raw LLM Prompts (User & System)
-          <span class="tree-badge">request payload</span>
+          Parsed Key & Schema Summary Table (Quick Reference)
+          <span class="tree-badge ok">${esc(nKeys)} key(s)</span>
+          ${outline ? `<span class="tree-badge">TOC: ${esc(outlineLines)} lines</span>` : ""}
         </summary>
-        <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px">
-          ${user ? `
-            <div class="flow-item user">
-              <div class="label" style="font-weight:600;font-size:11px;color:var(--accent);margin-bottom:2px">User Prompt (Initial Prompt)</div>
-              <pre class="pretty" style="max-height:260px;margin:0;font-size:11px;line-height:1.4">${esc(user)}</pre>
-            </div>
+        <div style="margin-top:8px">
+          ${nKeys > 0 ? `
+            <table class="kv-table" style="margin:0 0 10px">
+              <thead>
+                <tr>
+                  <th style="width:26%">Key</th>
+                  <th style="width:34%">Search Cues & Allowed Values</th>
+                  <th>Schema Description</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
           ` : ""}
-          ${sys ? `
-            <div class="flow-item system">
-              <div class="label" style="font-weight:600;font-size:11px;color:#9b7bd4;margin-bottom:2px">System Prompt</div>
-              <pre class="pretty" style="max-height:260px;margin:0;font-size:11px;line-height:1.4">${esc(sys)}</pre>
+          ${outline ? `
+            <div style="margin-top:6px">
+              <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px">Document Outline (Compact TOC):</div>
+              <pre class="pretty" style="max-height:160px;margin:0;font-size:11px;line-height:1.4">${esc(outline)}</pre>
             </div>
           ` : ""}
         </div>
       </details>`;
   }
 
+  // 2. User Prompt Internal Sequence Bar
+  const userSeqBar = `
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;margin:8px 0 10px;padding:6px 10px;background:rgba(0,0,0,0.3);border-radius:6px;border:1px solid var(--line);line-height:1.4">
+      <span style="color:var(--muted);font-weight:600">User Prompt Section Sequence:</span>
+      <span class="tree-badge ok" title="Search goal instructions">1. Task Instruction</span>
+      <span style="color:var(--muted)">➔</span>
+      <span class="tree-badge ok" title="Keys with search cues & allowed values">2. Target Keys & Schema Descriptions</span>
+      <span style="color:var(--muted)">➔</span>
+      <span class="tree-badge ok" title="Pre-injected Compact TOC">3. Document Outline TOC</span>
+      ${prior ? '<span style="color:var(--muted)">➔</span><span class="tree-badge warn" title="Pages inspected & queries from prior session">4. Prior Session Progress</span>' : ''}
+      <span style="color:var(--muted)">➔</span>
+      <span class="tree-badge ok" title="Tool rules & submit_pages requirements">${prior ? '5' : '4'}. Tool Rules & Submit Instructions</span>
+    </div>`;
+
+  // 3. Raw LLM Messages (system first, then user)
+  const messagesHtml = `
+    <div style="display:flex;flex-direction:column;gap:10px;margin-top:4px">
+      <!-- Message 0: system -->
+      <details class="viz-section" style="margin:0" ${sys ? "" : ""}>
+        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;user-select:none">
+          <span class="tree-badge" style="color:#b197fc;border-color:#5c3e9e;background:rgba(155,123,212,0.12)">Message [0] · role: "system"</span>
+          <span>SearchAgent System Prompt</span>
+          <span class="tree-badge">Instructions & Tool Rules</span>
+        </summary>
+        <div style="margin-top:8px">
+          <pre class="pretty" style="max-height:280px;margin:0;font-size:11px;line-height:1.45;white-space:pre-wrap">${esc(sys || "(system prompt not recorded in trace)")}</pre>
+        </div>
+      </details>
+
+      <!-- Message 1: user -->
+      <details class="viz-section" style="margin:0" open>
+        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;user-select:none">
+          <span class="tree-badge" style="color:#74c0fc;border-color:#2a6a9e;background:rgba(61,156,240,0.12)">Message [1] · role: "user"</span>
+          <span>SearchAgent Initial User Prompt</span>
+          <span class="tree-badge ok">${esc(nKeys)} key(s)</span>
+          ${outline ? `<span class="tree-badge">TOC outline</span>` : ""}
+        </summary>
+        <div style="margin-top:8px">
+          ${userSeqBar}
+          <pre class="pretty" style="max-height:360px;margin:0;font-size:11px;line-height:1.45;white-space:pre-wrap">${esc(user || "(user prompt not recorded in trace)")}</pre>
+        </div>
+      </details>
+    </div>`;
+
   return `<details class="tree-node search-prompts" open>
     <summary>
-      <span class="title">SearchAgent initial state & prompts</span>
-      ${nKeys ? `<span class="tree-badge ok">${esc(nKeys)} target key(s)</span>` : ""}
+      <span class="title">SearchAgent LLM Initial Messages (messages payload)</span>
+      <span class="tree-badge ok">messages[0]=system, messages[1]=user</span>
+      ${nKeys ? `<span class="tree-badge ok">${esc(nKeys)} key(s)</span>` : ""}
       ${outline ? `<span class="tree-badge">outline (${esc(outlineLines)}p)</span>` : ""}
-      ${prior ? `<span class="tree-badge warn">prior progress</span>` : ""}
-      ${(sys || user) ? `<span class="tree-badge">system + user</span>` : ""}
+      ${prior ? `<span class="tree-badge warn">prior handoff</span>` : ""}
     </summary>
     <div class="tree-body">
-      ${instrHtml}
-      ${keysHtml}
-      ${outlineHtml}
-      ${promptsHtml}
+      <div class="hint" style="margin:0 0 6px;line-height:1.4">
+        SearchAgent 실행 시 LLM에 전달되는 <b>messages 배열 (role: system ➔ role: user)</b>의 실제 원문 및 주입 순서입니다.
+      </div>
+      ${messagesHtml}
+      ${parsedSectionHtml}
     </div>
   </details>`;
 }
