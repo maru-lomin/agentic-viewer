@@ -34,7 +34,7 @@ def eval_cache_has_reason_split(report: Dict[str, Any]) -> bool:
 
 
 def eval_cache_has_searched_pages(report: Dict[str, Any]) -> bool:
-    """True when cached eval includes SearchAgent inspected pages."""
+    """True when cached eval includes SearchAgent inspected pages and bm25_queries."""
     per_key = report.get("per_key")
     if not isinstance(per_key, list) or not per_key:
         return False
@@ -42,7 +42,7 @@ def eval_cache_has_searched_pages(report: Dict[str, Any]) -> bool:
     if not isinstance(first, dict):
         return False
     sp = first.get("search_pages")
-    return isinstance(sp, dict) and "inspected" in sp
+    return isinstance(sp, dict) and "inspected" in sp and "bm25_queries" in sp
 
 
 def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
@@ -76,6 +76,7 @@ def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
                     "inspected": set(),
                     "bm25": set(),
                     "candidates": set(),
+                    "queries": {},
                 }
             for p in inspected:
                 try:
@@ -95,6 +96,18 @@ def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
                             out[k]["bm25"].add(int(p2))
                         except (TypeError, ValueError):
                             pass
+                    q = str(h.get("query") or "").strip()
+                    cid = str(h.get("chunk_id") or "").strip()
+                    if q and cid:
+                        if q not in out[k]["queries"]:
+                            out[k]["queries"][q] = {}
+                        if cid not in out[k]["queries"][q]:
+                            score = h.get("score")
+                            out[k]["queries"][q][cid] = {
+                                "chunk_id": cid,
+                                "page": int(p) if p is not None else None,
+                                "score": round(float(score), 4) if score is not None else None,
+                            }
             for c in cand_rows:
                 if isinstance(c, dict):
                     p = c.get("page")
@@ -110,6 +123,7 @@ def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
             session_keys: Dict[str, set] = {}
             session_inspected: Dict[str, set] = {}
             session_bm25: Dict[str, set] = {}
+            session_queries: Dict[str, Dict[str, Dict[str, Any]]] = {}
             for f in tools_dir.glob("*.json"):
                 parts = f.stem.split("_step_")
                 s_lbl = parts[0]
@@ -117,6 +131,7 @@ def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
                     session_inspected[s_lbl] = set()
                     session_bm25[s_lbl] = set()
                     session_keys[s_lbl] = set()
+                    session_queries[s_lbl] = {}
                 try:
                     d = json.loads(f.read_text(encoding="utf-8"))
                 except Exception:
@@ -132,12 +147,27 @@ def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
                         except (TypeError, ValueError):
                             pass
                 elif name == "bm25_search":
-                    for h in res.get("hits") or []:
-                        if isinstance(h, dict) and h.get("page") is not None:
-                            try:
-                                session_bm25[s_lbl].add(int(h["page"]))
-                            except (TypeError, ValueError):
-                                pass
+                    q = str(args.get("query") or "").strip()
+                    hits = res.get("hits") or []
+                    for h in hits:
+                        if isinstance(h, dict):
+                            p = h.get("page")
+                            if p is not None:
+                                try:
+                                    session_bm25[s_lbl].add(int(p))
+                                except (TypeError, ValueError):
+                                    pass
+                            cid = str(h.get("chunk_id") or "").strip()
+                            if q and cid:
+                                if q not in session_queries[s_lbl]:
+                                    session_queries[s_lbl][q] = {}
+                                if cid not in session_queries[s_lbl][q]:
+                                    score = h.get("score")
+                                    session_queries[s_lbl][q][cid] = {
+                                        "chunk_id": cid,
+                                        "page": int(p) if p is not None else None,
+                                        "score": round(float(score), 4) if score is not None else None,
+                                    }
                 elif name in ("submit_pages", "no_relevant_pages"):
                     k_arg = args.get("key")
                     if k_arg:
@@ -145,18 +175,30 @@ def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
             for s_lbl, keys in session_keys.items():
                 for k in keys:
                     if k not in out:
-                        out[k] = {"inspected": set(), "bm25": set(), "candidates": set()}
+                        out[k] = {"inspected": set(), "bm25": set(), "candidates": set(), "queries": {}}
                     out[k]["inspected"].update(session_inspected.get(s_lbl, set()))
                     out[k]["bm25"].update(session_bm25.get(s_lbl, set()))
+                    s_q = session_queries.get(s_lbl) or {}
+                    for q_str, c_map in s_q.items():
+                        if q_str not in out[k]["queries"]:
+                            out[k]["queries"][q_str] = {}
+                        out[k]["queries"][q_str].update(c_map)
 
-    return {
-        k: {
+    final_out = {}
+    for k, v in out.items():
+        q_list = []
+        for q_str, c_map in (v.get("queries") or {}).items():
+            q_list.append({
+                "query": q_str,
+                "hits": list(c_map.values()),
+            })
+        final_out[k] = {
             "inspected": sorted(list(v["inspected"])),
             "bm25": sorted(list(v["bm25"])),
             "candidates": sorted(list(v["candidates"])),
+            "bm25_queries": q_list,
         }
-        for k, v in out.items()
-    }
+    return final_out
 
 
 def enrich_eval_with_searched_pages(
@@ -188,6 +230,7 @@ def enrich_eval_with_searched_pages(
         sp["other_inspected"] = other_inspected
         sp["bm25"] = info.get("bm25") or []
         sp["candidates"] = info.get("candidates") or []
+        sp["bm25_queries"] = info.get("bm25_queries") or []
 
     return report
 

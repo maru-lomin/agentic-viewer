@@ -127,6 +127,80 @@ class EvalNoGtTests(unittest.TestCase):
         self.assertTrue(report["has_gt"])
         self.assertEqual(report["overall"]["value_exact_match"], 1.0)
 
+    def test_extract_searched_pages_with_bm25_queries(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+        from agentic_viewer.evaluation.baseline import (
+            extract_searched_pages,
+            enrich_eval_with_searched_pages,
+            eval_cache_has_searched_pages,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            pred = {
+                "search_agent_traces": [
+                    {
+                        "key": "TestKey",
+                        "prior_context_out": {
+                            "pages_inspected": [10, 11],
+                            "candidate_pages": [{"page": 10}, {"page": 12}],
+                            "bm25_hits": [
+                                {
+                                    "query": "search query 1",
+                                    "chunk_id": "10-1",
+                                    "page": 10,
+                                    "score": 15.5,
+                                },
+                                {
+                                    "query": "search query 1",
+                                    "chunk_id": "11-2",
+                                    "page": 11,
+                                    "score": 12.3,
+                                },
+                                {
+                                    "query": "search query 2",
+                                    "chunk_id": "12-1",
+                                    "page": 12,
+                                    "score": 9.8,
+                                },
+                            ],
+                        },
+                    }
+                ]
+            }
+            (tmp_dir / "04_result.json").write_text(json.dumps(pred), encoding="utf-8")
+
+            searched = extract_searched_pages(tmp_dir)
+            self.assertIn("TestKey", searched)
+            self.assertEqual(searched["TestKey"]["inspected"], [10, 11])
+            self.assertEqual(searched["TestKey"]["bm25"], [10, 11, 12])
+            queries = searched["TestKey"]["bm25_queries"]
+            self.assertEqual(len(queries), 2)
+            self.assertEqual(queries[0]["query"], "search query 1")
+            self.assertEqual(len(queries[0]["hits"]), 2)
+            self.assertEqual(queries[0]["hits"][0]["chunk_id"], "10-1")
+            self.assertEqual(queries[1]["query"], "search query 2")
+            self.assertEqual(len(queries[1]["hits"]), 1)
+            self.assertEqual(queries[1]["hits"][0]["chunk_id"], "12-1")
+
+            # Test enrich_eval_with_searched_pages
+            eval_report = {
+                "per_key": [
+                    {
+                        "key": "TestKey",
+                        "search_pages": {"pred": [10], "gold": [10]},
+                    }
+                ]
+            }
+            enriched = enrich_eval_with_searched_pages(eval_report, tmp_dir)
+            sp = enriched["per_key"][0]["search_pages"]
+            self.assertEqual(sp["inspected"], [10, 11])
+            self.assertEqual(sp["other_inspected"], [11])
+            self.assertEqual(len(sp["bm25_queries"]), 2)
+            self.assertTrue(eval_cache_has_searched_pages(enriched))
+
 
 if __name__ == "__main__":
     unittest.main()

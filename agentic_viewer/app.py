@@ -2229,6 +2229,54 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border-color: #58a6ff;
       color: #c9d1d9;
     }
+    .bm25-chunk-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      padding: 1px 5px;
+      background: #141c28;
+      border: 1px solid #253549;
+      border-radius: 4px;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .bm25-chunk-item:hover {
+      border-color: #388bfd;
+      background: #1a2538;
+    }
+    .bm25-chunk-item .chunk-jump {
+      background: transparent;
+      border: none;
+      color: #58a6ff;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 0;
+    }
+    .bm25-chunk-item .chunk-jump:hover {
+      text-decoration: underline;
+      color: #79c0ff;
+    }
+    .bm25-chunk-item .pdf-page-btn {
+      font-size: 9.5px;
+      padding: 0 3px;
+      border-radius: 3px;
+      border: 1px solid #354960;
+      background: #1c2738;
+      color: #8da0b5;
+      cursor: pointer;
+    }
+    .bm25-chunk-item .pdf-page-btn:hover {
+      border-color: #58a6ff;
+      background: #27374f;
+      color: #fff;
+    }
+    .bm25-query-row {
+      padding: 5px 8px;
+      border-radius: 5px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
     .pdf-page-inline-btn {
       display: inline-flex; align-items: center; gap: 2px;
       padding: 0 4px; border-radius: 4px; border: 1px solid rgba(77, 170, 252, 0.4);
@@ -5312,6 +5360,7 @@ function renderEval() {
       : inspectedPages.filter(p => !predPages.includes(p));
     const bm25Pages = Array.isArray(sp.bm25) ? sp.bm25 : [];
     const otherBm25Pages = bm25Pages.filter(p => !predPages.includes(p) && !otherInspectedPages.includes(p));
+    const bm25Queries = Array.isArray(sp.bm25_queries) ? sp.bm25_queries : [];
 
     const predPageBtns = predPages.map(p =>
       `<button type="button" class="pdf-page-btn" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} (제출 페이지) 원문 PDF 보기">p.${p} 원문</button>`
@@ -5321,9 +5370,58 @@ function renderEval() {
       `<button type="button" class="pdf-page-btn inspected" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} (SearchAgent 조회 페이지) 원문 PDF 보기">p.${p} 원문</button>`
     ).join(" ");
 
-    const bm25PageBtns = otherBm25Pages.map(p =>
-      `<button type="button" class="pdf-page-btn bm25" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} (BM25 검색 후보 페이지) 원문 PDF 보기">p.${p}</button>`
-    ).join(" ");
+    let bm25CandidatesHtml = "";
+    if (bm25Queries.length > 0) {
+      const allBm25ChunkIds = new Set();
+      bm25Queries.forEach(q => (q.hits || []).forEach(h => { if (h.chunk_id) allBm25ChunkIds.add(h.chunk_id); }));
+
+      const queryRowsHtml = bm25Queries.map((qGroup, idx) => {
+        const qText = qGroup.query || "";
+        const hits = Array.isArray(qGroup.hits) ? qGroup.hits : [];
+        const chunkBadges = hits.map(h => {
+          const cid = String(h.chunk_id || "").trim();
+          const p = h.page;
+          const scoreStr = h.score != null ? ` · Score ${Number(h.score).toFixed(2)}` : "";
+          if (!cid) return "";
+          return `<span class="bm25-chunk-item">
+            <button type="button" class="chunk-jump" data-chunk-id="${esc(cid)}" title="청크 ${esc(cid)} 미리보기${scoreStr}">${esc(cid)}</button>
+            ${p != null ? `<button type="button" class="pdf-page-btn" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} 원문 PDF 보기">p.${p}</button>` : ""}
+          </span>`;
+        }).filter(Boolean).join(" ");
+
+        return `<div class="bm25-query-row">
+          <div style="display:flex;align-items:baseline;gap:6px;font-size:11px;color:#c9d1d9;word-break:break-word">
+            <span style="color:#a371f7;font-weight:600;font-size:10.5px;flex-shrink:0">🔍 쿼리 ${idx + 1}:</span>
+            <span style="color:#d2a8ff;font-family:var(--mono);font-size:10.5px;font-weight:500">"${esc(qText)}"</span>
+            <span style="color:var(--muted);font-size:10px;margin-left:auto;flex-shrink:0">(${hits.length}개 청크)</span>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;padding-left:14px">
+            ${chunkBadges || '<span style="color:var(--muted);font-size:10px">(결과 없음)</span>'}
+          </div>
+        </div>`;
+      }).join("");
+
+      bm25CandidatesHtml = `
+        <details style="margin-top:7px;font-size:11px">
+          <summary style="cursor:pointer;color:var(--muted);user-select:none;font-weight:500">
+            BM25 검색 후보 청크 (${allBm25ChunkIds.size}개 청크 · ${bm25Queries.length}개 검색어)
+          </summary>
+          <div style="display:flex;flex-direction:column;gap:5px;margin-top:6px">
+            ${queryRowsHtml}
+          </div>
+        </details>`;
+    } else if (otherBm25Pages.length > 0) {
+      const bm25PageBtns = otherBm25Pages.map(p =>
+        `<button type="button" class="pdf-page-btn bm25" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} (BM25 검색 후보 페이지) 원문 PDF 보기">p.${p}</button>`
+      ).join(" ");
+      bm25CandidatesHtml = `
+        <details style="margin-top:6px;font-size:11px">
+          <summary style="cursor:pointer;color:var(--muted);user-select:none">BM25 검색 후보 페이지 (${otherBm25Pages.length}개)</summary>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px">
+            ${bm25PageBtns}
+          </div>
+        </details>`;
+    }
 
     const searchPagesBlockHtml = `
       <div class="ev-block">
@@ -5338,13 +5436,7 @@ function renderEval() {
             <span style="font-size:11px;font-weight:600;color:#c0a0e0" title="SearchAgent가 get_page_text/get_page_image 등으로 실제 확인했으나 최종 제출하지 않은 페이지">추가 조회 페이지:</span>
             ${otherInspectedPageBtns}
           </div>` : ''}
-          ${bm25PageBtns ? `
-          <details style="margin-top:6px;font-size:11px">
-            <summary style="cursor:pointer;color:var(--muted);user-select:none">BM25 검색 후보 페이지 (${otherBm25Pages.length}개)</summary>
-            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px">
-              ${bm25PageBtns}
-            </div>
-          </details>` : ''}
+          ${bm25CandidatesHtml}
         </div>
       </div>`;
 
