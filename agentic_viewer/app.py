@@ -24,6 +24,12 @@ from agentic_viewer.evaluation.agentic_client import (
     invoke_agentic_eval_chat,
     get_agentic_eval_chat,
     delete_agentic_eval_chat,
+    invoke_vlm_chat,
+    get_vlm_chat,
+    delete_vlm_chat,
+    invoke_search_chat,
+    get_search_chat,
+    delete_search_chat,
 )
 from agentic_viewer.evaluation.batch import enrich_batch_job_dict, make_batch_manager
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
@@ -1054,6 +1060,165 @@ def delete_agentic_eval_chat_api(
         return {"ok": True, "key": key, "cleared": True}
 
 
+@app.post("/api/runs/{run_id}/vlm-chat")
+def post_vlm_chat_api(
+    run_id: str, body: Dict[str, Any] = Body(...)
+) -> Dict[str, Any]:
+    """Send a follow-up chat message to the VLM for an extracted key."""
+    _run_dir(run_id)
+    key = str((body or {}).get("key") or "").strip()
+    message = str((body or {}).get("message") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    try:
+        return invoke_vlm_chat(INFERENCE_API_URL, run_id, key, message)
+    except AgenticEvalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/vlm-chat")
+def get_vlm_chat_api_endpoint(
+    run_id: str,
+    key: str = Query(...),
+) -> Dict[str, Any]:
+    """Retrieve VLM chat history for an extracted key."""
+    root = _run_dir(run_id)
+    key = str(key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    from agentic_viewer.evaluation.live_progress import _safe_key_filename
+    safe = _safe_key_filename(key)
+    chat_file = root / "03_agent" / "chats" / f"vlm_{safe}.json"
+    if chat_file.is_file():
+        try:
+            data = json.loads(chat_file.read_text(encoding="utf-8"))
+            return {
+                "ok": True,
+                "key": key,
+                "has_history": bool(data.get("messages")),
+                "history": data.get("messages") or [],
+            }
+        except Exception:
+            pass
+
+    try:
+        return get_vlm_chat(INFERENCE_API_URL, run_id, key)
+    except AgenticEvalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.delete("/api/runs/{run_id}/vlm-chat")
+def delete_vlm_chat_api_endpoint(
+    run_id: str,
+    key: str = Query(...),
+) -> Dict[str, Any]:
+    """Clear VLM chat history for an extracted key."""
+    root = _run_dir(run_id)
+    key = str(key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    from agentic_viewer.evaluation.live_progress import _safe_key_filename
+    safe = _safe_key_filename(key)
+    chat_dir = root / "03_agent" / "chats"
+    for fname in (f"vlm_{safe}.json", f"vlm_context_{safe}.json"):
+        p = chat_dir / fname
+        if p.is_file():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    try:
+        return delete_vlm_chat(INFERENCE_API_URL, run_id, key)
+    except Exception:
+        return {"ok": True, "key": key, "cleared": True}
+
+
+@app.post("/api/runs/{run_id}/search-chat")
+def post_search_chat_api(
+    run_id: str, body: Dict[str, Any] = Body(...)
+) -> Dict[str, Any]:
+    """Send a follow-up chat message to SearchAgent for an extracted key."""
+    _run_dir(run_id)
+    key = str((body or {}).get("key") or "").strip()
+    message = str((body or {}).get("message") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    try:
+        return invoke_search_chat(INFERENCE_API_URL, run_id, key, message)
+    except AgenticEvalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/search-chat")
+def get_search_chat_api_endpoint(
+    run_id: str,
+    key: str = Query(...),
+) -> Dict[str, Any]:
+    """Retrieve SearchAgent chat history for an extracted key."""
+    root = _run_dir(run_id)
+    key = str(key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    from agentic_viewer.evaluation.live_progress import _safe_key_filename
+    safe = _safe_key_filename(key)
+    chat_file = root / "03_agent" / "chats" / f"search_{safe}.json"
+    if chat_file.is_file():
+        try:
+            data = json.loads(chat_file.read_text(encoding="utf-8"))
+            return {
+                "ok": True,
+                "key": key,
+                "has_history": bool(data.get("messages")),
+                "history": data.get("messages") or [],
+            }
+        except Exception:
+            pass
+
+    try:
+        return get_search_chat(INFERENCE_API_URL, run_id, key)
+    except AgenticEvalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.delete("/api/runs/{run_id}/search-chat")
+def delete_search_chat_api_endpoint(
+    run_id: str,
+    key: str = Query(...),
+) -> Dict[str, Any]:
+    """Clear SearchAgent chat history for an extracted key."""
+    root = _run_dir(run_id)
+    key = str(key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    from agentic_viewer.evaluation.live_progress import _safe_key_filename
+    safe = _safe_key_filename(key)
+    chat_dir = root / "03_agent" / "chats"
+    for fname in (f"search_{safe}.json", f"search_context_{safe}.json"):
+        p = chat_dir / fname
+        if p.is_file():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    try:
+        return delete_search_chat(INFERENCE_API_URL, run_id, key)
+    except Exception:
+        return {"ok": True, "key": key, "cleared": True}
+
+
+
 
 def _serve_run_file(root: Path, rel: str):
     """Serve a file under ``root`` (JSON as JSONResponse, text as HTML pre)."""
@@ -1948,6 +2113,44 @@ INDEX_HTML = r"""<!DOCTYPE html>
       opacity: 0.6;
       cursor: not-allowed;
     }
+    .eval-chat-msg.assistant.vlm {
+      background: #152233;
+      border-color: #27476e;
+    }
+    .eval-chat-msg.assistant.search {
+      background: #251d2e;
+      border-color: #4b3461;
+    }
+    .ev-chat-details {
+      margin-top: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      padding: 4px 8px;
+      background: rgba(0, 0, 0, 0.18);
+    }
+    .ev-chat-summary {
+      cursor: pointer;
+      font-size: 11px;
+      color: var(--accent);
+      user-select: none;
+      font-weight: 600;
+      outline: none;
+    }
+    .ev-chat-summary:hover {
+      text-decoration: underline;
+    }
+    .ev-chat-count {
+      color: #9ac1f0;
+      font-weight: 700;
+      margin-left: 4px;
+    }
+    .eval-chat-section.in-evidence {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid var(--line);
+      min-width: 100%;
+      max-width: 100%;
+    }
     .agentic-eval-verdict {
       display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.03em;
       text-transform: uppercase; padding: 2px 8px; border-radius: 4px; margin-bottom: 6px;
@@ -2003,6 +2206,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .pdf-page-btn:hover {
       background: #1e3352; border-color: var(--accent); color: #fff;
+    }
+    .pdf-page-btn.inspected {
+      border-color: #5d3888;
+      background: #251636;
+      color: #d8b4fe;
+    }
+    .pdf-page-btn.inspected:hover {
+      background: #3a2254;
+      border-color: #a855f7;
+      color: #fff;
+    }
+    .pdf-page-btn.bm25 {
+      border-color: #38424d;
+      background: #161b22;
+      color: #8b949e;
+      font-size: 10px;
+      padding: 1px 6px;
+    }
+    .pdf-page-btn.bm25:hover {
+      background: #21262d;
+      border-color: #58a6ff;
+      color: #c9d1d9;
     }
     .pdf-page-inline-btn {
       display: inline-flex; align-items: center; gap: 2px;
@@ -2288,6 +2513,8 @@ const state = {
   evalReport: null, evalError: null, evalLoading: false,
   agenticEvals: {}, agenticEvalInflight: [], agenticEvalError: null,
   agenticChats: {},
+  vlmChats: {},
+  searchChats: {},
   evalOpenDetails: new Set(),
   gtEdit: null,
   batchJob: null, batchPollTimer: null,
@@ -2856,6 +3083,9 @@ async function selectRun(runId, opts = {}) {
     state.agenticEvals = {};
     state.agenticEvalInflight = [];
     state.agenticEvalError = null;
+    state.agenticChats = {};
+    state.vlmChats = {};
+    state.searchChats = {};
     state.evalOpenDetails = new Set();
     state.wrongCaseKeys = new Set();
     state.wrongCasesByKey = {};
@@ -4851,6 +5081,12 @@ function bindEvalDetailToggles(root) {
         if (id.startsWith("agentic:")) {
           const key = id.slice("agentic:".length);
           ensureEvalChat(key);
+        } else if (id.startsWith("vlm_chat:")) {
+          const key = id.slice("vlm_chat:".length);
+          ensureVlmChat(key);
+        } else if (id.startsWith("search_chat:")) {
+          const key = id.slice("search_chat:".length);
+          ensureSearchChat(key);
         }
       } else {
         state.evalOpenDetails.delete(id);
@@ -5070,6 +5306,47 @@ function renderEval() {
 
     const predPages = Array.isArray(sp.pred) ? sp.pred : [];
     const goldPages = Array.isArray(sp.gold) ? sp.gold : [];
+    const inspectedPages = Array.isArray(sp.inspected) ? sp.inspected : [];
+    const otherInspectedPages = Array.isArray(sp.other_inspected)
+      ? sp.other_inspected
+      : inspectedPages.filter(p => !predPages.includes(p));
+    const bm25Pages = Array.isArray(sp.bm25) ? sp.bm25 : [];
+    const otherBm25Pages = bm25Pages.filter(p => !predPages.includes(p) && !otherInspectedPages.includes(p));
+
+    const predPageBtns = predPages.map(p =>
+      `<button type="button" class="pdf-page-btn" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} (제출 페이지) 원문 PDF 보기">p.${p} 원문</button>`
+    ).join(" ");
+
+    const otherInspectedPageBtns = otherInspectedPages.map(p =>
+      `<button type="button" class="pdf-page-btn inspected" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} (SearchAgent 조회 페이지) 원문 PDF 보기">p.${p} 원문</button>`
+    ).join(" ");
+
+    const bm25PageBtns = otherBm25Pages.map(p =>
+      `<button type="button" class="pdf-page-btn bm25" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} (BM25 검색 후보 페이지) 원문 PDF 보기">p.${p}</button>`
+    ).join(" ");
+
+    const searchPagesBlockHtml = `
+      <div class="ev-block">
+        <span class="ev-label search">SearchAgent pages</span>
+        <div class="ev-text">
+          <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:4px">
+            <span style="font-size:11px;font-weight:600;color:var(--text)">제출 페이지:</span>
+            ${predPageBtns || '<span style="color:var(--muted);font-size:11px">(제출된 페이지 없음)</span>'}
+          </div>
+          ${otherInspectedPageBtns ? `
+          <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:5px">
+            <span style="font-size:11px;font-weight:600;color:#c0a0e0" title="SearchAgent가 get_page_text/get_page_image 등으로 실제 확인했으나 최종 제출하지 않은 페이지">추가 조회 페이지:</span>
+            ${otherInspectedPageBtns}
+          </div>` : ''}
+          ${bm25PageBtns ? `
+          <details style="margin-top:6px;font-size:11px">
+            <summary style="cursor:pointer;color:var(--muted);user-select:none">BM25 검색 후보 페이지 (${otherBm25Pages.length}개)</summary>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px">
+              ${bm25PageBtns}
+            </div>
+          </details>` : ''}
+        </div>
+      </div>`;
 
     let chunkBlockHtml;
     if (chunkJumpRows) {
@@ -5078,9 +5355,6 @@ function renderEval() {
         <div class="ev-text">${chunkJumpRows}</div>
       </div>`;
     } else {
-      const predPageBtns = predPages.map(p =>
-        `<button type="button" class="pdf-page-btn" data-page="${p}" data-key="${esc(row.key)}" title="Page ${p} 원문 PDF 보기">p.${p} 원문</button>`
-      ).join(" ");
       chunkBlockHtml = `<div class="ev-block">
         <span class="ev-label search">SearchAgent chunks</span>
         <div class="ev-text" style="color:var(--muted)">
@@ -5172,7 +5446,10 @@ function renderEval() {
     return `<tr class="eval-row" data-key-row="${esc(row.key)}">
       <td class="key">${esc(row.key)}</td>
       <td class="${hasGt ? (em ? "em-y" : "em-n") : ""}">${hasGt ? (em ? "Y" : "N") : "—"}</td>
-      <td>${hasGt ? fmtPct(sp.f1) : "—"}<div class="sub">pred [${esc((sp.pred||[]).join(", "))}]${hasGt ? ` · gold [${esc((sp.gold||[]).join(", "))}]` : ""}</div></td>
+      <td>${hasGt ? fmtPct(sp.f1) : "—"}
+        <div class="sub">pred [${esc((sp.pred||[]).join(", "))}]${hasGt ? ` · gold [${esc((sp.gold||[]).join(", "))}]` : ""}</div>
+        ${otherInspectedPages.length > 0 ? `<div class="sub" style="color:#b39ddb;margin-top:2px" title="SearchAgent가 실제 조회(get_page_text)했으나 제출하지 않은 추가 페이지">조회 [${esc(otherInspectedPages.join(", "))}]</div>` : ""}
+      </td>
       <td>${hasGt ? fmtPct(et.token_f1) : "—"}</td>
       <td>
         <div><b>pred</b> ${esc(row.value?.pred ?? "")}</div>
@@ -5182,11 +5459,14 @@ function renderEval() {
           <div class="ev-block">
             <span class="ev-label vlm">VLM value_reason</span>
             <div class="ev-text">${esc(et.pred || "(empty)")}</div>
+            ${renderVlmChat(row.key)}
           </div>
           <div class="ev-block">
             <span class="ev-label search">SearchAgent page_reasons</span>
             <div class="ev-text">${esc(sr.pred || row.reason || "(empty)")}</div>
+            ${renderSearchChat(row.key)}
           </div>
+          ${searchPagesBlockHtml}
           ${chunkBlockHtml}
           <div class="ev-block">
             <span class="ev-label gold">gold evidences</span>
@@ -5464,6 +5744,288 @@ function renderAgenticEvalChat(key) {
         </button>
       </div>
     </div>
+  `;
+}
+
+async function ensureVlmChat(key) {
+  if (!state.runId || !key) return;
+  if (!state.vlmChats[key]) {
+    state.vlmChats[key] = { messages: [], loading: false, loaded: false, input: "", error: null };
+  }
+  const chat = state.vlmChats[key];
+  if (chat.loaded || chat.loading) return;
+  chat.loading = true;
+  try {
+    const res = await api(`/api/runs/${encodeURIComponent(state.runId)}/vlm-chat?key=${encodeURIComponent(key)}`);
+    if (res && res.history) {
+      chat.messages = res.history;
+    }
+    chat.loaded = true;
+  } catch (err) {
+    console.warn("Failed to load VLM chat history for key", key, err);
+  } finally {
+    chat.loading = false;
+    paintDetail();
+  }
+}
+
+async function sendVlmChatMessage(key) {
+  if (!state.runId || !key) return;
+  if (!state.vlmChats[key]) {
+    state.vlmChats[key] = { messages: [], loading: false, loaded: true, input: "", error: null };
+  }
+  const chat = state.vlmChats[key];
+  const text = (chat.input || "").trim();
+  if (!text || chat.loading) return;
+
+  chat.loading = true;
+  chat.error = null;
+  const now = new Date().toISOString();
+  chat.messages.push({ role: "user", content: text, timestamp: now });
+  chat.input = "";
+  paintDetail();
+
+  setTimeout(() => {
+    try {
+      const box = document.querySelector(`[data-vlm-chat-box="${CSS.escape(key)}"]`);
+      if (box) box.scrollTop = box.scrollHeight;
+    } catch (_) {}
+  }, 10);
+
+  try {
+    const res = await apiPost(`/api/runs/${encodeURIComponent(state.runId)}/vlm-chat`, {
+      key: key,
+      message: text,
+    });
+    if (res && res.history) {
+      chat.messages = res.history;
+    } else if (res && res.content) {
+      chat.messages.push({
+        role: "assistant",
+        content: res.content,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } catch (err) {
+    chat.error = err.message || "VLM 답변 생성 중 오류가 발생했습니다.";
+  } finally {
+    chat.loading = false;
+    paintDetail();
+    setTimeout(() => {
+      try {
+        const box = document.querySelector(`[data-vlm-chat-box="${CSS.escape(key)}"]`);
+        if (box) box.scrollTop = box.scrollHeight;
+        const inp = document.querySelector(`[data-vlm-chat-input="${CSS.escape(key)}"]`);
+        if (inp) inp.focus();
+      } catch (_) {}
+    }, 20);
+  }
+}
+
+async function clearVlmChat(key) {
+  if (!state.runId || !key) return;
+  if (!confirm(`"${key}"의 VLM 대화 기록을 초기화하시겠습니까?`)) return;
+  try {
+    await apiDelete(`/api/runs/${encodeURIComponent(state.runId)}/vlm-chat?key=${encodeURIComponent(key)}`);
+    state.vlmChats[key] = { messages: [], loading: false, loaded: true, input: "", error: null };
+    showToast("VLM 대화 기록이 초기화되었습니다.");
+    paintDetail();
+  } catch (err) {
+    showToast("VLM 대화 초기화 실패: " + err.message);
+  }
+}
+
+function renderVlmChat(key) {
+  if (!state.vlmChats[key]) {
+    state.vlmChats[key] = { messages: [], loading: false, loaded: false, input: "", error: null };
+  }
+  const chat = state.vlmChats[key];
+  if (!chat.loaded && !chat.loading && state.evalOpenDetails.has(`vlm_chat:${key}`)) {
+    setTimeout(() => ensureVlmChat(key), 0);
+  }
+
+  const msgs = chat.messages || [];
+  const msgListHtml = msgs.length > 0
+    ? msgs.map(m => {
+        const isUser = m.role === "user";
+        const bubbleCls = isUser ? "eval-chat-msg user" : "eval-chat-msg assistant vlm";
+        const roleLabel = isUser ? "👤 질문" : "👁️ VLM (KV 추출 모델)";
+        return `<div class="${bubbleCls}">
+          <div class="eval-chat-msg-header">${esc(roleLabel)}</div>
+          <div class="eval-chat-msg-body">${esc(m.content || "")}</div>
+        </div>`;
+      }).join("")
+    : `<div class="eval-chat-empty">
+        VLM의 KV 추출 판단 논리나 SearchAgent와의 상충 이유에 대해 질문해보세요.<br/>
+        <span style="font-size:10px;color:var(--muted)">예: "SearchAgent의 page_reasons를 제공받았는데 왜 반대로 판단했나요?", "어떤 문구를 보고 판단했나요?"</span>
+      </div>`;
+
+  return `
+    <details class="ev-chat-details"${evalDetailAttrs("vlm_chat", key)}>
+      <summary class="ev-chat-summary">💬 VLM과 대화하기 ${msgs.length > 0 ? `<span class="ev-chat-count">(${msgs.length})</span>` : ""}</summary>
+      <div class="eval-chat-section in-evidence">
+        <div class="eval-chat-header">
+          <span>👁️ VLM (KV 추출 모델)과의 대화</span>
+          ${msgs.length > 0 ? `<button type="button" class="eval-chat-clear-btn" data-vlm-chat-clear="${esc(key)}" title="대화 내역 초기화">대화 초기화</button>` : ""}
+        </div>
+        <div class="eval-chat-msgs-box" data-vlm-chat-box="${esc(key)}">
+          ${msgListHtml}
+          ${chat.loading ? `<div class="eval-chat-msg assistant loading"><div class="eval-chat-msg-header">👁️ VLM</div><div class="eval-chat-msg-body">당시 추출 컨텍스트(이미지/텍스트/Search 이유)를 바탕으로 답변을 생각하는 중입니다… ⏳</div></div>` : ""}
+        </div>
+        ${chat.error ? `<div class="eval-chat-error">${esc(chat.error)}</div>` : ""}
+        <div class="eval-chat-input-row">
+          <input type="text" class="eval-chat-input" data-vlm-chat-input="${esc(key)}"
+            placeholder="VLM에게 질문 입력 (Enter로 전송)"
+            value="${esc(chat.input || "")}"
+            ${chat.loading ? "disabled" : ""} />
+          <button type="button" class="eval-chat-send-btn" data-vlm-chat-send="${esc(key)}"
+            ${chat.loading ? "disabled" : ""}>
+            ${chat.loading ? "생각 중…" : "전송"}
+          </button>
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+async function ensureSearchChat(key) {
+  if (!state.runId || !key) return;
+  if (!state.searchChats[key]) {
+    state.searchChats[key] = { messages: [], loading: false, loaded: false, input: "", error: null };
+  }
+  const chat = state.searchChats[key];
+  if (chat.loaded || chat.loading) return;
+  chat.loading = true;
+  try {
+    const res = await api(`/api/runs/${encodeURIComponent(state.runId)}/search-chat?key=${encodeURIComponent(key)}`);
+    if (res && res.history) {
+      chat.messages = res.history;
+    }
+    chat.loaded = true;
+  } catch (err) {
+    console.warn("Failed to load SearchAgent chat history for key", key, err);
+  } finally {
+    chat.loading = false;
+    paintDetail();
+  }
+}
+
+async function sendSearchChatMessage(key) {
+  if (!state.runId || !key) return;
+  if (!state.searchChats[key]) {
+    state.searchChats[key] = { messages: [], loading: false, loaded: true, input: "", error: null };
+  }
+  const chat = state.searchChats[key];
+  const text = (chat.input || "").trim();
+  if (!text || chat.loading) return;
+
+  chat.loading = true;
+  chat.error = null;
+  const now = new Date().toISOString();
+  chat.messages.push({ role: "user", content: text, timestamp: now });
+  chat.input = "";
+  paintDetail();
+
+  setTimeout(() => {
+    try {
+      const box = document.querySelector(`[data-search-chat-box="${CSS.escape(key)}"]`);
+      if (box) box.scrollTop = box.scrollHeight;
+    } catch (_) {}
+  }, 10);
+
+  try {
+    const res = await apiPost(`/api/runs/${encodeURIComponent(state.runId)}/search-chat`, {
+      key: key,
+      message: text,
+    });
+    if (res && res.history) {
+      chat.messages = res.history;
+    } else if (res && res.content) {
+      chat.messages.push({
+        role: "assistant",
+        content: res.content,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } catch (err) {
+    chat.error = err.message || "SearchAgent 답변 생성 중 오류가 발생했습니다.";
+  } finally {
+    chat.loading = false;
+    paintDetail();
+    setTimeout(() => {
+      try {
+        const box = document.querySelector(`[data-search-chat-box="${CSS.escape(key)}"]`);
+        if (box) box.scrollTop = box.scrollHeight;
+        const inp = document.querySelector(`[data-search-chat-input="${CSS.escape(key)}"]`);
+        if (inp) inp.focus();
+      } catch (_) {}
+    }, 20);
+  }
+}
+
+async function clearSearchChat(key) {
+  if (!state.runId || !key) return;
+  if (!confirm(`"${key}"의 SearchAgent 대화 기록을 초기화하시겠습니까?`)) return;
+  try {
+    await apiDelete(`/api/runs/${encodeURIComponent(state.runId)}/search-chat?key=${encodeURIComponent(key)}`);
+    state.searchChats[key] = { messages: [], loading: false, loaded: true, input: "", error: null };
+    showToast("SearchAgent 대화 기록이 초기화되었습니다.");
+    paintDetail();
+  } catch (err) {
+    showToast("SearchAgent 대화 초기화 실패: " + err.message);
+  }
+}
+
+function renderSearchChat(key) {
+  if (!state.searchChats[key]) {
+    state.searchChats[key] = { messages: [], loading: false, loaded: false, input: "", error: null };
+  }
+  const chat = state.searchChats[key];
+  if (!chat.loaded && !chat.loading && state.evalOpenDetails.has(`search_chat:${key}`)) {
+    setTimeout(() => ensureSearchChat(key), 0);
+  }
+
+  const msgs = chat.messages || [];
+  const msgListHtml = msgs.length > 0
+    ? msgs.map(m => {
+        const isUser = m.role === "user";
+        const bubbleCls = isUser ? "eval-chat-msg user" : "eval-chat-msg assistant search";
+        const roleLabel = isUser ? "👤 질문" : "🔎 SearchAgent (근거 검색 모델)";
+        return `<div class="${bubbleCls}">
+          <div class="eval-chat-msg-header">${esc(roleLabel)}</div>
+          <div class="eval-chat-msg-body">${esc(m.content || "")}</div>
+        </div>`;
+      }).join("")
+    : `<div class="eval-chat-empty">
+        SearchAgent의 페이지 선정 이유나 검색 전략에 대해 질문해보세요.<br/>
+        <span style="font-size:10px;color:var(--muted)">예: "p80을 근거 페이지로 선정한 검색 논리와 해석 이유는 무엇인가요?", "p43은 왜 제외되었나요?"</span>
+      </div>`;
+
+  return `
+    <details class="ev-chat-details"${evalDetailAttrs("search_chat", key)}>
+      <summary class="ev-chat-summary">💬 SearchAgent와 대화하기 ${msgs.length > 0 ? `<span class="ev-chat-count">(${msgs.length})</span>` : ""}</summary>
+      <div class="eval-chat-section in-evidence">
+        <div class="eval-chat-header">
+          <span>🔎 SearchAgent (근거 검색 모델)과의 대화</span>
+          ${msgs.length > 0 ? `<button type="button" class="eval-chat-clear-btn" data-search-chat-clear="${esc(key)}" title="대화 내역 초기화">대화 초기화</button>` : ""}
+        </div>
+        <div class="eval-chat-msgs-box" data-search-chat-box="${esc(key)}">
+          ${msgListHtml}
+          ${chat.loading ? `<div class="eval-chat-msg assistant loading"><div class="eval-chat-msg-header">🔎 SearchAgent</div><div class="eval-chat-msg-body">당시 검색 히스토리를 바탕으로 답변을 생각하는 중입니다… ⏳</div></div>` : ""}
+        </div>
+        ${chat.error ? `<div class="eval-chat-error">${esc(chat.error)}</div>` : ""}
+        <div class="eval-chat-input-row">
+          <input type="text" class="eval-chat-input" data-search-chat-input="${esc(key)}"
+            placeholder="SearchAgent에게 질문 입력 (Enter로 전송)"
+            value="${esc(chat.input || "")}"
+            ${chat.loading ? "disabled" : ""} />
+          <button type="button" class="eval-chat-send-btn" data-search-chat-send="${esc(key)}"
+            ${chat.loading ? "disabled" : ""}>
+            ${chat.loading ? "생각 중…" : "전송"}
+          </button>
+        </div>
+      </div>
+    </details>
   `;
 }
 
@@ -5827,6 +6389,46 @@ function paintDetail() {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           sendEvalChatMessage(input.dataset.chatInput);
+        }
+      };
+    });
+
+    detail.querySelectorAll("[data-vlm-chat-send]").forEach(btn => {
+      btn.onclick = () => sendVlmChatMessage(btn.dataset.vlmChatSend);
+    });
+    detail.querySelectorAll("[data-vlm-chat-clear]").forEach(btn => {
+      btn.onclick = () => clearVlmChat(btn.dataset.vlmChatClear);
+    });
+    detail.querySelectorAll("[data-vlm-chat-input]").forEach(input => {
+      input.oninput = (e) => {
+        const k = input.dataset.vlmChatInput;
+        if (!state.vlmChats[k]) state.vlmChats[k] = { messages: [], loading: false, loaded: true, input: "", error: null };
+        state.vlmChats[k].input = e.target.value;
+      };
+      input.onkeydown = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendVlmChatMessage(input.dataset.vlmChatInput);
+        }
+      };
+    });
+
+    detail.querySelectorAll("[data-search-chat-send]").forEach(btn => {
+      btn.onclick = () => sendSearchChatMessage(btn.dataset.searchChatSend);
+    });
+    detail.querySelectorAll("[data-search-chat-clear]").forEach(btn => {
+      btn.onclick = () => clearSearchChat(btn.dataset.searchChatClear);
+    });
+    detail.querySelectorAll("[data-search-chat-input]").forEach(input => {
+      input.oninput = (e) => {
+        const k = input.dataset.searchChatInput;
+        if (!state.searchChats[k]) state.searchChats[k] = { messages: [], loading: false, loaded: true, input: "", error: null };
+        state.searchChats[k].input = e.target.value;
+      };
+      input.onkeydown = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendSearchChatMessage(input.dataset.searchChatInput);
         }
       };
     });

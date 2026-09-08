@@ -163,13 +163,37 @@ def extract_fallback_reasons(pred: Dict[str, Any]) -> Dict[str, str]:
     return reasons
 
 
+def extract_inspected_pages_map(pred: Dict[str, Any]) -> Dict[str, List[int]]:
+    """Extract inspected pages per key from search_agent_traces if present."""
+    inspected_map: Dict[str, set] = {}
+    if not isinstance(pred, dict):
+        return {}
+    for item in pred.get("search_agent_traces") or []:
+        if isinstance(item, dict):
+            k = str(item.get("key") or "").strip()
+            if not k:
+                continue
+            prior = item.get("prior_context_out") or {}
+            pages = prior.get("pages_inspected") or []
+            if k not in inspected_map:
+                inspected_map[k] = set()
+            for p in pages:
+                try:
+                    inspected_map[k].add(int(p))
+                except (TypeError, ValueError):
+                    pass
+    return {k: sorted(list(v)) for k, v in inspected_map.items()}
+
+
 def index_pred_by_key(
     kv_results: Sequence[Dict[str, Any]],
     *,
     fallback_reasons: Optional[Dict[str, str]] = None,
+    inspected_pages_map: Optional[Dict[str, List[int]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     fallbacks = fallback_reasons or {}
+    inspected_map = inspected_pages_map or {}
     for row in kv_results or []:
         if not isinstance(row, dict) or "key" not in row:
             continue
@@ -182,6 +206,8 @@ def index_pred_by_key(
             and not r.get("reason")
         ):
             r["reason"] = fallbacks[k]
+        if k in inspected_map and not r.get("inspected_pages"):
+            r["inspected_pages"] = inspected_map[k]
         out[k] = r
     return out
 
@@ -225,6 +251,10 @@ def evaluate_document(
         micro_pred += len(pred_set)
         micro_gold += len(gold_set)
 
+        raw_inspected = pred.get("inspected_pages") or []
+        inspected_set = as_page_set(raw_inspected) if raw_inspected else set()
+        other_inspected_set = inspected_set - pred_set
+
         gold_evid = _join_evidence_texts(gold.get("evidences") or [])
         # VLM extract_kv_vlm value_reason / evidence_quote (not SearchAgent page_reasons).
         pred_evid = _join_evidence_texts(pred.get("evidence") or [])
@@ -267,6 +297,8 @@ def evaluate_document(
                     "precision": round(p_prec, 6),
                     "recall": round(p_rec, 6),
                     "f1": round(p_f1, 6),
+                    "inspected": sorted(inspected_set),
+                    "other_inspected": sorted(other_inspected_set),
                 },
                 "evidence_text": {
                     # VLM value_reason / evidence_quote only — used for token F1 vs gold evidences.
@@ -325,8 +357,11 @@ def build_pred_only_report(
 ) -> Dict[str, Any]:
     """Build an eval-shaped report from predictions when GT is missing."""
     fallback_reasons = extract_fallback_reasons(pred)
+    inspected_pages_map = extract_inspected_pages_map(pred)
     pred_rows = index_pred_by_key(
-        pred.get("kv_results") or [], fallback_reasons=fallback_reasons
+        pred.get("kv_results") or [],
+        fallback_reasons=fallback_reasons,
+        inspected_pages_map=inspected_pages_map,
     )
     empty_gold = {
         k: {"value": "", "evidences": [], "evidence_pages": []}
@@ -358,8 +393,11 @@ def build_report(
         raise ValueError(f"invalid gold entry for {doc_name}")
 
     fallback_reasons = extract_fallback_reasons(pred)
+    inspected_pages_map = extract_inspected_pages_map(pred)
     pred_rows = index_pred_by_key(
-        pred.get("kv_results") or [], fallback_reasons=fallback_reasons
+        pred.get("kv_results") or [],
+        fallback_reasons=fallback_reasons,
+        inspected_pages_map=inspected_pages_map,
     )
     scored = evaluate_document(
         pred_rows, gold_doc, fallback_reasons=fallback_reasons

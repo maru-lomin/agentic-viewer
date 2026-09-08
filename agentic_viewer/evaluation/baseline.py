@@ -33,6 +33,165 @@ def eval_cache_has_reason_split(report: Dict[str, Any]) -> bool:
     return "search_reasons" in first
 
 
+def eval_cache_has_searched_pages(report: Dict[str, Any]) -> bool:
+    """True when cached eval includes SearchAgent inspected pages."""
+    per_key = report.get("per_key")
+    if not isinstance(per_key, list) or not per_key:
+        return False
+    first = per_key[0]
+    if not isinstance(first, dict):
+        return False
+    sp = first.get("search_pages")
+    return isinstance(sp, dict) and "inspected" in sp
+
+
+def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Extract all pages inspected and queried by SearchAgent for each key in run_dir."""
+    out: Dict[str, Dict[str, Any]] = {}
+    pred_path = run_dir / "04_result.json"
+    sat: list = []
+    if pred_path.is_file():
+        try:
+            pred = json.loads(pred_path.read_text(encoding="utf-8"))
+            if isinstance(pred, dict):
+                sat = pred.get("search_agent_traces") or []
+        except Exception:
+            sat = []
+
+    if sat:
+        for entry in sat:
+            if not isinstance(entry, dict):
+                continue
+            k = entry.get("key")
+            if not k:
+                continue
+            k = str(k).strip()
+            prior = entry.get("prior_context_out") or {}
+            inspected = prior.get("pages_inspected") or []
+            bm25_hits = prior.get("bm25_hits") or []
+            cand_rows = prior.get("candidate_pages") or []
+
+            if k not in out:
+                out[k] = {
+                    "inspected": set(),
+                    "bm25": set(),
+                    "candidates": set(),
+                }
+            for p in inspected:
+                try:
+                    out[k]["inspected"].add(int(p))
+                except (TypeError, ValueError):
+                    pass
+            for h in bm25_hits:
+                if isinstance(h, dict):
+                    p = h.get("page")
+                    if p is not None:
+                        try:
+                            out[k]["bm25"].add(int(p))
+                        except (TypeError, ValueError):
+                            pass
+                    for p2 in h.get("pages") or []:
+                        try:
+                            out[k]["bm25"].add(int(p2))
+                        except (TypeError, ValueError):
+                            pass
+            for c in cand_rows:
+                if isinstance(c, dict):
+                    p = c.get("page")
+                    if p is not None:
+                        try:
+                            out[k]["candidates"].add(int(p))
+                        except (TypeError, ValueError):
+                            pass
+    else:
+        # Fallback to 03_agent/tools
+        tools_dir = run_dir / "03_agent" / "tools"
+        if tools_dir.is_dir():
+            session_keys: Dict[str, set] = {}
+            session_inspected: Dict[str, set] = {}
+            session_bm25: Dict[str, set] = {}
+            for f in tools_dir.glob("*.json"):
+                parts = f.stem.split("_step_")
+                s_lbl = parts[0]
+                if s_lbl not in session_inspected:
+                    session_inspected[s_lbl] = set()
+                    session_bm25[s_lbl] = set()
+                    session_keys[s_lbl] = set()
+                try:
+                    d = json.loads(f.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                name = d.get("name")
+                args = d.get("arguments") or {}
+                res = d.get("result") or {}
+                if name in ("get_page_text", "get_page_image"):
+                    p = args.get("page")
+                    if p is not None:
+                        try:
+                            session_inspected[s_lbl].add(int(p))
+                        except (TypeError, ValueError):
+                            pass
+                elif name == "bm25_search":
+                    for h in res.get("hits") or []:
+                        if isinstance(h, dict) and h.get("page") is not None:
+                            try:
+                                session_bm25[s_lbl].add(int(h["page"]))
+                            except (TypeError, ValueError):
+                                pass
+                elif name in ("submit_pages", "no_relevant_pages"):
+                    k_arg = args.get("key")
+                    if k_arg:
+                        session_keys[s_lbl].add(str(k_arg).strip())
+            for s_lbl, keys in session_keys.items():
+                for k in keys:
+                    if k not in out:
+                        out[k] = {"inspected": set(), "bm25": set(), "candidates": set()}
+                    out[k]["inspected"].update(session_inspected.get(s_lbl, set()))
+                    out[k]["bm25"].update(session_bm25.get(s_lbl, set()))
+
+    return {
+        k: {
+            "inspected": sorted(list(v["inspected"])),
+            "bm25": sorted(list(v["bm25"])),
+            "candidates": sorted(list(v["candidates"])),
+        }
+        for k, v in out.items()
+    }
+
+
+def enrich_eval_with_searched_pages(
+    report: Dict[str, Any],
+    run_dir: Path,
+) -> Dict[str, Any]:
+    """Enrich per_key rows in eval report with pages inspected and queried by SearchAgent."""
+    per_key = report.get("per_key")
+    if not isinstance(per_key, list):
+        return report
+
+    searched_map = extract_searched_pages(run_dir)
+    for row in per_key:
+        if not isinstance(row, dict):
+            continue
+        k = row.get("key")
+        if not k:
+            continue
+        info = searched_map.get(str(k).strip()) or {}
+        sp = row.setdefault("search_pages", {})
+        if not isinstance(sp, dict):
+            continue
+        pred_pages = sp.get("pred") or []
+        pred_set = set(pred_pages)
+        inspected = info.get("inspected") or []
+        other_inspected = [p for p in inspected if p not in pred_set]
+
+        sp["inspected"] = inspected
+        sp["other_inspected"] = other_inspected
+        sp["bm25"] = info.get("bm25") or []
+        sp["candidates"] = info.get("candidates") or []
+
+    return report
+
+
 def load_or_compute_run_eval(
     run_dir: Path,
     *,
@@ -63,6 +222,16 @@ def load_or_compute_run_eval(
                 )
                 if isinstance(fresh, dict) and fresh.get("has_gt") is not False:
                     return fresh
+            if not eval_cache_has_searched_pages(cached):
+                enrich_eval_with_searched_pages(cached, run_dir)
+                if write_cache:
+                    try:
+                        cache_path.write_text(
+                            json.dumps(cached, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                    except OSError:
+                        pass
             return cached
 
     pred_path = run_dir / "04_result.json"
@@ -104,6 +273,7 @@ def load_or_compute_run_eval(
 
     if run_id:
         report["run_id"] = run_id
+    enrich_eval_with_searched_pages(report, run_dir)
     if write_cache:
         try:
             cache_path.write_text(
