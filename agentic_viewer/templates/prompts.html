@@ -1,0 +1,1255 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prompts — Agentic Viewer</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --panel-dark: #121820;
+      --line: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #9aa8bc;
+      --accent: #3d9cf0;
+      --ok: #3ecf8e;
+      --err: #f07178;
+      --warn: #e0a45c;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: var(--sans); height: 100vh;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    header {
+      flex: 0 0 auto;
+      padding: 14px 20px; border-bottom: 1px solid var(--line);
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header .meta { color: var(--muted); font-size: 13px; margin-left: auto; }
+    .topnav { display: flex; gap: 4px; }
+    .topnav a {
+      color: var(--muted); text-decoration: none; font-size: 13px;
+      padding: 6px 12px; border-radius: 999px; border: 1px solid transparent;
+    }
+    .topnav a:hover { color: var(--text); border-color: var(--line); }
+    .topnav a.active {
+      color: var(--text); background: var(--panel); border-color: var(--line);
+    }
+    main {
+      flex: 1 1 0; min-height: 0;
+      display: grid; grid-template-columns: 360px 1fr;
+      overflow: hidden;
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel-dark);
+      display: flex; flex-direction: column;
+      height: 100%; min-height: 0; overflow: hidden;
+    }
+    .aside-section {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .aside-title {
+      font-size: 12px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.05em; color: var(--muted); margin-bottom: 10px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .prompt-list {
+      flex: 1 1 auto; overflow-y: auto; padding: 10px 12px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .prompt-card {
+      border: 1px solid var(--line); border-radius: 8px;
+      background: var(--panel); padding: 12px 14px; cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .prompt-card:hover { border-color: #4a5c73; }
+    .prompt-card.active {
+      border-color: var(--accent); background: #18283f;
+    }
+    .prompt-card-top {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; margin-bottom: 6px;
+    }
+    .prompt-title { font-size: 14px; font-weight: 600; color: #fff; }
+    .badge {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      padding: 2px 6px; border-radius: 4px;
+      background: rgba(61, 156, 240, 0.15); color: var(--accent);
+      border: 1px solid rgba(61, 156, 240, 0.3);
+    }
+    .badge.green {
+      background: rgba(62, 207, 142, 0.15); color: var(--ok);
+      border-color: rgba(62, 207, 142, 0.3);
+    }
+    .badge.purple {
+      background: rgba(168, 85, 247, 0.15); color: #c084fc;
+      border-color: rgba(168, 85, 247, 0.3);
+    }
+    .badge.orange {
+      background: rgba(224, 164, 92, 0.15); color: var(--warn);
+      border-color: rgba(224, 164, 92, 0.3);
+    }
+    .prompt-file {
+      font-family: var(--mono); font-size: 11px; color: var(--muted);
+      margin-bottom: 6px; word-break: break-all;
+    }
+    .prompt-meta {
+      display: flex; gap: 10px; font-size: 11px; color: #7f91a8;
+      align-items: center; flex-wrap: wrap;
+    }
+    .backups-panel {
+      flex: 0 0 240px; border-top: 1px solid var(--line);
+      display: flex; flex-direction: column; min-height: 0;
+      background: #0d1217;
+    }
+    .backups-header {
+      padding: 10px 14px; font-size: 12px; font-weight: 600;
+      color: var(--muted); border-bottom: 1px solid var(--line);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .backups-list {
+      flex: 1 1 auto; overflow-y: auto; padding: 8px 12px;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .backup-item {
+      padding: 6px 10px; border-radius: 6px; border: 1px solid #232d3d;
+      background: #141c26; font-size: 11px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .backup-item:hover { border-color: #3d4f66; }
+    .backup-ts { font-family: var(--mono); color: var(--text); }
+    .backup-actions { display: flex; gap: 4px; }
+    .btn-xs {
+      padding: 2px 6px; font-size: 10px; border-radius: 4px;
+      border: 1px solid var(--line); background: #1a2332; color: var(--muted);
+      cursor: pointer;
+    }
+    .btn-xs:hover { color: var(--text); border-color: var(--accent); }
+    .btn-xs.danger:hover { color: var(--err); border-color: var(--err); }
+
+    /* Right Main Panel */
+    section#content {
+      display: flex; flex-direction: column;
+      height: 100%; min-height: 0; overflow: hidden;
+      background: var(--bg);
+    }
+    .toolbar {
+      flex: 0 0 auto;
+      padding: 10px 18px; border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      background: #121820;
+    }
+    .toolbar-left {
+      display: flex; align-items: center; gap: 10px;
+    }
+    .toolbar-title { font-size: 15px; font-weight: 600; }
+    .status-pill {
+      font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px;
+      display: inline-flex; align-items: center; gap: 5px;
+    }
+    .status-pill.saved {
+      background: rgba(62, 207, 142, 0.15); color: var(--ok);
+      border: 1px solid rgba(62, 207, 142, 0.3);
+    }
+    .status-pill.unsaved {
+      background: rgba(224, 164, 92, 0.15); color: var(--warn);
+      border: 1px solid rgba(224, 164, 92, 0.3);
+    }
+    .view-tabs {
+      display: flex; gap: 4px; margin-left: 20px;
+      background: #0f1419; padding: 3px; border-radius: 8px; border: 1px solid var(--line);
+    }
+    .view-tab {
+      padding: 4px 12px; border-radius: 6px; border: none;
+      background: transparent; color: var(--muted); font-size: 12px;
+      cursor: pointer; font-weight: 500;
+    }
+    .view-tab:hover { color: var(--text); }
+    .view-tab.active {
+      background: var(--panel); color: var(--text); font-weight: 600;
+    }
+    .toolbar-right {
+      margin-left: auto; display: flex; align-items: center; gap: 8px;
+    }
+    .btn {
+      padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 500;
+      border: 1px solid var(--line); background: var(--panel); color: var(--text);
+      cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn:hover { border-color: #4a5c73; background: #222f42; }
+    .btn.primary {
+      background: var(--accent); color: #fff; border-color: var(--accent);
+      font-weight: 600;
+    }
+    .btn.primary:hover { background: #2b88dc; border-color: #2b88dc; }
+    .btn.accent {
+      background: #2a3a50; color: #8ec3f8; border-color: #3d5575;
+    }
+    .btn.accent:hover { background: #334966; border-color: var(--accent); }
+    .btn:disabled {
+      opacity: 0.45; cursor: not-allowed; pointer-events: none;
+    }
+
+    /* Editor Container */
+    .editor-wrap {
+      flex: 1 1 auto; min-height: 0;
+      display: flex; flex-direction: column;
+      position: relative; overflow: hidden;
+    }
+    .hot-reload-banner {
+      flex: 0 0 auto;
+      padding: 7px 18px; font-size: 12px;
+      background: #152233; color: #a0c4ed; border-bottom: 1px solid #23374e;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .editor-inner {
+      flex: 1 1 auto; min-height: 0;
+      display: flex; position: relative; overflow: hidden;
+    }
+    .gutter {
+      flex: 0 0 54px; user-select: none;
+      background: #0d1217; border-right: 1px solid var(--line);
+      color: #4a5c73; font-family: var(--mono); font-size: 12px;
+      line-height: 20px; padding: 12px 6px 12px 0; text-align: right;
+      overflow: hidden;
+    }
+    .textarea-wrap {
+      flex: 1 1 auto; min-width: 0; height: 100%;
+      position: relative;
+    }
+    #promptTextarea {
+      width: 100%; height: 100%; margin: 0; padding: 12px 16px;
+      border: none; outline: none; resize: none;
+      background: #0f1419; color: var(--text);
+      font-family: var(--mono); font-size: 12.5px; line-height: 20px;
+      tab-size: 2; white-space: pre; overflow-wrap: normal; overflow-x: auto;
+    }
+    .editor-footer {
+      flex: 0 0 auto;
+      padding: 6px 18px; border-top: 1px solid var(--line);
+      background: #121820; font-size: 11px; color: var(--muted);
+      display: flex; gap: 16px; align-items: center;
+    }
+    .editor-footer .stat { font-family: var(--mono); color: #cbd6e2; }
+
+    /* Contract Tab View */
+    .contract-wrap {
+      flex: 1 1 auto; min-height: 0; overflow-y: auto;
+      padding: 20px 24px; display: flex; flex-direction: column; gap: 20px;
+    }
+    .contract-card {
+      border: 1px solid var(--line); border-radius: 8px;
+      background: var(--panel); padding: 18px;
+    }
+    .contract-card h3 {
+      margin: 0 0 10px; font-size: 14px; font-weight: 600;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .contract-desc {
+      font-size: 13px; line-height: 1.5; color: var(--muted); margin: 0 0 12px;
+    }
+    pre.code-block {
+      margin: 0; padding: 12px 14px; border-radius: 6px;
+      background: #0b0f14; border: 1px solid #232d3d;
+      font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+      color: #9cdcfe; overflow-x: auto;
+    }
+    .tools-table, .schema-table {
+      width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px;
+    }
+    .tools-table th, .tools-table td,
+    .schema-table th, .schema-table td {
+      border: 1px solid var(--line); padding: 8px 10px; text-align: left;
+      vertical-align: top;
+    }
+    .tools-table th, .schema-table th {
+      background: #141c26; color: var(--muted); font-weight: 600;
+    }
+    .tools-table td.name { font-family: var(--mono); color: var(--accent); font-weight: 600; width: 170px; }
+    .tools-table td.args { font-family: var(--mono); color: #e0a45c; font-size: 11px; width: 220px; }
+    .schema-table td.key { font-family: var(--mono); font-weight: 600; color: #fff; width: 240px; }
+    .schema-table td.desc { line-height: 1.45; color: #cbd6e2; }
+    .search-input {
+      width: 100%; padding: 8px 12px; border-radius: 6px;
+      border: 1px solid var(--line); background: #0b0f14; color: var(--text);
+      font-size: 12px; outline: none; margin-bottom: 10px;
+    }
+    .search-input:focus { border-color: var(--accent); }
+
+    /* Schema Keys Structured Editor View */
+    .schema-editor-wrap {
+      flex: 1 1 auto; min-height: 0;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .schema-editor-header {
+      padding: 12px 18px; border-bottom: 1px solid var(--line);
+      background: #141c26; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .schema-search-bar {
+      flex: 1 1 360px; max-width: 500px;
+      position: relative; display: flex; align-items: center;
+    }
+    .schema-search-bar input {
+      width: 100%; padding: 6px 12px; border-radius: 6px;
+      border: 1px solid var(--line); background: #0d1217; color: var(--text);
+      font-size: 12px; outline: none;
+    }
+    .schema-search-bar input:focus { border-color: var(--accent); }
+    .schema-keys-list {
+      flex: 1 1 auto; overflow-y: auto; padding: 16px 20px;
+      display: flex; flex-direction: column; gap: 14px;
+    }
+    .key-card {
+      border: 1px solid var(--line); border-radius: 8px;
+      background: var(--panel); padding: 14px 16px;
+      transition: border-color 0.15s;
+    }
+    .key-card:hover { border-color: #43546b; }
+    .key-card.focused { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .key-card-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 10px;
+    }
+    .key-index {
+      font-family: var(--mono); font-size: 11px; font-weight: 700;
+      color: var(--muted); min-width: 24px;
+    }
+    .key-name-input {
+      flex: 1 1 auto; font-family: var(--mono); font-size: 13px; font-weight: 600;
+      color: #fff; background: #0d1217; border: 1px solid var(--line);
+      border-radius: 6px; padding: 6px 10px; outline: none;
+    }
+    .key-name-input:focus { border-color: var(--accent); }
+    .key-card-body {
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .key-desc-label {
+      font-size: 11px; font-weight: 600; color: #7f91a8;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .key-desc-textarea {
+      width: 100%; min-height: 84px; padding: 8px 10px; border-radius: 6px;
+      border: 1px solid var(--line); background: #0d1217; color: var(--text);
+      font-family: var(--sans); font-size: 12px; line-height: 1.5; resize: vertical;
+      outline: none;
+    }
+    .key-desc-textarea:focus { border-color: var(--accent); }
+    .key-tags-row {
+      display: flex; gap: 8px; font-size: 11px; margin-top: 4px;
+    }
+    .cue-pill {
+      font-size: 10px; padding: 2px 6px; border-radius: 4px;
+      background: #1b2636; border: 1px solid #2d3e56; color: #8ec3f8;
+    }
+    .cue-pill.ok {
+      background: rgba(62, 207, 142, 0.12); color: var(--ok); border-color: rgba(62, 207, 142, 0.25);
+    }
+
+    /* Modal */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.7);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100; backdrop-filter: blur(2px);
+    }
+    .modal {
+      width: 840px; max-width: 90vw; max-height: 85vh;
+      border-radius: 10px; border: 1px solid var(--line);
+      background: var(--panel); display: flex; flex-direction: column;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5); overflow: hidden;
+    }
+    .modal-header {
+      padding: 14px 18px; border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; justify-content: space-between;
+      background: #141c26;
+    }
+    .modal-header h3 { margin: 0; font-size: 15px; font-weight: 600; }
+    .modal-body {
+      flex: 1 1 auto; overflow: auto; padding: 16px;
+    }
+    .modal-footer {
+      padding: 12px 18px; border-top: 1px solid var(--line);
+      display: flex; justify-content: flex-end; gap: 8px; background: #141c26;
+    }
+    .diff-view {
+      font-family: var(--mono); font-size: 12px; line-height: 1.5;
+      background: #0b0f14; border-radius: 6px; padding: 12px;
+      white-space: pre; overflow-x: auto;
+    }
+    .diff-line.add { background: rgba(62, 207, 142, 0.15); color: #85e8b9; }
+    .diff-line.del { background: rgba(240, 113, 120, 0.15); color: #f59a9f; }
+    .diff-line.hunk { color: #3d9cf0; font-weight: 600; }
+    .empty { color: var(--muted); padding: 40px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Agentic Viewer</h1>
+    <nav class="topnav">
+      <a href="/">Inference</a>
+      <a href="/datasets">Datasets</a>
+      <a href="/evaluation">Evaluation</a>
+      <a href="/ground-truth">Ground Truth</a>
+      <a href="/wrong-cases">Wrong Cases</a>
+      <a href="/prompts" class="active">Prompts</a>
+    </nav>
+    <div class="meta" id="headerMeta">System Prompts & KV Schema Management</div>
+  </header>
+  <main>
+    <aside>
+      <div class="aside-section">
+        <div class="aside-title">
+          <span>Agents & Schema</span>
+          <span class="badge green" id="promptCountBadge">4 Items</span>
+        </div>
+      </div>
+      <div class="prompt-list" id="promptList">
+        <div class="empty">Loading items…</div>
+      </div>
+      <div class="backups-panel">
+        <div class="backups-header">
+          <span>Backup History</span>
+          <span id="backupCountLabel" class="badge">0 backups</span>
+        </div>
+        <div class="backups-list" id="backupsList">
+          <div class="empty" style="padding:16px 0; font-size:11px;">No backups yet</div>
+        </div>
+      </div>
+    </aside>
+
+    <section id="content">
+      <div class="toolbar" id="toolbar">
+        <div class="toolbar-left">
+          <div class="toolbar-title" id="currentTitle">—</div>
+          <span class="badge" id="currentRoleBadge">—</span>
+          <span class="status-pill saved" id="statusPill">Saved</span>
+        </div>
+        <div class="view-tabs" id="viewTabs">
+          <!-- Dynamically populated based on prompt vs schema -->
+        </div>
+        <div class="toolbar-right">
+          <button type="button" class="btn" id="btnDiff" onclick="openDiffModal()" disabled>🔍 Diff</button>
+          <button type="button" class="btn" id="btnReset" onclick="resetCurrentPrompt()" disabled>↺ Reset</button>
+          <button type="button" class="btn primary" id="btnSave" onclick="saveCurrentPrompt()" disabled>💾 Save (Ctrl+S)</button>
+        </div>
+      </div>
+
+      <!-- View 1: Text Editor (Prompt or Raw JSON) -->
+      <div class="editor-wrap" id="editorView">
+        <div class="hot-reload-banner">
+          <span>⚡ <strong>Hot-Reloading:</strong> Changes saved here are dynamically reloaded on the next run of <code>client_dir.sh</code> or Agentic Eval without restarting the server.</span>
+          <span id="filePathDisplay" style="font-family:var(--mono); font-size:11px; opacity:0.8;"></span>
+        </div>
+        <div class="editor-inner">
+          <div class="gutter" id="lineGutter">1</div>
+          <div class="textarea-wrap">
+            <textarea id="promptTextarea" spellcheck="false" placeholder="Loading content…"></textarea>
+          </div>
+        </div>
+        <div class="editor-footer">
+          <span>Lines: <strong class="stat" id="statLines">0</strong></span>
+          <span>Chars: <strong class="stat" id="statChars">0</strong></span>
+          <span>Est. Tokens: <strong class="stat" id="statTokens">0</strong> (~4 chars/tok)</span>
+          <span style="margin-left:auto; color:#607590;" id="lastUpdatedLabel"></span>
+        </div>
+      </div>
+
+      <!-- View 2: Prompt Contract Tab View (For Master/Search/Eval) -->
+      <div class="contract-wrap" id="contractView" style="display:none;">
+        <div class="contract-card" id="completionCard">
+          <h3>Completion Protocol & Structured Output</h3>
+          <p class="contract-desc" id="completionDesc">—</p>
+          <div id="schemaExampleWrap">
+            <pre class="code-block" id="schemaExampleCode"></pre>
+          </div>
+        </div>
+
+        <div class="contract-card" id="intermediateCard" style="display:none;">
+          <h3>Intermediate Tool Structured Outputs</h3>
+          <div id="intermediateSchemasList"></div>
+        </div>
+
+        <div class="contract-card">
+          <h3>Available Agent Tools</h3>
+          <table class="tools-table">
+            <thead>
+              <tr><th>Tool Name</th><th>Arguments</th><th>Description</th></tr>
+            </thead>
+            <tbody id="toolsTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="contract-card" id="schemaKeysCard" style="display:none;">
+          <h3>
+            <span>Target Extraction Keys (<span id="keyCountLabel">0</span>)</span>
+            <button type="button" class="btn accent" onclick="selectPrompt('kv_schema')" style="font-size:11px; padding:3px 10px;">
+              ✏️ Edit Schema Keys in Schema Editor
+            </button>
+          </h3>
+          <p class="contract-desc">Document schema defined in <code>dataset/kv_description.json</code>. The agent is prompted to extract evidence and values for these exact keys:</p>
+          <input type="search" class="search-input" id="keySearchInput" placeholder="Filter schema keys by name or keyword…" oninput="filterSchemaKeys()" />
+          <table class="schema-table">
+            <thead>
+              <tr><th>Schema Key</th><th>Search Cues & Allowed Values Description</th><th>Action</th></tr>
+            </thead>
+            <tbody id="schemaTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- View 3: Structured Key-by-Key Schema Editor (For kv_schema) -->
+      <div class="schema-editor-wrap" id="schemaKeysView" style="display:none;">
+        <div class="hot-reload-banner">
+          <span>⚡ <strong>Schema Editor:</strong> Edit extraction instructions, BM25 search cues, and allowed values per key. Saved directly to <code>dataset/kv_description.json</code>.</span>
+          <span id="schemaCountBadge" class="badge orange">0 Keys</span>
+        </div>
+        <div class="schema-editor-header">
+          <div class="schema-search-bar">
+            <input type="search" id="schemaFilterInput" placeholder="🔍 Search keys, cues, or description keywords…" oninput="renderSchemaCards()" />
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button type="button" class="btn accent" onclick="addNewSchemaKey()">+ Add Key</button>
+          </div>
+        </div>
+        <div class="schema-keys-list" id="schemaKeysList">
+          <div class="empty">Loading schema keys…</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Diff / Preview Modal -->
+  <div class="modal-backdrop" id="diffModal" style="display:none;" onclick="if(event.target===this) closeDiffModal()">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="diffModalTitle">Prompt Diff</h3>
+        <button type="button" class="btn-xs" onclick="closeDiffModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="diff-view" id="diffContent">Calculating diff…</div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" onclick="closeDiffModal()">Close</button>
+        <button type="button" class="btn primary" id="modalSaveBtn" onclick="saveCurrentPrompt(); closeDiffModal();">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const state = {
+  prompts: [],
+  selectedId: "master",
+  activePrompt: null,
+  savedContent: "",
+  currentContent: "",
+  isDirty: false,
+  activeTab: "editor", // "editor", "contract", "keys", "raw_json"
+  backups: [],
+  schemaKeys: [],
+  editableSchemaKeys: [], // For structured key editor
+  focusKeyAfterSwitch: null,
+};
+
+function esc(s) {
+  if (s == null) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString("ko-KR", {
+      month: "numeric", day: "numeric",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+  } catch (e) {
+    return iso;
+  }
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  if (!res.ok) {
+    let err = `${res.status} ${res.statusText}`;
+    try {
+      const j = await res.json();
+      if (j && j.detail) err = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+    } catch (_) {}
+    throw new Error(err);
+  }
+  return res.json();
+}
+
+async function init() {
+  await loadPromptsList();
+  const textarea = document.getElementById("promptTextarea");
+  textarea.addEventListener("input", handleTextareaInput);
+  textarea.addEventListener("scroll", syncGutterScroll);
+  textarea.addEventListener("keydown", handleKeydown);
+  window.addEventListener("keydown", handleGlobalShortcuts);
+
+  // Parse prompt parameter from URL if any
+  const params = new URLSearchParams(window.location.search);
+  const targetId = params.get("prompt");
+  const targetKey = params.get("key");
+  if (targetKey) state.focusKeyAfterSwitch = targetKey;
+
+  if (targetId && ["master", "search", "eval_master", "kv_schema"].includes(targetId)) {
+    await selectPrompt(targetId, targetKey);
+  } else {
+    await selectPrompt("master");
+  }
+}
+
+async function loadPromptsList() {
+  try {
+    const data = await api("/api/prompts");
+    state.prompts = data.prompts || [];
+    renderPromptList();
+  } catch (e) {
+    console.error("Failed to load prompts list", e);
+  }
+}
+
+function renderPromptList() {
+  const container = document.getElementById("promptList");
+  if (!state.prompts.length) {
+    container.innerHTML = `<div class="empty">No items found</div>`;
+    return;
+  }
+  container.innerHTML = state.prompts.map(p => {
+    const isActive = p.id === state.selectedId;
+    let badgeClass = "badge";
+    if (p.id === "master") badgeClass = "badge";
+    else if (p.id === "search") badgeClass = "badge green";
+    else if (p.id === "eval_master") badgeClass = "badge purple";
+    else if (p.id === "kv_schema") badgeClass = "badge orange";
+
+    const isSchema = p.id === "kv_schema";
+    const metaCount = isSchema ? `${p.line_count || 0} lines` : `${p.line_count || 0} lines`;
+
+    return `
+      <div class="prompt-card ${isActive ? 'active' : ''}" onclick="selectPrompt('${esc(p.id)}')">
+        <div class="prompt-card-top">
+          <div class="prompt-title">${esc(p.title)}</div>
+          <span class="${badgeClass}">${esc(p.role)}</span>
+        </div>
+        <div class="prompt-file">${esc(p.filename)}</div>
+        <div class="prompt-meta">
+          <span>${metaCount}</span>
+          <span>${Math.round((p.size_bytes || 0) / 1024 * 10) / 10} KB</span>
+          <span>${p.backup_count || 0} backups</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function selectPrompt(id, focusKey = null) {
+  if (state.isDirty && state.selectedId !== id) {
+    if (!confirm("You have unsaved changes. Discard and switch?")) return;
+  }
+  state.selectedId = id;
+  renderPromptList();
+
+  const textarea = document.getElementById("promptTextarea");
+  textarea.value = "Loading…";
+  textarea.disabled = true;
+
+  try {
+    const prompt = await api(`/api/prompts/${encodeURIComponent(id)}`);
+    state.activePrompt = prompt;
+    state.savedContent = prompt.content || "";
+    state.currentContent = prompt.content || "";
+    state.isDirty = false;
+    state.backups = prompt.backups || [];
+    state.schemaKeys = prompt.schema_keys || [];
+
+    // Clone schema keys for structured editing
+    state.editableSchemaKeys = JSON.parse(JSON.stringify(prompt.schema_keys || []));
+
+    // Update UI Header & Badges
+    document.getElementById("currentTitle").textContent = prompt.title;
+    const roleBadge = document.getElementById("currentRoleBadge");
+    roleBadge.textContent = prompt.role;
+    if (id === "master") roleBadge.className = "badge";
+    else if (id === "search") roleBadge.className = "badge green";
+    else if (id === "eval_master") roleBadge.className = "badge purple";
+    else if (id === "kv_schema") roleBadge.className = "badge orange";
+
+    document.getElementById("filePathDisplay").textContent = prompt.filename;
+    document.getElementById("lastUpdatedLabel").textContent = prompt.updated_at ? `Last saved: ${fmtDate(prompt.updated_at)}` : "";
+
+    // Set Textarea Content
+    textarea.value = state.currentContent;
+    textarea.disabled = false;
+    updateStatsAndGutter();
+    updateDirtyUI();
+
+    // Render Backups
+    renderBackupsList();
+
+    // Setup Tabs based on item type
+    setupViewTabs(id);
+
+    // Render appropriate tab
+    if (id === "kv_schema") {
+      switchTab("keys");
+      renderSchemaCards(focusKey || state.focusKeyAfterSwitch);
+      state.focusKeyAfterSwitch = null;
+    } else {
+      switchTab("editor");
+      renderContractTab();
+    }
+
+    // Update URL query param
+    const url = new URL(window.location);
+    url.searchParams.set("prompt", id);
+    if (focusKey) url.searchParams.set("key", focusKey);
+    else url.searchParams.delete("key");
+    window.history.replaceState({}, "", url);
+
+  } catch (e) {
+    alert(`Failed to load item: ${e.message}`);
+  }
+}
+
+function setupViewTabs(id) {
+  const container = document.getElementById("viewTabs");
+  if (id === "kv_schema") {
+    container.innerHTML = `
+      <button type="button" class="view-tab active" id="tabKeysBtn" onclick="switchTab('keys')">🔑 Key-by-Key Editor</button>
+      <button type="button" class="view-tab" id="tabRawJsonBtn" onclick="switchTab('raw_json')">📝 Raw JSON</button>
+    `;
+  } else {
+    container.innerHTML = `
+      <button type="button" class="view-tab active" id="tabEditorBtn" onclick="switchTab('editor')">✏️ Editor</button>
+      <button type="button" class="view-tab" id="tabContractBtn" onclick="switchTab('contract')">📋 Output Contract & Keys</button>
+    `;
+  }
+}
+
+function switchTab(tab) {
+  state.activeTab = tab;
+  const isSchema = state.selectedId === "kv_schema";
+
+  const editorView = document.getElementById("editorView");
+  const contractView = document.getElementById("contractView");
+  const schemaKeysView = document.getElementById("schemaKeysView");
+
+  if (isSchema) {
+    const tabKeysBtn = document.getElementById("tabKeysBtn");
+    const tabRawJsonBtn = document.getElementById("tabRawJsonBtn");
+
+    if (tab === "keys") {
+      // Sync from raw JSON to keys if raw json was edited
+      if (tabRawJsonBtn && tabRawJsonBtn.classList.contains("active")) {
+        try {
+          const parsed = JSON.parse(state.currentContent);
+          if (Array.isArray(parsed)) {
+            state.editableSchemaKeys = parsed;
+          }
+        } catch (e) {
+          alert(`Invalid JSON in raw editor: ${e.message}. Please fix syntax errors before switching.`);
+          return;
+        }
+      }
+      if (tabKeysBtn) tabKeysBtn.className = "view-tab active";
+      if (tabRawJsonBtn) tabRawJsonBtn.className = "view-tab";
+      schemaKeysView.style.display = "flex";
+      editorView.style.display = "none";
+      contractView.style.display = "none";
+      renderSchemaCards();
+    } else {
+      // Switch to raw JSON: sync from keys to JSON string
+      syncKeysToContent();
+      const textarea = document.getElementById("promptTextarea");
+      textarea.value = state.currentContent;
+      updateStatsAndGutter();
+
+      if (tabKeysBtn) tabKeysBtn.className = "view-tab";
+      if (tabRawJsonBtn) tabRawJsonBtn.className = "view-tab active";
+      schemaKeysView.style.display = "none";
+      editorView.style.display = "flex";
+      contractView.style.display = "none";
+    }
+  } else {
+    const tabEditorBtn = document.getElementById("tabEditorBtn");
+    const tabContractBtn = document.getElementById("tabContractBtn");
+
+    if (tab === "editor") {
+      if (tabEditorBtn) tabEditorBtn.className = "view-tab active";
+      if (tabContractBtn) tabContractBtn.className = "view-tab";
+      editorView.style.display = "flex";
+      contractView.style.display = "none";
+      schemaKeysView.style.display = "none";
+    } else {
+      if (tabEditorBtn) tabEditorBtn.className = "view-tab";
+      if (tabContractBtn) tabContractBtn.className = "view-tab active";
+      editorView.style.display = "none";
+      contractView.style.display = "flex";
+      schemaKeysView.style.display = "none";
+    }
+  }
+}
+
+function handleTextareaInput(e) {
+  state.currentContent = e.target.value;
+  state.isDirty = state.currentContent !== state.savedContent;
+  updateStatsAndGutter();
+  updateDirtyUI();
+}
+
+function syncKeysToContent() {
+  state.currentContent = JSON.stringify(state.editableSchemaKeys, null, 2) + "\n";
+  state.isDirty = state.currentContent !== state.savedContent;
+  updateDirtyUI();
+}
+
+function updateDirtyUI() {
+  const pill = document.getElementById("statusPill");
+  const btnSave = document.getElementById("btnSave");
+  const btnReset = document.getElementById("btnReset");
+  const btnDiff = document.getElementById("btnDiff");
+
+  if (state.isDirty) {
+    pill.className = "status-pill unsaved";
+    pill.textContent = "Unsaved Changes *";
+    btnSave.disabled = false;
+    btnReset.disabled = false;
+    btnDiff.disabled = false;
+  } else {
+    pill.className = "status-pill saved";
+    pill.textContent = "Saved";
+    btnSave.disabled = true;
+    btnReset.disabled = true;
+    btnDiff.disabled = true;
+  }
+}
+
+function updateStatsAndGutter() {
+  const text = state.currentContent;
+  const lines = text.split("\n");
+  const lineCount = lines.length;
+  const charCount = text.length;
+  const estTokens = Math.round(charCount / 4);
+
+  document.getElementById("statLines").textContent = lineCount.toLocaleString();
+  document.getElementById("statChars").textContent = charCount.toLocaleString();
+  document.getElementById("statTokens").textContent = estTokens.toLocaleString();
+
+  // Generate gutter numbers
+  const gutter = document.getElementById("lineGutter");
+  const numbers = [];
+  for (let i = 1; i <= lineCount; i++) numbers.push(i);
+  gutter.textContent = numbers.join("\n");
+}
+
+function syncGutterScroll() {
+  const textarea = document.getElementById("promptTextarea");
+  const gutter = document.getElementById("lineGutter");
+  gutter.scrollTop = textarea.scrollTop;
+}
+
+function handleKeydown(e) {
+  if (e.key === "Tab") {
+    e.preventDefault();
+    const textarea = e.target;
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const value = textarea.value;
+    textarea.value = value.substring(0, start) + "  " + value.substring(end);
+    textarea.selectionStart = textarea.selectionEnd = start + 2;
+    handleTextareaInput({ target: textarea });
+  }
+}
+
+function handleGlobalShortcuts(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+    e.preventDefault();
+    if (state.isDirty) {
+      saveCurrentPrompt();
+    }
+  }
+}
+
+async function saveCurrentPrompt() {
+  if (!state.selectedId) return;
+  const btnSave = document.getElementById("btnSave");
+  btnSave.disabled = true;
+  btnSave.textContent = "Saving…";
+
+  // If in schema structured view, make sure currentContent is in sync
+  if (state.selectedId === "kv_schema" && state.activeTab === "keys") {
+    syncKeysToContent();
+  }
+
+  try {
+    const res = await api(`/api/prompts/${encodeURIComponent(state.selectedId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ content: state.currentContent }),
+    });
+
+    state.savedContent = state.currentContent;
+    state.isDirty = false;
+    updateDirtyUI();
+
+    document.getElementById("lastUpdatedLabel").textContent = `Last saved: ${fmtDate(res.updated_at)}`;
+
+    // Refresh prompt list & backups list
+    await loadPromptsList();
+    const promptData = await api(`/api/prompts/${encodeURIComponent(state.selectedId)}`);
+    state.backups = promptData.backups || [];
+    state.schemaKeys = promptData.schema_keys || [];
+    state.editableSchemaKeys = JSON.parse(JSON.stringify(promptData.schema_keys || []));
+    renderBackupsList();
+
+    if (state.selectedId === "kv_schema") {
+      renderSchemaCards();
+    }
+
+  } catch (e) {
+    alert(`Failed to save: ${e.message}`);
+  } finally {
+    btnSave.textContent = "💾 Save (Ctrl+S)";
+    updateDirtyUI();
+  }
+}
+
+function resetCurrentPrompt() {
+  if (!confirm("Discard all unsaved edits and reload last saved version?")) return;
+  state.currentContent = state.savedContent;
+  document.getElementById("promptTextarea").value = state.savedContent;
+
+  if (state.selectedId === "kv_schema") {
+    try {
+      state.editableSchemaKeys = JSON.parse(state.savedContent);
+    } catch (_) {
+      state.editableSchemaKeys = JSON.parse(JSON.stringify(state.schemaKeys));
+    }
+    renderSchemaCards();
+  }
+
+  state.isDirty = false;
+  updateStatsAndGutter();
+  updateDirtyUI();
+}
+
+function renderBackupsList() {
+  const list = document.getElementById("backupsList");
+  const countLabel = document.getElementById("backupCountLabel");
+  countLabel.textContent = `${state.backups.length} backups`;
+
+  if (!state.backups.length) {
+    list.innerHTML = `<div class="empty" style="padding:16px 0; font-size:11px;">No backups yet (created on save)</div>`;
+    return;
+  }
+
+  list.innerHTML = state.backups.map(b => {
+    return `
+      <div class="backup-item">
+        <div>
+          <div class="backup-ts">${esc(b.timestamp)}</div>
+          <div style="color:var(--muted); font-size:10px;">${fmtDate(b.updated_at)}</div>
+        </div>
+        <div class="backup-actions">
+          <button type="button" class="btn-xs" onclick="previewBackupDiff('${esc(b.timestamp)}')">Diff</button>
+          <button type="button" class="btn-xs" onclick="restoreBackup('${esc(b.timestamp)}')">Restore</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function restoreBackup(timestamp) {
+  if (!confirm(`Restore from backup [${timestamp}]? A backup of the current file will be created.`)) return;
+
+  try {
+    await api(`/api/prompts/${encodeURIComponent(state.selectedId)}/restore`, {
+      method: "POST",
+      body: JSON.stringify({ timestamp }),
+    });
+    await selectPrompt(state.selectedId);
+    alert(`Successfully restored from backup [${timestamp}]`);
+  } catch (e) {
+    alert(`Restore failed: ${e.message}`);
+  }
+}
+
+async function openDiffModal() {
+  if (!state.isDirty) return;
+  const modal = document.getElementById("diffModal");
+  const title = document.getElementById("diffModalTitle");
+  const content = document.getElementById("diffContent");
+
+  if (state.selectedId === "kv_schema" && state.activeTab === "keys") {
+    syncKeysToContent();
+  }
+
+  title.textContent = `Unsaved Changes Diff — ${state.activePrompt ? state.activePrompt.title : ''}`;
+  content.innerHTML = "Computing diff…";
+  modal.style.display = "flex";
+
+  try {
+    const res = await api(`/api/prompts/${encodeURIComponent(state.selectedId)}/diff`, {
+      method: "POST",
+      body: JSON.stringify({
+        modified: state.currentContent,
+        compare_with: "current"
+      }),
+    });
+    renderDiffLines(res.diff || "No changes detected.");
+  } catch (e) {
+    content.textContent = `Diff error: ${e.message}`;
+  }
+}
+
+async function previewBackupDiff(timestamp) {
+  const modal = document.getElementById("diffModal");
+  const title = document.getElementById("diffModalTitle");
+  const content = document.getElementById("diffContent");
+
+  title.textContent = `Backup [${timestamp}] vs Current Saved`;
+  content.innerHTML = "Computing diff…";
+  modal.style.display = "flex";
+
+  try {
+    const res = await api(`/api/prompts/${encodeURIComponent(state.selectedId)}/diff`, {
+      method: "POST",
+      body: JSON.stringify({
+        modified: state.savedContent,
+        compare_with: timestamp
+      }),
+    });
+    renderDiffLines(res.diff || "Files are identical.");
+  } catch (e) {
+    content.textContent = `Diff error: ${e.message}`;
+  }
+}
+
+function renderDiffLines(diffText) {
+  const el = document.getElementById("diffContent");
+  if (!diffText.trim()) {
+    el.innerHTML = '<span style="color:var(--muted)">No differences found.</span>';
+    return;
+  }
+  const lines = diffText.split("\n");
+  el.innerHTML = lines.map(line => {
+    let cls = "diff-line";
+    if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
+    else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
+    else if (line.startsWith("@@")) cls += " hunk";
+    return `<div class="${cls}">${esc(line)}</div>`;
+  }).join("");
+}
+
+function closeDiffModal() {
+  document.getElementById("diffModal").style.display = "none";
+}
+
+/* ========================================================
+   Structured Key-by-Key Schema Editor Functions
+   ======================================================== */
+
+function renderSchemaCards(focusKeyName = null) {
+  const list = document.getElementById("schemaKeysList");
+  const badge = document.getElementById("schemaCountBadge");
+  const filterInput = document.getElementById("schemaFilterInput");
+  const query = (filterInput ? filterInput.value : "").trim().toLowerCase();
+
+  const keys = state.editableSchemaKeys || [];
+  badge.textContent = `${keys.length} Keys`;
+
+  let visibleKeys = keys.map((item, idx) => ({ ...item, originalIndex: idx }));
+  if (query) {
+    visibleKeys = visibleKeys.filter(k =>
+      (k.key && k.key.toLowerCase().includes(query)) ||
+      (k.description && k.description.toLowerCase().includes(query))
+    );
+  }
+
+  if (!visibleKeys.length) {
+    list.innerHTML = `<div class="empty">No keys match "${esc(query)}". Click [+ Add Key] to create one.</div>`;
+    return;
+  }
+
+  list.innerHTML = visibleKeys.map(k => {
+    const idx = k.originalIndex;
+    const hasCues = k.description && k.description.includes("Search cues:");
+    const hasAllowed = k.description && (k.description.includes("Allowed values") || k.description.includes("허용값"));
+    const isTarget = focusKeyName && k.key === focusKeyName;
+
+    return `
+      <div class="key-card ${isTarget ? 'focused' : ''}" id="keyCard_${idx}">
+        <div class="key-card-head">
+          <span class="key-index">#${idx + 1}</span>
+          <input type="text" class="key-name-input" value="${esc(k.key)}"
+            placeholder="Key name (e.g. Distance between GTG)"
+            onchange="updateSchemaKeyName(${idx}, this.value)"
+          />
+          <button type="button" class="btn-xs danger" onclick="deleteSchemaKey(${idx})">🗑️ Delete</button>
+        </div>
+        <div class="key-card-body">
+          <div class="key-desc-label">
+            <span>Extraction Instructions, Search Cues & Allowed Values (Description):</span>
+            <div class="key-tags-row">
+              <span class="cue-pill ${hasCues ? 'ok' : ''}">Search Cues ${hasCues ? '✓' : '⚠️'}</span>
+              <span class="cue-pill ${hasAllowed ? 'ok' : ''}">Allowed Values ${hasAllowed ? '✓' : '⚠️'}</span>
+            </div>
+          </div>
+          <textarea class="key-desc-textarea" id="keyDescTextarea_${idx}"
+            placeholder="Extract... Search cues: ... Allowed values: ..."
+            oninput="updateSchemaKeyDesc(${idx}, this.value)"
+          >${esc(k.description || "")}</textarea>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  if (focusKeyName) {
+    setTimeout(() => {
+      const targetCard = document.querySelector(".key-card.focused");
+      if (targetCard) {
+        targetCard.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 100);
+  }
+}
+
+function updateSchemaKeyName(index, newName) {
+  if (!state.editableSchemaKeys[index]) return;
+  state.editableSchemaKeys[index].key = newName.trim();
+  syncKeysToContent();
+}
+
+function updateSchemaKeyDesc(index, newDesc) {
+  if (!state.editableSchemaKeys[index]) return;
+  state.editableSchemaKeys[index].description = newDesc;
+  syncKeysToContent();
+}
+
+function addNewSchemaKey() {
+  const newKey = {
+    key: "New Extraction Key",
+    description: "Extract ... Search cues: ... Allowed values (choose exactly one): '...' / '...'. If the document has no usable information, output 'not_found'."
+  };
+  state.editableSchemaKeys.unshift(newKey);
+  syncKeysToContent();
+  renderSchemaCards(newKey.key);
+}
+
+function deleteSchemaKey(index) {
+  const item = state.editableSchemaKeys[index];
+  if (!item) return;
+  if (!confirm(`Delete key "${item.key}" from schema?`)) return;
+
+  state.editableSchemaKeys.splice(index, 1);
+  syncKeysToContent();
+  renderSchemaCards();
+}
+
+/* ========================================================
+   Contract Tab View Functions (For Master/Search/Eval)
+   ======================================================== */
+
+function renderContractTab() {
+  const p = state.activePrompt;
+  if (!p || !p.contract) return;
+  const c = p.contract;
+
+  // Completion Card
+  document.getElementById("completionDesc").textContent = c.completion_description || "";
+  document.getElementById("schemaExampleCode").textContent = JSON.stringify(c.final_schema_example, null, 2);
+
+  // Intermediate Schemas
+  const intermediateCard = document.getElementById("intermediateCard");
+  const intermediateList = document.getElementById("intermediateSchemasList");
+  if (c.intermediate_schemas && c.intermediate_schemas.length > 0) {
+    intermediateCard.style.display = "block";
+    intermediateList.innerHTML = c.intermediate_schemas.map(item => `
+      <div style="margin-bottom:14px;">
+        <h4 style="margin:0 0 4px; font-size:13px; color:var(--accent); font-family:var(--mono);">${esc(item.name)}</h4>
+        <p style="margin:0 0 8px; font-size:12px; color:var(--muted);">${esc(item.description)}</p>
+        <pre class="code-block">${esc(JSON.stringify(item.schema, null, 2))}</pre>
+      </div>
+    `).join("");
+  } else {
+    intermediateCard.style.display = "none";
+  }
+
+  // Available Tools
+  const toolsBody = document.getElementById("toolsTableBody");
+  if (c.available_tools && c.available_tools.length > 0) {
+    toolsBody.innerHTML = c.available_tools.map(t => `
+      <tr>
+        <td class="name">${esc(t.name)}</td>
+        <td class="args">${esc(t.args || "()")}</td>
+        <td>${esc(t.description)}</td>
+      </tr>
+    `).join("");
+  } else {
+    toolsBody.innerHTML = `<tr><td colspan="3" style="color:var(--muted); padding:12px;">No tools defined</td></tr>`;
+  }
+
+  // Schema Keys Card
+  const schemaKeysCard = document.getElementById("schemaKeysCard");
+  if (state.schemaKeys && state.schemaKeys.length > 0) {
+    schemaKeysCard.style.display = "block";
+    document.getElementById("keyCountLabel").textContent = state.schemaKeys.length;
+    renderSchemaKeysTable(state.schemaKeys);
+  } else {
+    schemaKeysCard.style.display = "none";
+  }
+}
+
+function renderSchemaKeysTable(keys) {
+  const tbody = document.getElementById("schemaTableBody");
+  if (!keys.length) {
+    tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted); padding:16px;">No keys match filter</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = keys.map(k => `
+    <tr>
+      <td class="key">${esc(k.key)}</td>
+      <td class="desc">${esc(k.description)}</td>
+      <td style="white-space:nowrap; vertical-align:middle;">
+        <button type="button" class="btn-xs" onclick="selectPrompt('kv_schema', '${esc(k.key)}')">✏️ Edit Key</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+function filterSchemaKeys() {
+  const query = (document.getElementById("keySearchInput").value || "").trim().toLowerCase();
+  if (!query) {
+    renderSchemaKeysTable(state.schemaKeys);
+    return;
+  }
+  const filtered = state.schemaKeys.filter(k =>
+    (k.key && k.key.toLowerCase().includes(query)) ||
+    (k.description && k.description.toLowerCase().includes(query))
+  );
+  renderSchemaKeysTable(filtered);
+}
+
+window.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

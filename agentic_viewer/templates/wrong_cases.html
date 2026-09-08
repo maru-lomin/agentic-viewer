@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wrong Cases — Agentic Viewer</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --line: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #9aa8bc;
+      --accent: #3d9cf0;
+      --ok: #3ecf8e;
+      --err: #f07178;
+      --warn: #e0a45c;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: var(--sans); height: 100vh;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    header {
+      flex: 0 0 auto;
+      padding: 14px 20px; border-bottom: 1px solid var(--line);
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header .meta { color: var(--muted); font-size: 13px; margin-left: auto; }
+    .topnav { display: flex; gap: 4px; }
+    .topnav a {
+      color: var(--muted); text-decoration: none; font-size: 13px;
+      padding: 6px 12px; border-radius: 999px; border: 1px solid transparent;
+    }
+    .topnav a:hover { color: var(--text); border-color: var(--line); }
+    .topnav a.active {
+      color: var(--text); background: var(--panel); border-color: var(--line);
+    }
+    main {
+      flex: 1 1 0;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      overflow: hidden;
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: #121820;
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
+      padding: 12px;
+      gap: 10px;
+    }
+    section#content {
+      overflow-y: auto;
+      overflow-x: hidden;
+      height: 100%;
+      min-height: 0;
+      padding: 20px 24px;
+    }
+    .filter-tabs {
+      display: flex; gap: 4px; flex-wrap: wrap;
+    }
+    .filter-tab {
+      padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line);
+      background: #152033; color: var(--muted); font-size: 11px; cursor: pointer;
+    }
+    .filter-tab:hover { color: var(--text); border-color: var(--accent); }
+    .filter-tab.active {
+      color: var(--text); background: #1a3a5c; border-color: var(--accent); font-weight: 600;
+    }
+    .search-box {
+      width: 100%; padding: 7px 10px; border-radius: 6px;
+      border: 1px solid var(--line); background: #0f1419; color: var(--text);
+      font-size: 12px; font-family: var(--sans);
+    }
+    .search-box:focus { outline: none; border-color: var(--accent); }
+    .case-list {
+      flex: 1 1 0;
+      min-height: 0;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .case-card {
+      padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+      background: #152033; cursor: pointer; transition: all 0.15s ease;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .case-card:hover {
+      border-color: #3d6a9a; background: #1a273b;
+    }
+    .case-card.active {
+      border-color: var(--accent); background: #182d47;
+    }
+    .case-card-title {
+      font-size: 13px; font-weight: 600; color: var(--text);
+      word-break: break-word; line-height: 1.35;
+    }
+    .case-card-doc {
+      font-size: 11px; color: var(--muted); word-break: break-all;
+    }
+    .case-card-meta {
+      display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px;
+    }
+    .badge {
+      display: inline-flex; align-items: center; padding: 2px 7px;
+      border-radius: 999px; font-size: 10px; font-weight: 600;
+      border: 1px solid transparent; font-family: var(--mono);
+    }
+    .badge-open {
+      background: rgba(224, 164, 92, 0.15); color: var(--warn); border-color: rgba(224, 164, 92, 0.4);
+    }
+    .badge-investigating {
+      background: rgba(61, 156, 240, 0.15); color: var(--accent); border-color: rgba(61, 156, 240, 0.4);
+    }
+    .badge-resolved {
+      background: rgba(62, 207, 142, 0.15); color: var(--ok); border-color: rgba(62, 207, 142, 0.4);
+    }
+    .badge-em-n {
+      background: rgba(240, 113, 120, 0.15); color: var(--err); border-color: rgba(240, 113, 120, 0.4);
+    }
+    .badge-em-y {
+      background: rgba(62, 207, 142, 0.15); color: var(--ok); border-color: rgba(62, 207, 142, 0.4);
+    }
+    .badge-improved {
+      background: rgba(62, 207, 142, 0.25); color: #72f7be; border-color: rgba(62, 207, 142, 0.6);
+      font-weight: 700;
+    }
+    .empty {
+      color: var(--muted); text-align: center; padding: 40px 20px; font-size: 13px;
+    }
+    .header-bar {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      gap: 16px; margin-bottom: 16px; padding-bottom: 16px;
+      border-bottom: 1px solid var(--line); flex-wrap: wrap;
+    }
+    .header-title-box h2 {
+      margin: 0 0 6px 0; font-size: 20px; font-weight: 600; line-height: 1.3;
+    }
+    .header-title-box .doc-link {
+      font-size: 12px; color: var(--muted); font-family: var(--mono);
+    }
+    .header-actions {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    }
+    .btn {
+      padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line);
+      background: #152033; color: var(--text); font-size: 12px; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 6px; text-decoration: none;
+    }
+    .btn:hover { border-color: var(--accent); color: #fff; }
+    .btn-primary {
+      background: #1a4971; border-color: #3d86c6; color: #fff; font-weight: 600;
+    }
+    .btn-primary:hover { background: #225e91; border-color: var(--accent); }
+    .btn-danger {
+      border-color: #7a3a3f; background: #2a1518; color: var(--err);
+    }
+    .btn-danger:hover { background: #3d1b20; border-color: var(--err); }
+    .status-select {
+      padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line);
+      background: #152033; color: var(--text); font-size: 12px; cursor: pointer;
+    }
+    .status-select:focus { outline: none; border-color: var(--accent); }
+
+    .banner {
+      border-radius: 8px; padding: 12px 16px; margin-bottom: 18px;
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      flex-wrap: wrap;
+    }
+    .banner-improved {
+      background: rgba(62, 207, 142, 0.12); border: 1px solid rgba(62, 207, 142, 0.4);
+      color: #72f7be;
+    }
+    .banner-warning {
+      background: rgba(224, 164, 92, 0.12); border: 1px solid rgba(224, 164, 92, 0.4);
+      color: var(--warn);
+    }
+    .banner-info {
+      background: rgba(61, 156, 240, 0.10); border: 1px solid rgba(61, 156, 240, 0.3);
+      color: var(--muted);
+    }
+
+    .detail-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 14px; margin-bottom: 18px;
+    }
+    .card {
+      border: 1px solid var(--line); border-radius: 8px; background: #152033;
+      padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;
+    }
+    .card-label {
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.5px; color: var(--muted);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .card-value {
+      font-size: 13px; line-height: 1.5; color: var(--text);
+      word-break: break-word; white-space: pre-wrap;
+    }
+    .code-box {
+      font-family: var(--mono); font-size: 12px; padding: 8px 10px;
+      border-radius: 6px; background: #0f1419; border: 1px solid var(--line);
+      color: #e7ecf3; overflow-x: auto;
+    }
+
+    .ev-block {
+      border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
+      background: #0f1419; margin-top: 6px;
+    }
+    .ev-label {
+      display: inline-block; font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.5px; padding: 2px 6px; border-radius: 4px; margin-bottom: 6px;
+    }
+    .ev-label.vlm { background: #2a203a; color: #b89ae6; border: 1px solid #4a3468; }
+    .ev-label.search { background: #1c2a38; color: #7cb8e6; border: 1px solid #2d4560; }
+    .ev-label.gold { background: #2a2618; color: #e0d0a0; border: 1px solid #4a4020; }
+    .ev-text {
+      font-size: 12px; line-height: 1.55; color: var(--text); word-break: break-word;
+      white-space: pre-wrap;
+    }
+
+    .agentic-box {
+      border: 1px solid #3d6a9a; border-radius: 8px; padding: 14px 16px;
+      background: #142438; display: flex; flex-direction: column; gap: 8px;
+      margin-bottom: 18px;
+    }
+    .agentic-verdicts {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    }
+    .agentic-verdict {
+      padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+      font-family: var(--mono);
+    }
+    .agentic-verdict.correct {
+      background: rgba(62, 207, 142, 0.2); color: var(--ok); border: 1px solid var(--ok);
+    }
+    .agentic-verdict.incorrect {
+      background: rgba(240, 113, 120, 0.2); color: var(--err); border: 1px solid var(--err);
+    }
+    .agentic-verdict.valid {
+      background: rgba(62, 207, 142, 0.2); color: var(--ok); border: 1px solid var(--ok);
+    }
+    .agentic-verdict.invalid {
+      background: rgba(240, 113, 120, 0.2); color: var(--err); border: 1px solid var(--err);
+    }
+    .agentic-summary {
+      font-size: 13px; font-weight: 500; color: #e7ecf3; line-height: 1.45;
+    }
+    .agentic-detail {
+      font-size: 12px; line-height: 1.6; color: var(--muted);
+      border-top: 1px solid rgba(255, 255, 255, 0.08); padding-top: 8px;
+    }
+    .agentic-detail summary {
+      cursor: pointer; color: var(--accent); margin-bottom: 6px; user-select: none;
+    }
+
+    .notes-box {
+      border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px;
+      background: #152033; margin-bottom: 18px; display: flex; flex-direction: column; gap: 8px;
+    }
+    .notes-box textarea {
+      width: 100%; min-height: 70px; padding: 8px 10px; border-radius: 6px;
+      border: 1px solid var(--line); background: #0f1419; color: var(--text);
+      font-family: var(--sans); font-size: 12px; resize: vertical; line-height: 1.5;
+    }
+    .notes-box textarea:focus { outline: none; border-color: var(--accent); }
+
+    .history-table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+      margin-top: 6px; border: 1px solid var(--line); border-radius: 6px;
+      overflow: hidden;
+    }
+    .history-table th, .history-table td {
+      padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line);
+    }
+    .history-table th {
+      background: #121820; color: var(--muted); font-weight: 600; font-size: 11px;
+    }
+    .history-table tr:hover td {
+      background: rgba(61, 156, 240, 0.04);
+    }
+    .history-table tr.current-run td {
+      background: rgba(61, 156, 240, 0.08);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Agentic Viewer</h1>
+    <nav class="topnav">
+      <a href="/">Inference</a>
+      <a href="/datasets">Datasets</a>
+      <a href="/evaluation">Evaluation</a>
+      <a href="/ground-truth">Ground Truth</a>
+      <a href="/wrong-cases" class="active">Wrong Cases</a>
+      <a href="/prompts">Prompts</a>
+    </nav>
+    <div class="meta" id="headerMeta">Loading cases…</div>
+  </header>
+  <main>
+    <aside>
+      <div class="filter-tabs" id="filterTabs">
+        <button type="button" class="filter-tab active" data-status="all">All (0)</button>
+        <button type="button" class="filter-tab" data-status="open">Open (0)</button>
+        <button type="button" class="filter-tab" data-status="investigating">Investigating (0)</button>
+        <button type="button" class="filter-tab" data-status="resolved">Resolved (0)</button>
+      </div>
+      <input type="search" class="search-box" id="caseSearch" placeholder="Search key, document, note…" />
+      <div class="case-list" id="caseList">
+        <div class="empty">Loading…</div>
+      </div>
+    </aside>
+    <section id="content">
+      <div class="empty">Select a wrong case from the left list to view details.</div>
+    </section>
+  </main>
+
+<script>
+const state = {
+  cases: [],
+  total: 0,
+  counts: { total: 0, open: 0, investigating: 0, resolved: 0 },
+  selectedId: null,
+  selectedDetail: null,
+  statusFilter: "all",
+  searchQuery: "",
+  loading: false,
+};
+
+function esc(s) {
+  if (s == null) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString("ko-KR", {
+      month: "numeric", day: "numeric",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+  } catch (e) {
+    return iso;
+  }
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  if (!res.ok) {
+    let err = `${res.status} ${res.statusText}`;
+    try {
+      const j = await res.json();
+      if (j && j.detail) err = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+    } catch (_) {}
+    throw new Error(err);
+  }
+  return res.json();
+}
+
+async function loadCases() {
+  try {
+    const q = new URLSearchParams();
+    if (state.statusFilter && state.statusFilter !== "all") q.set("status", state.statusFilter);
+    if (state.searchQuery) q.set("search", state.searchQuery);
+
+    const res = await api(`/api/wrong-cases?${q.toString()}`);
+    state.cases = res.cases || [];
+    state.total = res.total || 0;
+    state.counts = res.counts || { total: 0, open: 0, investigating: 0, resolved: 0 };
+    renderFilterTabs();
+    renderCaseList();
+    updateHeaderMeta();
+  } catch (err) {
+    document.getElementById("caseList").innerHTML = `<div class="empty" style="color:var(--err)">Failed to load cases: ${esc(err.message)}</div>`;
+  }
+}
+
+function updateHeaderMeta() {
+  const meta = document.getElementById("headerMeta");
+  if (!meta) return;
+  meta.textContent = `${state.counts.total} cases (${state.counts.open} open · ${state.counts.investigating} investigating · ${state.counts.resolved} resolved)`;
+}
+
+function renderFilterTabs() {
+  const container = document.getElementById("filterTabs");
+  if (!container) return;
+  const tabs = [
+    { id: "all", label: `All (${state.counts.total})` },
+    { id: "open", label: `Open (${state.counts.open})` },
+    { id: "investigating", label: `Investigating (${state.counts.investigating})` },
+    { id: "resolved", label: `Resolved (${state.counts.resolved})` },
+  ];
+  container.innerHTML = tabs.map(t => `
+    <button type="button" class="filter-tab ${state.statusFilter === t.id ? "active" : ""}" data-status="${t.id}">${esc(t.label)}</button>
+  `).join("");
+
+  container.querySelectorAll(".filter-tab").forEach(btn => {
+    btn.onclick = () => {
+      state.statusFilter = btn.dataset.status;
+      loadCases();
+    };
+  });
+}
+
+function renderCaseList() {
+  const container = document.getElementById("caseList");
+  if (!container) return;
+
+  if (state.cases.length === 0) {
+    container.innerHTML = `<div class="empty">No wrong cases found.<br><br><span style="font-size:11px">Add cases from the <b>Inference → Eval</b> tab using <b>+ Wrong Case</b>.</span></div>`;
+    return;
+  }
+
+  container.innerHTML = state.cases.map(c => {
+    const isAct = c.id === state.selectedId;
+    const snap = c.snapshot || {};
+    const em = snap.exact_match;
+    const emBadge = em === true
+      ? `<span class="badge badge-em-y">EM: Y</span>`
+      : `<span class="badge badge-em-n">EM: N</span>`;
+    const statusCls = `badge-${c.status || "open"}`;
+    return `
+      <div class="case-card ${isAct ? "active" : ""}" data-id="${esc(c.id)}">
+        <div class="case-card-title">${esc(c.key)}</div>
+        <div class="case-card-doc">${esc(c.document || "—")}</div>
+        <div class="case-card-meta">
+          <span class="badge ${statusCls}">${esc(c.status || "open")}</span>
+          ${emBadge}
+          <span style="font-size:10px;color:var(--muted);margin-left:auto">${esc(fmtDate(c.created_at))}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  container.querySelectorAll(".case-card").forEach(el => {
+    el.onclick = () => selectCase(el.dataset.id);
+  });
+}
+
+async function selectCase(id) {
+  state.selectedId = id;
+  renderCaseList();
+  const content = document.getElementById("content");
+  if (!content) return;
+  content.innerHTML = `<div class="empty">Loading case details…</div>`;
+
+  try {
+    const detail = await api(`/api/wrong-cases/${encodeURIComponent(id)}`);
+    state.selectedDetail = detail;
+    renderCaseDetail(detail);
+    // Update URL param
+    const url = new URL(window.location);
+    url.searchParams.set("id", id);
+    window.history.replaceState({}, "", url);
+  } catch (err) {
+    content.innerHTML = `<div class="empty" style="color:var(--err)">Failed to load details: ${esc(err.message)}</div>`;
+  }
+}
+
+function renderCaseDetail(data) {
+  const content = document.getElementById("content");
+  if (!content) return;
+  const c = data.case || {};
+  const snap = c.snapshot || {};
+  const ae = snap.agentic_eval || {};
+  const latest = data.latest_run;
+  const history = data.history || [];
+
+  const em = snap.exact_match;
+  const emBadge = em === true
+    ? `<span class="badge badge-em-y" style="font-size:12px;padding:3px 10px">Exact Match: Y</span>`
+    : `<span class="badge badge-em-n" style="font-size:12px;padding:3px 10px">Exact Match: N</span>`;
+
+  // Improvement banner
+  let bannerHtml = "";
+  if (latest && !latest.is_same_as_initial) {
+    if (latest.improved) {
+      bannerHtml = `
+        <div class="banner banner-improved">
+          <div>
+            <b>🎉 Improved in Latest Run!</b>
+            Run <code>${esc(latest.run_id)}</code> achieved Exact Match = Y (or corrected evaluation).
+          </div>
+          <div style="display:flex;gap:6px">
+            <a href="/?run=${encodeURIComponent(latest.run_id)}&tab=eval&key=${encodeURIComponent(c.key)}" class="btn btn-primary" style="font-size:11px">Open Latest Run in Inference</a>
+            ${c.status !== "resolved" ? `<button type="button" class="btn" id="markResolvedBtn" style="font-size:11px;border-color:var(--ok);color:var(--ok)">Mark as Resolved</button>` : ""}
+          </div>
+        </div>`;
+    } else {
+      bannerHtml = `
+        <div class="banner banner-warning">
+          <div>
+            <b>⚠️ Still failing in Latest Run</b>
+            Run <code>${esc(latest.run_id)}</code> also recorded EM = N for this key.
+          </div>
+          <div>
+            <a href="/?run=${encodeURIComponent(latest.run_id)}&tab=eval&key=${encodeURIComponent(c.key)}" class="btn" style="font-size:11px">Open Latest Run in Inference</a>
+          </div>
+        </div>`;
+    }
+  } else if (latest && latest.is_same_as_initial) {
+    bannerHtml = `
+      <div class="banner banner-info">
+        <div>ℹ️ This wrong case was recorded from the most recent run for this document.</div>
+      </div>`;
+  }
+
+  // Agentic eval block
+  let aeBlock = "";
+  if (ae && (ae.is_correct_answer || ae.reason_summary || ae.reason_detail)) {
+    const verdict = String(ae.is_correct_answer || "").toLowerCase();
+    const goldVerdict = String(ae.is_valid_gold || "").toLowerCase();
+    const verdictCls = verdict === "correct" ? "correct" : (verdict === "incorrect" ? "incorrect" : "");
+    const goldCls = goldVerdict === "valid" ? "valid" : (goldVerdict === "invalid" ? "invalid" : "");
+    aeBlock = `
+      <div class="agentic-box">
+        <div class="card-label">
+          <span>Agentic Evaluation (${esc(snap.agentic_eval.seconds || 0)}s · ${esc(snap.agentic_eval.n_steps || 0)} steps)</span>
+          <a href="/?run=${encodeURIComponent(c.run_id)}&tab=hierarchy_eval&eval_key=${encodeURIComponent(c.key)}" class="btn" style="padding:2px 8px;font-size:11px" title="View agent tree and steps in Inference">View Agent Trace</a>
+        </div>
+        <div class="agentic-verdicts">
+          ${verdict ? `<span class="agentic-verdict ${verdictCls}">Pred Verdict: ${esc(verdict)}</span>` : ""}
+          ${goldVerdict ? `<span class="agentic-verdict ${goldCls}">Gold Verdict: ${esc(goldVerdict)}</span>` : ""}
+        </div>
+        ${ae.reason_summary ? `<div class="agentic-summary">${esc(ae.reason_summary)}</div>` : ""}
+        ${ae.reason_detail ? `
+          <div class="agentic-detail">
+            <details open>
+              <summary>Agentic Evaluation Reason Detail</summary>
+              <div style="white-space:pre-wrap;line-height:1.6;color:var(--text);margin-top:6px">${esc(ae.reason_detail)}</div>
+            </details>
+          </div>
+        ` : ""}
+      </div>
+    `;
+  } else {
+    aeBlock = `
+      <div class="agentic-box" style="border-style:dashed">
+        <div class="card-label">Agentic Evaluation</div>
+        <div style="font-size:12px;color:var(--muted)">No agentic evaluation performed on this key yet.</div>
+        <div style="margin-top:4px">
+          <a href="/?run=${encodeURIComponent(c.run_id)}&tab=eval&key=${encodeURIComponent(c.key)}" class="btn" style="font-size:11px">Open Inference to run Agentic Eval</a>
+        </div>
+      </div>
+    `;
+  }
+
+  // History table
+  let historyHtml = "";
+  if (history.length > 0) {
+    const rows = history.map(h => {
+      const isCur = h.run_id === c.run_id;
+      const hEm = h.exact_match === true ? `<span class="badge badge-em-y">Y</span>` : (h.exact_match === false ? `<span class="badge badge-em-n">N</span>` : "—");
+      return `
+        <tr class="${isCur ? "current-run" : ""}">
+          <td>
+            <a href="/?run=${encodeURIComponent(h.run_id)}&tab=eval&key=${encodeURIComponent(c.key)}" style="color:var(--accent);text-decoration:none;font-family:var(--mono);font-size:11px">
+              ${esc(h.run_id)} ${isCur ? '<span style="color:var(--warn);font-size:10px">(source)</span>' : ""}
+            </a>
+          </td>
+          <td>${esc(fmtDate(h.started_at))}</td>
+          <td>${hEm}</td>
+          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(h.pred || "")}">${esc(h.pred ?? "—")}</td>
+          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(h.gold || "")}">${esc(h.gold ?? "—")}</td>
+          <td>${esc(h.agentic_verdict || "—")}</td>
+          <td>
+            <a href="/?run=${encodeURIComponent(h.run_id)}&tab=eval&key=${encodeURIComponent(c.key)}" class="btn" style="padding:2px 8px;font-size:11px">Inspect</a>
+          </td>
+        </tr>
+      `;
+    }).join("");
+
+    historyHtml = `
+      <div style="margin-top:20px">
+        <h3 style="font-size:14px;margin:0 0 8px 0;font-weight:600">Run History for Document (${history.length} runs)</h3>
+        <table class="history-table">
+          <thead>
+            <tr>
+              <th>Run ID</th>
+              <th>Date</th>
+              <th>EM</th>
+              <th>Pred</th>
+              <th>Gold</th>
+              <th>Agentic Verdict</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  content.innerHTML = `
+    <div class="header-bar">
+      <div class="header-title-box">
+        <h2>${esc(c.key)}</h2>
+        <div class="doc-link">
+          📄 ${esc(c.document || "unknown document")} · Source Run: <code>${esc(c.run_id)}</code>
+        </div>
+      </div>
+      <div class="header-actions">
+        <select class="status-select" id="caseStatusSelect">
+          <option value="open" ${c.status === "open" ? "selected" : ""}>Status: Open</option>
+          <option value="investigating" ${c.status === "investigating" ? "selected" : ""}>Status: Investigating</option>
+          <option value="resolved" ${c.status === "resolved" ? "selected" : ""}>Status: Resolved</option>
+        </select>
+        <a href="/?run=${encodeURIComponent(c.run_id)}&tab=eval&key=${encodeURIComponent(c.key)}" class="btn btn-primary" title="Open this run and key in Inference page">
+          ← Open in Inference
+        </a>
+        <button type="button" class="btn btn-danger" id="deleteCaseBtn" title="Remove from Wrong Cases">Delete</button>
+      </div>
+    </div>
+
+    ${bannerHtml}
+
+    <div class="detail-grid">
+      <div class="card">
+        <div class="card-label">
+          <span>Predicted Value</span>
+          ${emBadge}
+        </div>
+        <div class="code-box">${esc(snap.pred ?? "(none)")}</div>
+        <div style="font-size:11px;color:var(--muted)">
+          Pages: [${esc((snap.pred_pages || []).join(", "))}]
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Ground Truth (Gold) Value</div>
+        <div class="code-box">${esc(snap.gold ?? "(none)")}</div>
+        <div style="font-size:11px;color:var(--muted)">
+          Gold Pages: [${esc((snap.gold_pages || []).join(", "))}]
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-label">VLM Reason (evidence_text.pred)</div>
+      <div class="ev-block">
+        <span class="ev-label vlm">VLM value_reason</span>
+        <div class="ev-text">${esc(snap.vlm_reason || "(empty)")}</div>
+      </div>
+
+      <div class="ev-block">
+        <span class="ev-label search">SearchAgent page_reasons</span>
+        <div class="ev-text">${esc(snap.search_reasons || "(empty)")}</div>
+      </div>
+
+      <div class="ev-block">
+        <span class="ev-label gold">Gold Evidences</span>
+        <div class="ev-text">${esc(snap.gold_evidences || "(empty)")}</div>
+      </div>
+    </div>
+
+    ${aeBlock}
+
+    <div class="notes-box">
+      <div class="card-label">Analysis Notes & Follow-up</div>
+      <textarea id="caseNotesInput" placeholder="Write analysis notes, prompt improvement ideas, or root cause details here...">${esc(c.note || "")}</textarea>
+      <div style="display:flex;justify-content:flex-end">
+        <button type="button" class="btn btn-primary" id="saveNotesBtn" style="font-size:11px">Save Note</button>
+      </div>
+    </div>
+
+    ${historyHtml}
+  `;
+
+  // Bind actions
+  const statusSelect = document.getElementById("caseStatusSelect");
+  if (statusSelect) {
+    statusSelect.onchange = async () => {
+      const newStatus = statusSelect.value;
+      try {
+        await api(`/api/wrong-cases/${encodeURIComponent(c.id)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: newStatus }),
+        });
+        c.status = newStatus;
+        loadCases();
+      } catch (err) {
+        alert(`Failed to update status: ${err.message}`);
+      }
+    };
+  }
+
+  const markResolvedBtn = document.getElementById("markResolvedBtn");
+  if (markResolvedBtn) {
+    markResolvedBtn.onclick = async () => {
+      try {
+        await api(`/api/wrong-cases/${encodeURIComponent(c.id)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "resolved" }),
+        });
+        selectCase(c.id);
+        loadCases();
+      } catch (err) {
+        alert(`Failed to update status: ${err.message}`);
+      }
+    };
+  }
+
+  const saveNotesBtn = document.getElementById("saveNotesBtn");
+  if (saveNotesBtn) {
+    saveNotesBtn.onclick = async () => {
+      const note = (document.getElementById("caseNotesInput") || {}).value || "";
+      try {
+        saveNotesBtn.textContent = "Saving…";
+        await api(`/api/wrong-cases/${encodeURIComponent(c.id)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ note }),
+        });
+        saveNotesBtn.textContent = "Saved!";
+        setTimeout(() => { saveNotesBtn.textContent = "Save Note"; }, 2000);
+      } catch (err) {
+        alert(`Failed to save note: ${err.message}`);
+        saveNotesBtn.textContent = "Save Note";
+      }
+    };
+  }
+
+  const deleteBtn = document.getElementById("deleteCaseBtn");
+  if (deleteBtn) {
+    deleteBtn.onclick = async () => {
+      if (!confirm(`Are you sure you want to remove "${c.key}" from Wrong Cases?`)) return;
+      try {
+        await api(`/api/wrong-cases/${encodeURIComponent(c.id)}`, { method: "DELETE" });
+        state.selectedId = null;
+        content.innerHTML = `<div class="empty">Case deleted. Select another case from the list.</div>`;
+        loadCases();
+      } catch (err) {
+        alert(`Failed to delete case: ${err.message}`);
+      }
+    };
+  }
+}
+
+// Initial setup
+(async function init() {
+  const searchInput = document.getElementById("caseSearch");
+  if (searchInput) {
+    let timeout = null;
+    searchInput.oninput = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        state.searchQuery = searchInput.value.trim();
+        loadCases();
+      }, 250);
+    };
+  }
+
+  await loadCases();
+
+  // Check URL params
+  const params = new URLSearchParams(window.location.search);
+  const targetId = params.get("id");
+  const targetRun = params.get("run");
+  const targetKey = params.get("key");
+
+  if (targetId && state.cases.some(c => c.id === targetId)) {
+    selectCase(targetId);
+  } else if (targetRun && targetKey) {
+    const matched = state.cases.find(c => c.run_id === targetRun && c.key === targetKey);
+    if (matched) {
+      selectCase(matched.id);
+    } else if (state.cases.length > 0) {
+      selectCase(state.cases[0].id);
+    }
+  } else if (state.cases.length > 0) {
+    selectCase(state.cases[0].id);
+  }
+})();
+</script>
+</body>
+</html>
