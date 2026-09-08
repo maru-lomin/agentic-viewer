@@ -228,6 +228,47 @@ PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
                 }
             ]
         }
+    },
+    "extract_kv_vlm": {
+        "id": "extract_kv_vlm",
+        "title": "Extract KV VLM Tool",
+        "filename": "extract_kv_vlm_prompt.txt",
+        "role": "VLM Extraction",
+        "category": "extraction",
+        "tags": ["VLM", "Extraction", "Tool"],
+        "pipeline_file": "inference-pipeline/agentic/tools.py",
+        "description": "선정된 문서 페이지(이미지+텍스트)와 대상 키 정의를 VLM에 전달하여 Structured Output으로 값(value)과 한국어 근거 사유(value_reason)를 추출하는 프롬프트 템플릿입니다. 부재 시 결측 기본값 처리 지침을 포함합니다.",
+        "contract": {
+            "completion_type": "structured_output_json",
+            "completion_description": "OpenAI/vLLM response_format(json_schema strict=True)으로 각 키별 key, value, value_reason 객체 배열이 반환됩니다.",
+            "final_schema_example": {
+                "extractions": [
+                    {
+                        "key": "Distance between GTG",
+                        "value": "20m",
+                        "value_reason": "도면에서 가스 터빈 인클로저 간 거리가 20m로 확인됨."
+                    },
+                    {
+                        "key": "Trend Analysis",
+                        "value": "미수행",
+                        "value_reason": "문서 전체에 운영 데이터 통계/추세 분석에 대한 언급이 없어 결측 기본값 '미수행'을 적용함."
+                    }
+                ]
+            },
+            "intermediate_schemas": [],
+            "available_tools": [
+                {
+                    "name": "{guidance_block}",
+                    "args": "placeholder",
+                    "description": "SearchAgent가 수집한 페이지별 선정 사유(page_reasons) 및 BM25 chunk_id가 런타임에 동적으로 주입되는 위치입니다."
+                },
+                {
+                    "name": "{schema_json}",
+                    "args": "placeholder",
+                    "description": "추출 대상 키들의 스키마 정의(설명, 검색 큐, 허용값)가 JSON 형식으로 주입되는 위치입니다."
+                }
+            ]
+        }
     }
 }
 

@@ -30,6 +30,9 @@ class PromptsApiTests(unittest.TestCase):
         (self.prompts_path / "eval_master_system_prompt.txt").write_text(
             "Eval Master Initial Content", encoding="utf-8"
         )
+        (self.prompts_path / "extract_kv_vlm_prompt.txt").write_text(
+            "Extract VLM Initial Content", encoding="utf-8"
+        )
         schema = [
             {"key": "Test Key", "description": "Test Desc"},
         ]
@@ -52,12 +55,13 @@ class PromptsApiTests(unittest.TestCase):
         res = app_module.api_list_prompts()
         self.assertIn("prompts", res)
         prompts = res["prompts"]
-        self.assertEqual(len(prompts), 4)
+        self.assertEqual(len(prompts), 5)
         ids = [p["id"] for p in prompts]
         self.assertIn("master", ids)
         self.assertIn("search", ids)
         self.assertIn("eval_master", ids)
         self.assertIn("kv_schema", ids)
+        self.assertIn("extract_kv_vlm", ids)
 
     def test_api_get_prompt_success(self) -> None:
         res = app_module.api_get_prompt("master")

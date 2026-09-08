@@ -39,6 +39,9 @@ class TestPromptsStore(unittest.TestCase):
         (self.prompts_path / "eval_master_system_prompt.txt").write_text(
             "Original Eval Master Prompt", encoding="utf-8"
         )
+        (self.prompts_path / "extract_kv_vlm_prompt.txt").write_text(
+            "Original Extract KV VLM Prompt\nLine 2", encoding="utf-8"
+        )
         # Seed dummy kv_description.json
         schema = [
             {"key": "Key A", "description": "Desc A"},
@@ -60,14 +63,19 @@ class TestPromptsStore(unittest.TestCase):
 
     def test_list_prompts(self) -> None:
         prompts = list_prompts()
-        self.assertEqual(len(prompts), 4)
+        self.assertEqual(len(prompts), 5)
         ids = {p["id"] for p in prompts}
-        self.assertEqual(ids, {"master", "search", "eval_master", "kv_schema"})
+        self.assertEqual(ids, {"master", "search", "eval_master", "kv_schema", "extract_kv_vlm"})
 
         master = next(p for p in prompts if p["id"] == "master")
         self.assertTrue(master["exists"])
         self.assertEqual(master["line_count"], 2)
         self.assertEqual(master["backup_count"], 0)
+
+        extract_tool = next(p for p in prompts if p["id"] == "extract_kv_vlm")
+        self.assertTrue(extract_tool["exists"])
+        self.assertEqual(extract_tool["line_count"], 2)
+        self.assertEqual(extract_tool["category"], "extraction")
 
         schema = next(p for p in prompts if p["id"] == "kv_schema")
         self.assertTrue(schema["exists"])

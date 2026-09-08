@@ -97,6 +97,10 @@
       background: rgba(224, 164, 92, 0.15); color: var(--warn);
       border-color: rgba(224, 164, 92, 0.3);
     }
+    .badge.cyan {
+      background: rgba(45, 212, 191, 0.15); color: #2dd4bf;
+      border-color: rgba(45, 212, 191, 0.3);
+    }
     .prompt-file {
       font-family: var(--mono); font-size: 11px; color: var(--muted);
       margin-bottom: 6px; word-break: break-all;
@@ -611,7 +615,7 @@ async function init() {
   const targetKey = params.get("key");
   if (targetKey) state.focusKeyAfterSwitch = targetKey;
 
-  if (targetId && ["master", "search", "eval_master", "kv_schema"].includes(targetId)) {
+  if (targetId && ["master", "search", "eval_master", "kv_schema", "extract_kv_vlm"].includes(targetId)) {
     await selectPrompt(targetId, targetKey);
   } else {
     await selectPrompt("master");
@@ -641,6 +645,7 @@ function renderPromptList() {
     else if (p.id === "search") badgeClass = "badge green";
     else if (p.id === "eval_master") badgeClass = "badge purple";
     else if (p.id === "kv_schema") badgeClass = "badge orange";
+    else if (p.id === "extract_kv_vlm") badgeClass = "badge cyan";
 
     const isSchema = p.id === "kv_schema";
     const metaCount = isSchema ? `${p.line_count || 0} lines` : `${p.line_count || 0} lines`;
@@ -693,6 +698,7 @@ async function selectPrompt(id, focusKey = null) {
     else if (id === "search") roleBadge.className = "badge green";
     else if (id === "eval_master") roleBadge.className = "badge purple";
     else if (id === "kv_schema") roleBadge.className = "badge orange";
+    else if (id === "extract_kv_vlm") roleBadge.className = "badge cyan";
 
     document.getElementById("filePathDisplay").textContent = prompt.filename;
     document.getElementById("lastUpdatedLabel").textContent = prompt.updated_at ? `Last saved: ${fmtDate(prompt.updated_at)}` : "";
