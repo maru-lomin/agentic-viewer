@@ -135,6 +135,23 @@ class PdfSourceTests(unittest.TestCase):
         self.assertGreater(len(hl.get("regions", [])), 0)
         self.assertIn("4", hl.get("layout_paths", {}))
 
+    def test_infer_run_document_and_pdf_on_empty_dir_no_recursion(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            self.assertIsNone(infer_run_document(p))
+            self.assertIsNone(infer_pdf_path(p))
+            info = pdf_info(p)
+            self.assertFalse(info["available"])
+
+    def test_infer_run_document_from_meta_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            (p / "meta.json").write_text(
+                json.dumps({"source_filename": "sample_doc.pdf"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(infer_run_document(p), "sample_doc.pdf")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -116,10 +116,10 @@ def extract_searched_pages(run_dir: Path) -> Dict[str, Dict[str, Any]]:
                             out[k]["candidates"].add(int(p))
                         except (TypeError, ValueError):
                             pass
-    else:
-        # Fallback to 03_agent/tools
-        tools_dir = run_dir / "03_agent" / "tools"
-        if tools_dir.is_dir():
+    # Enrich from 03_agent/tools if present (restores any BM25 hits truncated in prior_context,
+    # or serves as fallback when search_agent_traces is absent).
+    tools_dir = run_dir / "03_agent" / "tools"
+    if tools_dir.is_dir():
             session_keys: Dict[str, set] = {}
             session_inspected: Dict[str, set] = {}
             session_bm25: Dict[str, set] = {}

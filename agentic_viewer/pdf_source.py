@@ -175,6 +175,9 @@ def infer_pdf_path(
     req = _read_json(root / "00_request.json") or {}
     if not isinstance(req, dict):
         req = {}
+    run_meta = _read_json(root / "meta.json") or {}
+    if not isinstance(run_meta, dict):
+        run_meta = {}
     if result is None:
         result = _read_json(root / "04_result.json") or {}
     meta = (result or {}).get("meta") if isinstance(result, dict) else {}
@@ -195,6 +198,12 @@ def infer_pdf_path(
         meta.get("source_filename"),
         meta.get("filename"),
         meta.get("file_name"),
+        run_meta.get("pdf_path"),
+        run_meta.get("file_path"),
+        run_meta.get("source_file"),
+        run_meta.get("source_filename"),
+        run_meta.get("filename"),
+        run_meta.get("file_name"),
         eval_report.get("document") if isinstance(eval_report, dict) else None,
     ]
 
@@ -210,7 +219,7 @@ def infer_pdf_path(
             return found
 
     # 2. Search by filename across dataset roots
-    dataset_id = req.get("dataset_id") or meta.get("dataset_id")
+    dataset_id = req.get("dataset_id") or meta.get("dataset_id") or run_meta.get("dataset_id")
     for cand in candidates:
         if not cand:
             continue
@@ -278,8 +287,32 @@ def infer_run_document(
         if isinstance(eval_data, dict) and eval_data.get("document"):
             return str(eval_data["document"])
 
-    filename = pdf_info(root).get("filename")
-    return str(filename) if filename else None
+    run_meta = _read_json(root / "meta.json") or {}
+    if isinstance(run_meta, dict):
+        for key in (
+            "source_filename",
+            "source_file",
+            "filename",
+            "file_name",
+            "pdf_name",
+            "pdf_path",
+            "file_path",
+            "document",
+        ):
+            val = run_meta.get(key)
+            if val:
+                return Path(str(val)).name
+
+    bundled = root / "00_source.pdf"
+    if bundled.is_file():
+        try:
+            resolved = bundled.resolve()
+            if resolved.is_file() and not resolved.name.startswith("00_"):
+                return resolved.name
+        except OSError:
+            pass
+
+    return None
 
 
 def pdf_info(run_dir: Path) -> Dict[str, Any]:
