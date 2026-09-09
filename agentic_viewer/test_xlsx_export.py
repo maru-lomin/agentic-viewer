@@ -154,16 +154,38 @@ class XlsxExportTests(unittest.TestCase):
         self.assertGreater(len(data), 500)
 
         wb = openpyxl.load_workbook(io.BytesIO(data))
-        ws = wb.active
-        self.assertEqual(ws.title, "채점결과")
+        self.assertEqual(wb.sheetnames, ["채점결과", "Per-run summary", "Key x run matrix"])
 
+        # Sheet 1: 채점결과
+        ws = wb["채점결과"]
+        self.assertEqual(ws.title, "채점결과")
         headers = [ws.cell(row=1, column=c).value for c in range(1, len(EXCEL_COLUMNS) + 1)]
         self.assertEqual(headers, EXCEL_COLUMNS)
-
         # 3 data rows (2 from run1, 1 from run2) + 1 header row = 4 rows
         self.assertEqual(ws.max_row, 4)
         self.assertEqual(ws.cell(row=2, column=1).value, "sample_doc_1.pdf")
         self.assertEqual(ws.cell(row=4, column=1).value, "sample_doc_2.pdf")
+
+        # Sheet 2: Per-run summary
+        ws_summary = wb["Per-run summary"]
+        self.assertEqual(
+            [ws_summary.cell(row=1, column=c).value for c in range(1, 9)],
+            ["Run ID", "파일명", "Value EM", "Page F1", "Evid F1", "Agentic Done", "Pred Acc", "GT Valid"],
+        )
+        # Header + 2 runs + 1 average row = 4 rows
+        self.assertEqual(ws_summary.max_row, 4)
+        self.assertEqual(ws_summary.cell(row=2, column=1).value, "run-sample-1")
+        self.assertEqual(ws_summary.cell(row=3, column=1).value, "run-sample-2")
+        self.assertEqual(ws_summary.cell(row=4, column=1).value, "Average")
+
+        # Sheet 3: Key x run matrix
+        ws_matrix = wb["Key x run matrix"]
+        self.assertEqual(ws_matrix.cell(row=1, column=1).value, "Key")
+        self.assertEqual(ws_matrix.cell(row=1, column=2).value, "Ground Truth")
+        self.assertEqual(ws_matrix.cell(row=1, column=3).value, "Overall (EM Rate)")
+        self.assertIn("sample_doc_1.pdf", str(ws_matrix.cell(row=1, column=4).value))
+        self.assertIn("sample_doc_2.pdf", str(ws_matrix.cell(row=1, column=5).value))
+        self.assertGreaterEqual(ws_matrix.max_row, 2)
 
     def test_api_export_xlsx(self) -> None:
         import agentic_viewer.app as app_mod

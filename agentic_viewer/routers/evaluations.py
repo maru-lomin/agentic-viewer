@@ -254,7 +254,7 @@ def _export_runs_to_xlsx_response(run_ids: List[str]) -> Response:
     if not run_dirs:
         raise HTTPException(status_code=404, detail="No valid runs found for the provided run_ids")
 
-    buf = generate_evaluation_xlsx(run_dirs)
+    buf = generate_evaluation_xlsx(run_dirs, runs_root=runs_root)
     ts = kst_now().strftime("%Y%m%d_%H%M%S")
     filename = f"evaluation_results_{ts}.xlsx"
     encoded_filename = quote(filename)
