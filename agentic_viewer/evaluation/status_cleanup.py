@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-
-
 from typing import Dict, Optional, Sequence
+
+from agentic_viewer.timezone import kst_now_iso
 
 
 def mark_running_eval_status_cancelled(
@@ -19,7 +19,7 @@ def mark_running_eval_status_cancelled(
     out_dir = run_dir / "06_agentic_eval"
     if not out_dir.is_dir():
         return 0
-    now = datetime.now(timezone.utc).isoformat()
+    now = kst_now_iso()
     n = 0
     for path in out_dir.glob("*.status.json"):
         try:

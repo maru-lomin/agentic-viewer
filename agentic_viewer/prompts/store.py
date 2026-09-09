@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agentic_viewer.timezone import KST, kst_now
+
 PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
     "master": {
         "id": "master",
@@ -350,7 +352,7 @@ def list_prompts() -> List[Dict[str, Any]]:
         if exists:
             stat = path.stat()
             size_bytes = stat.st_size
-            updated_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+            updated_at = datetime.fromtimestamp(stat.st_mtime, tz=KST).isoformat()
             try:
                 line_count = len(path.read_text(encoding="utf-8").splitlines())
             except Exception:
@@ -394,7 +396,7 @@ def get_prompt(prompt_id: str) -> Dict[str, Any]:
     if exists:
         stat = path.stat()
         size_bytes = stat.st_size
-        updated_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        updated_at = datetime.fromtimestamp(stat.st_mtime, tz=KST).isoformat()
         try:
             content = path.read_text(encoding="utf-8")
             line_count = len(content.splitlines())
@@ -447,7 +449,7 @@ def list_backups(prompt_id: str) -> List[Dict[str, Any]]:
                     "path": str(entry.resolve()),
                     "timestamp": ts_str,
                     "size_bytes": stat.st_size,
-                    "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                    "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=KST).isoformat(),
                 })
     except Exception:
         pass
@@ -480,7 +482,7 @@ def get_backup(prompt_id: str, timestamp_or_filename: str) -> Dict[str, Any]:
         "filename": candidate.name,
         "path": str(candidate.resolve()),
         "size_bytes": stat.st_size,
-        "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=KST).isoformat(),
         "content": content,
     }
 
@@ -542,7 +544,7 @@ def save_prompt(prompt_id: str, content: str) -> Dict[str, Any]:
         "path": str(path.resolve()),
         "size_bytes": stat.st_size,
         "line_count": len(content.splitlines()),
-        "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=KST).isoformat(),
         "backup": backup_info,
     }
 

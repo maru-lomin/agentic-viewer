@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agentic_viewer.eval.paths import REPO_ROOT
+from agentic_viewer.timezone import kst_now_iso
 
 MANIFEST_NAME = "manifest.json"
 RESERVED_FOLDER_NAMES = {
@@ -22,7 +23,9 @@ RESERVED_FOLDER_NAMES = {
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return kst_now_iso()
+
+_kst_now = kst_now_iso
 
 
 def slugify_dataset_id(name: str) -> str:

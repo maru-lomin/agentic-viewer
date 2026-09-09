@@ -21,6 +21,7 @@ from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
 from agentic_viewer.evaluation.live_progress import format_live_progress, read_eval_live_progress
 from agentic_viewer.evaluation.status_cleanup import mark_running_eval_status_cancelled
 from agentic_viewer.evaluation.summary import read_agentic_evals
+from agentic_viewer.timezone import kst_now_iso
 
 
 def default_max_parallel_evals() -> int:
@@ -51,7 +52,9 @@ def enrich_batch_job_dict(
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return kst_now_iso()
+
+_kst_now = kst_now_iso
 
 
 def agentic_key_is_done(data: Optional[Dict[str, Any]]) -> bool:

@@ -3,6 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+export TZ="${TZ:-Asia/Seoul}"
+
 # Default: shared repo outputs/runs (see ../outputs/README.md).
 if [[ -z "${AGENTIC_RUNS_DIR:-}" ]]; then
   SHARED="$ROOT/../outputs/runs"

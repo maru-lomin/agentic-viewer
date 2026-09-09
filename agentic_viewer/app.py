@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,16 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+from agentic_viewer.timezone import KST, to_kst
+
+# Ensure local timezone is Asia/Seoul (KST)
+os.environ.setdefault("TZ", "Asia/Seoul")
+if hasattr(time, "tzset"):
+    try:
+        time.tzset()
+    except Exception:
+        pass
 
 from agentic_viewer.datasets import DatasetStore
 from agentic_viewer.datasets_page import DATASETS_HTML
@@ -200,12 +211,14 @@ def _parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
     if not ts_str or not isinstance(ts_str, str):
         return None
     try:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return to_kst(dt)
     except ValueError:
         pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(ts_str, fmt)
+            return to_kst(dt)
         except ValueError:
             pass
     return None
@@ -214,7 +227,8 @@ def _parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
 def _format_display_ts(dt: Optional[datetime]) -> str:
     if not dt:
         return ""
-    return dt.strftime("%Y-%m-%d %H:%M")
+    kst_dt = to_kst(dt)
+    return kst_dt.strftime("%Y-%m-%d %H:%M") if kst_dt else ""
 
 
 def _enrich_run_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -244,7 +258,7 @@ def _enrich_run_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             dt = _parse_ts(r.get("started_at")) or _parse_ts(r.get("finished_at"))
             timed.append((dt, r))
 
-        timed.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=timezone.utc))
+        timed.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=KST))
 
         sessions: List[List[tuple[Optional[datetime], Dict[str, Any]]]] = []
         curr_session: List[tuple[Optional[datetime], Dict[str, Any]]] = []

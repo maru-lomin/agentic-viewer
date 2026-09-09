@@ -1384,7 +1384,7 @@ function runItemHtml(r) {
       </div>
       <div class="sub">
         <span class="badge ${r.status === "ok" ? "ok" : (r.status === "error" ? "error" : (r.status === "running" ? "warn" : ""))}">${esc(r.status)}</span>
-        ${r.seconds != null ? r.seconds + "s" : ""} · kv=${r.n_kv ?? "?"} · pages=${r.page_count ?? "?"}
+        ${r.started_at ? `<span class="run-time" title="${esc(fmtKstDateTime(r.started_at))}">${esc(fmtKstShort(r.started_at))}</span> · ` : ""}${r.seconds != null ? r.seconds + "s · " : ""}kv=${r.n_kv ?? "?"} · pages=${r.page_count ?? "?"}
       </div>
       ${evalLine}
       ${agenticLine}
@@ -1741,6 +1741,28 @@ function runClockBase() {
   return state.agentTree?.timing?.run_started_at || state.info?.meta?.started_at;
 }
 
+function fmtKstDateTime(isoString) {
+  if (!isoString) return "";
+  const d = new Date(isoString);
+  if (Number.isNaN(d.getTime())) return String(isoString);
+  return d.toLocaleString("ko-KR", {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    timeZone: "Asia/Seoul",
+  });
+}
+
+function fmtKstShort(isoString) {
+  if (!isoString) return "";
+  const d = new Date(isoString);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("ko-KR", {
+    month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+    timeZone: "Asia/Seoul",
+  });
+}
+
 function fmtRunClock(relativeSec) {
   if (relativeSec == null || Number.isNaN(Number(relativeSec))) return "—";
   const started = runClockBase();
@@ -1749,8 +1771,9 @@ function fmtRunClock(relativeSec) {
     return n >= 100 ? `t+${n.toFixed(0)}s` : `t+${n.toFixed(1)}s`;
   }
   const ms = new Date(started).getTime() + Number(relativeSec) * 1000;
-  return new Date(ms).toLocaleTimeString([], {
+  return new Date(ms).toLocaleTimeString("ko-KR", {
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    timeZone: "Asia/Seoul",
   });
 }
 
@@ -1762,9 +1785,10 @@ function fmtAbsDateTime(relativeSec) {
     return n >= 100 ? `t+${n.toFixed(0)}s` : `t+${n.toFixed(1)}s`;
   }
   const ms = new Date(started).getTime() + Number(relativeSec) * 1000;
-  return new Date(ms).toLocaleString([], {
+  return new Date(ms).toLocaleString("ko-KR", {
     year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    timeZone: "Asia/Seoul",
   });
 }
 
@@ -4669,6 +4693,7 @@ function paintDetail() {
       ${runLabelHtml(state.runId)}
       ${state.tab === "hierarchy_eval" && state.evalKey ? `· eval key <code>${esc(state.evalKey)}</code>` : ""}
       · status=${esc(state.info?.meta?.status || (state.info?.meta?.finished_at ? "done" : "running"))}
+      ${state.info?.meta?.started_at ? `· started=${esc(fmtKstDateTime(state.info.meta.started_at))}` : ""}
       · ${esc(state.info?.meta?.seconds)}s
       <button type="button" id="runRefresh" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);background:#152033;color:var(--text);font-size:12px;cursor:pointer">Refresh</button>
       <button type="button" id="runDelete" style="margin-left:4px;padding:2px 10px;border-radius:999px;border:1px solid #7a3a3f;background:#2a1518;color:var(--err);font-size:12px;cursor:pointer"

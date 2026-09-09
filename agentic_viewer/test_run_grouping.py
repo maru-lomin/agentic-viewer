@@ -16,6 +16,13 @@ class RunGroupingTests(unittest.TestCase):
         s = _format_display_ts(dt)
         self.assertTrue(len(s) > 0)
         self.assertIn(":", s)
+        # UTC 02:08 should be formatted as KST 11:08
+        self.assertEqual(s, "2026-09-06 11:08")
+
+        # KST input should also format correctly
+        dt_kst = _parse_ts("2026-09-06T11:08:19.310525+09:00")
+        self.assertIsNotNone(dt_kst)
+        self.assertEqual(_format_display_ts(dt_kst), "2026-09-06 11:08")
 
     def test_enrich_run_groups_assigns_v1_for_continuous_runs(self) -> None:
         base = datetime(2026, 9, 6, 2, 0, 0, tzinfo=timezone.utc)

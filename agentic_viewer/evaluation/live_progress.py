@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from agentic_viewer.timezone import kst_now, to_kst
+
 
 def _safe_key_filename(key: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(key or "").strip())[:120].strip("_")
@@ -143,10 +145,11 @@ def read_eval_live_progress(run_dir: Path, key: str) -> Optional[Dict[str, Any]]
     wall_elapsed_s: Optional[float] = None
     if started_at:
         try:
-            started_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-            wall_elapsed_s = round(
-                (datetime.now(timezone.utc) - started_dt).total_seconds(), 1
-            )
+            started_dt = to_kst(datetime.fromisoformat(started_at.replace("Z", "+00:00")))
+            if started_dt:
+                wall_elapsed_s = round(
+                    (kst_now() - started_dt).total_seconds(), 1
+                )
         except ValueError:
             wall_elapsed_s = None
 

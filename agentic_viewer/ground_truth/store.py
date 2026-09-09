@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from agentic_viewer.eval.paths import answer_sheet_path
 from agentic_viewer.pdf_source import infer_run_document
+from agentic_viewer.timezone import kst_now
 
 
 def load_answer_sheet() -> Dict[str, Any]:
@@ -135,7 +136,7 @@ def save_answer_sheet(data: Dict[str, Any]) -> Path:
         raise ValueError("answer sheet must be a JSON object")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = kst_now().strftime("%Y%m%dT%H%M%S")
         backup = path.with_name(f"{path.stem}.bak.{stamp}{path.suffix}")
         shutil.copy2(path, backup)
     path.write_text(

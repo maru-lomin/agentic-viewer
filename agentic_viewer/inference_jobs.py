@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agentic_viewer.inference_client import InferenceError, invoke_inference, wait_for_inference_api
+from agentic_viewer.timezone import kst_now_iso
 
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_kst_now = kst_now_iso
+_utc_now = kst_now_iso  # Backward compatibility alias
 
 
 def annotate_run_meta(

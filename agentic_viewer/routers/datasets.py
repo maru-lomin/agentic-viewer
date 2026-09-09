@@ -6,6 +6,8 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List
 
+from agentic_viewer.timezone import kst_now
+
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 
@@ -161,7 +163,7 @@ async def post_inference_job(
 
     hooks_name = (hooks or "agentic_config").strip() or "agentic_config"
     auto_eval_bool = str(auto_eval).strip().lower() in {"true", "1", "yes"}
-    now = datetime.now()
+    now = kst_now()
     display_time = now.strftime("%Y-%m-%d %H:%M")
     ts_slug = now.strftime("%Y%m%d-%H%M%S")
     upload_dataset_id = f"upload-{ts_slug}-{uuid.uuid4().hex[:6]}"
@@ -214,7 +216,7 @@ def post_inference_job_from_dataset(body: Dict[str, Any] = Body(...)) -> Dict[st
     hooks_name = str((body or {}).get("hooks") or "agentic_config").strip() or "agentic_config"
     auto_eval = bool((body or {}).get("auto_eval", True))
     next_v = _next_version(info["id"])
-    now = datetime.now()
+    now = kst_now()
     display_time = now.strftime("%Y-%m-%d %H:%M")
     ts_slug = now.strftime("%Y%m%d-%H%M%S")
     ds_name = info.get("name") or info["id"]

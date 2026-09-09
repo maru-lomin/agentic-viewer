@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from agentic_viewer.evaluation.baseline import load_or_compute_run_eval
 from agentic_viewer.evaluation.summary import read_agentic_evals
 from agentic_viewer.pdf_source import infer_run_document
+from agentic_viewer.timezone import KST, kst_now, kst_now_iso, to_kst
 
 
 def default_wrong_cases_path() -> Path:
@@ -73,7 +74,7 @@ def save_wrong_cases(data: Dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
         try:
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            stamp = kst_now().strftime("%Y%m%dT%H%M%S")
             backup = path.with_name(f"{path.stem}.bak.{stamp}{path.suffix}")
             shutil.copy2(path, backup)
         except OSError:
@@ -91,7 +92,7 @@ def _parse_ts(val: Any) -> Optional[datetime]:
     if not val:
         return None
     try:
-        return datetime.fromisoformat(str(val))
+        return to_kst(datetime.fromisoformat(str(val).replace("Z", "+00:00")))
     except (TypeError, ValueError):
         return None
 
@@ -188,7 +189,7 @@ def add_or_update_wrong_case(
         snapshot.update(user_snapshot)
 
     case_id = make_case_id(run_id_clean, key_clean)
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = kst_now_iso()
 
     data = load_wrong_cases()
     cases: List[Dict[str, Any]] = data.get("cases", [])
@@ -301,7 +302,7 @@ def update_wrong_case_status(
         target["note"] = str(note)
     if tags is not None:
         target["tags"] = [str(t).strip() for t in tags if str(t).strip()]
-    target["updated_at"] = datetime.now(timezone.utc).isoformat()
+    target["updated_at"] = kst_now_iso()
 
     save_wrong_cases(data)
     return target
@@ -371,7 +372,7 @@ def find_all_document_runs(runs_root: Path, document: str) -> List[Dict[str, Any
             "run_id": child.name,
             "run_dir": child,
             "started_at": started_at,
-            "dt": _parse_ts(started_at) or datetime.fromtimestamp(child.stat().st_mtime, tz=timezone.utc),
+            "dt": _parse_ts(started_at) or datetime.fromtimestamp(child.stat().st_mtime, tz=KST),
             "status": meta.get("status", "unknown"),
         })
 
