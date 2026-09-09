@@ -310,6 +310,7 @@
       <div class="toolbar">
         <button type="button" id="selectFinished">Select finished</button>
         <button type="button" id="clearSelection">Clear</button>
+        <button type="button" id="exportXlsxAside" class="btn" title="선택한 run들의 실행 및 채점 결과를 Excel 파일로 다운로드합니다">XLSX 다운로드</button>
         <button type="button" id="deleteSelectedRuns" class="danger">Delete selected</button>
         <button type="button" id="toggleAllGroups">Expand all</button>
       </div>
@@ -553,9 +554,19 @@ function maybeFollowBatchHierarchy() {
 }
 
 function contentTabsHtml() {
-  return `<div class="content-tabs">
-    <button type="button" data-content-tab="summary" class="${state.contentTab === "summary" ? "active" : ""}">Summary</button>
-    <button type="button" data-content-tab="hierarchy" class="${state.contentTab === "hierarchy" ? "active" : ""}">Eval hierarchy</button>
+  const nRuns = viewRunIds().length;
+  return `<div class="content-tabs" style="display:flex;align-items:center;justify-content:space-between">
+    <div style="display:flex;gap:4px">
+      <button type="button" data-content-tab="summary" class="${state.contentTab === "summary" ? "active" : ""}">Summary</button>
+      <button type="button" data-content-tab="hierarchy" class="${state.contentTab === "hierarchy" ? "active" : ""}">Eval hierarchy</button>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button type="button" class="btn" id="exportXlsxTab" ${!nRuns ? "disabled" : ""}
+        style="padding:4px 12px;font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;border-color:var(--accent,#2563eb);color:var(--accent,#38bdf8)"
+        title="선택한 run들의 실행 및 채점 결과를 Excel (.xlsx) 파일로 다운로드합니다">
+        📥 XLSX 다운로드${nRuns ? ` (${nRuns})` : ""}
+      </button>
+    </div>
   </div>`;
 }
 
@@ -703,6 +714,9 @@ function bindMatrixControls() {
 }
 
 function bindContentTabs() {
+  const exportBtn = document.getElementById("exportXlsxTab");
+  if (exportBtn) exportBtn.onclick = downloadEvaluationXlsx;
+
   document.querySelectorAll("[data-content-tab]").forEach(btn => {
     btn.onclick = () => {
       const next = btn.dataset.contentTab;
@@ -721,6 +735,56 @@ function bindContentTabs() {
       }
     };
   });
+}
+
+async function downloadEvaluationXlsx() {
+  const runIds = viewRunIds();
+  if (!runIds.length) {
+    alert("다운로드할 run을 먼저 선택해주세요.");
+    return;
+  }
+  const btns = document.querySelectorAll("#exportXlsxAside, #exportXlsxBatch, #exportXlsxTab");
+  btns.forEach(b => {
+    b.disabled = true;
+    b.dataset.origText = b.textContent;
+    b.textContent = "다운로드 준비 중…";
+  });
+  try {
+    const res = await fetch("/api/evaluation/export/xlsx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_ids: runIds }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      let msg = errText;
+      try { msg = JSON.parse(errText).detail || errText; } catch (_) {}
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.style.display = "none";
+    a.href = url;
+    const disposition = res.headers.get("Content-Disposition");
+    let filename = "evaluation_results.xlsx";
+    if (disposition) {
+      const match = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+      if (match && match[1]) filename = decodeURIComponent(match[1]);
+    }
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+  } catch (err) {
+    alert("엑셀 다운로드 실패: " + (err.message || err));
+  } finally {
+    btns.forEach(b => {
+      b.disabled = !viewRunIds().length;
+      if (b.dataset.origText) b.textContent = b.dataset.origText;
+    });
+  }
 }
 
 function persistBatchJobId(jobId) {
@@ -835,6 +899,7 @@ function batchIsActive() {
 function renderBatchStartControls() {
   const disabled = !state.selected.size || batchIsActive();
   const hasStale = Boolean(state.summary?.per_run?.some(r => (r.agentic?.n_running ?? 0) > 0));
+  const nRuns = viewRunIds().length;
   return `
     <div class="batch-panel">
       <div class="title">Batch agentic-evaluation</div>
@@ -847,6 +912,11 @@ function renderBatchStartControls() {
         <button type="button" class="btn ${hasStale ? "warn" : ""}" id="clearStaleTasks"
           title="Clean up interrupted or dead running tasks across runs">
           Clear Stale Tasks
+        </button>
+        <button type="button" class="btn" id="exportXlsxBatch" ${!nRuns ? "disabled" : ""}
+          style="margin-left:auto;border-color:var(--accent,#2563eb);color:var(--accent,#38bdf8);font-weight:600"
+          title="선택한 run들의 실행 결과와 채점 결과를 Excel (.xlsx) 파일로 다운로드합니다">
+          📥 결과 XLSX 다운로드 (${nRuns}개 선택)
         </button>
       </div>
       <p class="hint" style="margin:8px 0 0">
@@ -989,6 +1059,12 @@ function renderRunList() {
   }).join("");
 
   el.scrollTop = prevScrollTop;
+
+  const asideXlsxBtn = document.getElementById("exportXlsxAside");
+  if (asideXlsxBtn) {
+    asideXlsxBtn.disabled = !state.selected.size;
+    asideXlsxBtn.textContent = state.selected.size ? `XLSX 다운로드 (${state.selected.size})` : "XLSX 다운로드";
+  }
 
   // Set indeterminate state for partially selected groups
   el.querySelectorAll("[data-group-check]").forEach(cb => {
@@ -1469,6 +1545,8 @@ function bindBatchControls() {
       }
     };
   }
+  const exportBatchBtn = document.getElementById("exportXlsxBatch");
+  if (exportBatchBtn) exportBatchBtn.onclick = downloadEvaluationXlsx;
   const panel = document.getElementById("batchJobPanel");
   if (panel) {
     panel.onclick = (e) => {
@@ -1667,6 +1745,11 @@ document.getElementById("clearSelection").onclick = () => {
   renderRunList();
   loadSummary();
 };
+
+const exportAsideBtn = document.getElementById("exportXlsxAside");
+if (exportAsideBtn) {
+  exportAsideBtn.onclick = downloadEvaluationXlsx;
+}
 
 const deleteSelectedBtn = document.getElementById("deleteSelectedRuns");
 if (deleteSelectedBtn) {

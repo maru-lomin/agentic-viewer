@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
+from urllib.parse import quote
 
 from fastapi import APIRouter, Body, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from agentic_viewer.evaluation.agentic_client import (
     AgenticEvalError,
@@ -25,8 +26,10 @@ from agentic_viewer.evaluation.trace_paths import (
     list_agentic_eval_keys,
     resolve_agentic_eval_trace_dir,
 )
+from agentic_viewer.evaluation.xlsx_export import generate_evaluation_xlsx
 from agentic_viewer.evaluation_page import EVALUATION_HTML
 from agentic_viewer.hierarchy import build_agent_tree
+from agentic_viewer.timezone import kst_now
 from agentic_viewer.timing import attach_timing_to_tree, build_timing_report
 
 router = APIRouter()
@@ -233,3 +236,51 @@ def get_agentic_eval_file(run_id: str, key: str = "", path: str = ""):
     if rel.is_absolute() or ".." in rel.parts:
         raise HTTPException(status_code=400, detail="invalid path")
     return app_mod._serve_run_file(trace_dir.resolve(), str(rel))
+
+
+def _export_runs_to_xlsx_response(run_ids: List[str]) -> Response:
+    app_mod = _get_app()
+    runs_root = app_mod.RUNS_ROOT
+    clean_ids = [str(x).strip() for x in run_ids if str(x).strip()]
+    if not clean_ids:
+        raise HTTPException(status_code=400, detail="run_ids is required")
+
+    run_dirs: List[Path] = []
+    for rid in clean_ids:
+        p = (runs_root / rid).resolve()
+        if str(p).startswith(str(runs_root)) and p.is_dir():
+            run_dirs.append(p)
+
+    if not run_dirs:
+        raise HTTPException(status_code=404, detail="No valid runs found for the provided run_ids")
+
+    buf = generate_evaluation_xlsx(run_dirs)
+    ts = kst_now().strftime("%Y%m%d_%H%M%S")
+    filename = f"evaluation_results_{ts}.xlsx"
+    encoded_filename = quote(filename)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"; filename*=UTF-8\'\'{encoded_filename}',
+    }
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
+
+
+@router.get("/api/evaluation/export/xlsx")
+def get_export_evaluation_xlsx(run_ids: str = "") -> Response:
+    """Download evaluation and extraction results for selected runs as Excel (.xlsx)."""
+    ids = [x.strip() for x in run_ids.split(",") if x.strip()]
+    return _export_runs_to_xlsx_response(ids)
+
+
+@router.post("/api/evaluation/export/xlsx")
+def post_export_evaluation_xlsx(body: Dict[str, Any] = Body(...)) -> Response:
+    """Download evaluation and extraction results for selected runs as Excel (.xlsx) via POST."""
+    ids = body.get("run_ids") or []
+    if isinstance(ids, str):
+        ids = [x.strip() for x in ids.split(",") if x.strip()]
+    elif not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="run_ids must be a list of strings")
+    return _export_runs_to_xlsx_response(ids)
