@@ -540,7 +540,8 @@ function renderCaseDetail(data) {
         </div>
         <div class="agentic-verdicts">
           ${verdict ? `<span class="agentic-verdict ${verdictCls}">Pred Verdict: ${esc(verdict)}</span>` : ""}
-          ${goldVerdict ? `<span class="agentic-verdict ${goldCls}">Gold Verdict: ${esc(goldVerdict)}</span>` : ""}
+          ${(goldVerdict === "valid" || goldVerdict === "invalid")
+            ? `<span class="agentic-verdict ${goldCls}">Gold Verdict: ${esc(goldVerdict)}</span>` : ""}
         </div>
         ${ae.reason_summary ? `<div class="agentic-summary">${esc(ae.reason_summary)}</div>` : ""}
         ${ae.reason_detail ? `

@@ -582,7 +582,8 @@ function renderHierarchyToolbar() {
   const keyOpts = state.hierarchyKeys.map(row => {
     const status = row.status || "pending";
     const verdict = row.is_correct_answer ? ` · pred ${row.is_correct_answer}` : "";
-    const goldVerdict = row.is_valid_gold ? ` · GT ${row.is_valid_gold}` : "";
+    const goldRaw = String(row.is_valid_gold || "").toLowerCase();
+    const goldVerdict = (goldRaw === "valid" || goldRaw === "invalid") ? ` · GT ${goldRaw}` : "";
     return `<option value="${esc(row.key)}" ${row.key === state.hierarchyKey ? "selected" : ""}>${esc(row.key)} (${esc(status)}${esc(verdict)}${esc(goldVerdict)})</option>`;
   }).join("");
   const follow = state.hierarchyFollowBatch
@@ -1375,7 +1376,8 @@ function renderSummaryBody() {
         const predCls = v === "correct" ? "correct" : (v === "incorrect" ? "incorrect" : "pending");
         const goldCls = gv === "valid" ? "valid" : (gv === "invalid" ? "invalid" : "pending");
         const predHtml = v ? `<div class="cell-agent ${predCls}">pred: ${esc(v)}</div>` : "";
-        const goldHtml = gv ? `<div class="cell-agent ${goldCls}">GT: ${esc(gv)}</div>` : "";
+        const goldHtml = (gv === "valid" || gv === "invalid")
+          ? `<div class="cell-agent ${goldCls}">GT: ${esc(gv)}</div>` : "";
         agentHtml = `${predHtml}${goldHtml}`;
       } else if (isActuallyRunning) {
         const liveLabel = ae.live_label || formatLiveLabel(ae.live)

@@ -1710,7 +1710,8 @@ function renderEvalHierarchyKeyToolbar() {
   const keyOpts = (state.evalHierarchyKeys || []).map(row => {
     const status = row.status || "pending";
     const verdict = row.is_correct_answer ? ` · pred ${row.is_correct_answer}` : "";
-    const goldVerdict = row.is_valid_gold ? ` · GT ${row.is_valid_gold}` : "";
+    const goldRaw = String(row.is_valid_gold || "").toLowerCase();
+    const goldVerdict = (goldRaw === "valid" || goldRaw === "invalid") ? ` · GT ${goldRaw}` : "";
     return `<option value="${esc(row.key)}" ${row.key === state.evalKey ? "selected" : ""}>${esc(row.key)} (${esc(status)}${esc(verdict)}${esc(goldVerdict)})</option>`;
   }).join("");
   return `
@@ -2928,11 +2929,12 @@ function renderSubmitEvaluation(tool) {
   const goldVerdict = String(payload.is_valid_gold || "").toLowerCase();
   const cls = verdict === "correct" ? "ok" : (verdict === "incorrect" ? "warn" : "");
   const goldCls = goldVerdict === "valid" ? "ok" : (goldVerdict === "invalid" ? "warn" : "");
+  const showGold = goldVerdict === "valid" || goldVerdict === "invalid";
   return `
     <div class="tree-kv">
       key=${esc(payload.key || args.key || state.evalKey || "?")}
       ${verdict ? `<span class="tree-badge ${cls}">pred: ${esc(verdict)}</span>` : ""}
-      ${goldVerdict ? `<span class="tree-badge ${goldCls}">GT: ${esc(goldVerdict)}</span>` : ""}
+      ${showGold ? `<span class="tree-badge ${goldCls}">GT: ${esc(goldVerdict)}</span>` : ""}
     </div>
     ${payload.reason_summary ? `<div class="tree-kv">${esc(payload.reason_summary)}</div>` : ""}
     ${payload.reason_detail || payload.text ? `<pre class="pretty" style="max-height:200px;margin-top:6px">${esc(payload.reason_detail || payload.text)}</pre>` : ""}
@@ -3411,9 +3413,10 @@ function renderEvalOutput() {
   const goldVerdict = String(er.is_valid_gold || "").toLowerCase();
   const cls = verdict === "correct" ? "ok" : (verdict === "incorrect" ? "warn" : "");
   const goldCls = goldVerdict === "valid" ? "ok" : (goldVerdict === "invalid" ? "warn" : "");
+  const showGold = goldVerdict === "valid" || goldVerdict === "invalid";
   const summary = er.reason_summary || er.reason || "";
   const detail = er.reason_detail || er.text || "";
-  if (!verdict && !goldVerdict && !summary && !detail) {
+  if (!verdict && !showGold && !summary && !detail) {
     return `<details class="tree-node output" open>
       <summary><span class="title">Eval output</span><span class="tree-badge warn">pending</span></summary>
       <div class="tree-body"><div class="tree-kv">No submit_evaluation verdict recorded yet.</div></div>
@@ -3423,7 +3426,7 @@ function renderEvalOutput() {
     <summary>
       <span class="title">Eval output</span>
       ${verdict ? `<span class="tree-badge ${cls}">pred: ${esc(verdict)}</span>` : ""}
-      ${goldVerdict ? `<span class="tree-badge ${goldCls}">GT: ${esc(goldVerdict)}</span>` : ""}
+      ${showGold ? `<span class="tree-badge ${goldCls}">GT: ${esc(goldVerdict)}</span>` : ""}
       ${state.evalKey ? `<span class="tree-kv">${esc(state.evalKey)}</span>` : ""}
     </summary>
     <div class="tree-body">

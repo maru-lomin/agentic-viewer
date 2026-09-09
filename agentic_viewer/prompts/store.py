@@ -151,15 +151,15 @@ PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
         "category": "evaluation",
         "tags": ["Evaluation", "Master"],
         "pipeline_file": "inference-pipeline/agentic/evaluation_pipeline.py",
-        "description": "단일 추출 키에 대해 추론값(pred)과 정답지(gold GT)를 문서와 교차 검증하여 정답 여부(is_correct_answer) 및 GT 유효성(is_valid_gold)을 판정합니다.",
+        "description": "단일 추출 키에 대해 추론값(pred)을 문서와 교차 검증하여 정답 여부(is_correct_answer)를 판정합니다. 정답지(GT)가 있으면 GT 유효성(is_valid_gold)도 함께 판정하고, 없으면 is_valid_gold는 n/a입니다.",
         "contract": {
             "completion_type": "tool_call",
             "completion_description": "Eval Master Agent는 판정 완료 시 반드시 submit_evaluation 도구를 정확히 1회 호출하여 구조화된 판정 결과를 기록해야 합니다.",
             "final_schema_example": {
                 "submit_evaluation_arguments": {
                     "is_correct_answer": "correct | incorrect",
-                    "is_valid_gold": "valid | invalid",
-                    "reason_summary": "1줄 한국어 핵심 요약 (예: 추론값 일치 및 정답지 유효)",
+                    "is_valid_gold": "valid | invalid | n/a",
+                    "reason_summary": "1줄 한국어 핵심 요약 (예: 추론값 문서 근거와 일치)",
                     "reason_detail": "페이지 인용과 함께 상세한 한국어 판정 근거 서술"
                 }
             },
@@ -173,7 +173,7 @@ PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
                 {
                     "name": "get_gold",
                     "args": "key?: string",
-                    "description": "정답지(answer sheet)의 정답값(gold), 근거 인용구 및 페이지를 조회합니다."
+                    "description": "정답지(answer sheet)의 정답값(gold), 근거 인용구 및 페이지를 조회합니다. GT가 없으면 found=false를 반환합니다."
                 },
                 {
                     "name": "load_kv_schema",
@@ -198,7 +198,7 @@ PROMPT_CONFIGS: Dict[str, Dict[str, Any]] = {
                 {
                     "name": "submit_evaluation",
                     "args": "is_correct_answer: str, is_valid_gold: str, reason_summary: str, reason_detail: str",
-                    "description": "정답 여부와 GT 유효성 및 한국어 사유를 확정 제출하고 평가를 마칩니다."
+                    "description": "정답 여부(및 GT가 있으면 GT 유효성, 없으면 n/a)와 한국어 사유를 확정 제출하고 평가를 마칩니다."
                 }
             ]
         }
