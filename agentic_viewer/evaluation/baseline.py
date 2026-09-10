@@ -19,7 +19,13 @@ from agentic_viewer.pdf_source import infer_run_document
 def _read_json(path: Path) -> Any:
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        return json.loads(text)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
 
 
 def eval_cache_has_reason_split(report: Dict[str, Any]) -> bool:

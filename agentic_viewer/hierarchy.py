@@ -85,7 +85,400 @@ def _search_rows_for_key(
 def _read_json(path: Path) -> Any:
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        return json.loads(text)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+_EXTRACT_KV_VLM_PROMPT_TEMPLATE = (
+    "Extract values for the following keys from the page image(s) and parsed text.\n"
+    "For each key return key, value, and value_reason:\n"
+    "- value_reason: MUST be written in Korean (반드시 한국어로 작성). State the factual rationale and concrete evidence supporting the extracted value in Korean.\n"
+    "- If a key is absent from the page(s) or no evidence is found in the document:\n"
+    "  * Check the key description: if a default value for missing/absent information is specified (e.g. '미수행', '20m', 'TIL 없음' 등), output that default value as the value.\n"
+    "  * If no missing default is specified in the key description, set value to 'not_found'.\n"
+    "  * In both cases, explain in value_reason why it is judged to be absent or using the default based on the inspected pages in Korean (반드시 한국어로 부재/기본값 사유 서술).\n\n"
+    "{guidance_block}\n\n"
+    "Keys:\n{schema_json}"
+)
+
+
+def _load_extract_vlm_prompt_template() -> str:
+    candidates = [
+        Path("/workspace/dataset/extract_kv_vlm_prompt.txt"),
+        Path(__file__).resolve().parents[2] / "dataset" / "extract_kv_vlm_prompt.txt",
+    ]
+    for p in candidates:
+        try:
+            if p.is_file():
+                text = p.read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+        except Exception:
+            continue
+    return _EXTRACT_KV_VLM_PROMPT_TEMPLATE
+
+
+def _load_kv_schema_items_from_run(run_dir: Path) -> List[Dict[str, Any]]:
+    tools_dir = run_dir / "03_agent" / "tools"
+    if not tools_dir.is_dir():
+        return []
+    for path in sorted(tools_dir.glob("step_*_load_kv_schema.json")):
+        data = _read_json(path) or {}
+        if data.get("label"):
+            continue
+        result = data.get("result") or {}
+        items = result.get("items") if isinstance(result, dict) else None
+        if isinstance(items, list) and items:
+            return [it for it in items if isinstance(it, dict)]
+    return []
+
+
+def _read_page_md(run_dir: Path, page: int, *, max_chars: int = 4000) -> str:
+    path = run_dir / "01_parse" / f"page_{int(page):03d}.md"
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")[:max_chars]
+    except Exception:
+        return ""
+
+
+def _reconstruct_extract_vlm_messages(
+    run_dir: Path,
+    arguments: Dict[str, Any],
+    *,
+    schema_items: Optional[List[Dict[str, Any]]] = None,
+    page_text_max_chars: int = 4000,
+) -> Optional[List[Dict[str, Any]]]:
+    """Best-effort rebuild of extract_kv_vlm VLM messages for legacy runs."""
+    keys = [str(k).strip() for k in (arguments.get("keys") or []) if str(k).strip()]
+    pages_raw = arguments.get("pages") or []
+    pages: List[int] = []
+    for p in pages_raw:
+        try:
+            pi = int(p)
+        except (TypeError, ValueError):
+            continue
+        if pi > 0 and pi not in pages:
+            pages.append(pi)
+    if not keys:
+        return None
+
+    all_items = schema_items if schema_items is not None else _load_kv_schema_items_from_run(run_dir)
+    key_set = set(keys)
+    items = [it for it in all_items if str(it.get("key") or "") in key_set]
+    if not items:
+        items = [{"key": k, "description": ""} for k in keys]
+    schema_json = json.dumps(items, ensure_ascii=False, indent=2)
+
+    page_reasons = arguments.get("page_reasons") or {}
+    page_chunk_id = arguments.get("page_chunk_id") or {}
+    hints = arguments.get("hints")
+    page_set = {str(p) for p in pages}
+
+    def _sort_page_key(kv: Tuple[Any, Any]) -> Tuple[int, Any]:
+        k = str(kv[0])
+        return (0, int(k)) if k.isdigit() else (1, k)
+
+    guidance_parts: List[str] = []
+    if hints and str(hints).strip():
+        guidance_parts.append(str(hints).strip())
+    if isinstance(page_reasons, dict):
+        reason_lines = [
+            (f"- page {p}: {text}" if str(p).isdigit() else f"- {p}: {text}")
+            for p, text in sorted(page_reasons.items(), key=_sort_page_key)
+            if text and (not page_set or str(p) in page_set)
+        ]
+        if reason_lines:
+            guidance_parts.append(
+                "Page selection reasons from search:\n" + "\n".join(reason_lines)
+            )
+    if isinstance(page_chunk_id, dict):
+        chunk_lines = [
+            (f"- page {p}: chunk {cid}" if str(p).isdigit() else f"- {p}: chunk {cid}")
+            for p, cid in sorted(page_chunk_id.items(), key=_sort_page_key)
+            if cid and (not page_set or str(p) in page_set)
+        ]
+        if chunk_lines:
+            guidance_parts.append(
+                "BM25 evidence chunks from search:\n" + "\n".join(chunk_lines)
+            )
+    guidance_block = ""
+    if guidance_parts:
+        guidance_block = (
+            "\n\nAdditional extraction guidance:\n"
+            + "\n".join(guidance_parts)
+            + "\n"
+        )
+
+    template = _load_extract_vlm_prompt_template()
+    prompt = template
+    if "{guidance_block}" in prompt:
+        prompt = prompt.replace("{guidance_block}", guidance_block.strip())
+    elif guidance_block.strip():
+        prompt = prompt.rstrip() + "\n\n" + guidance_block.strip()
+    if "{schema_json}" in prompt:
+        prompt = prompt.replace("{schema_json}", schema_json)
+    else:
+        prompt = prompt.rstrip() + "\n\nKeys:\n" + schema_json
+    prompt = prompt.strip()
+
+    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for pi in pages:
+        page_text = _read_page_md(run_dir, pi, max_chars=page_text_max_chars)
+        content.append(
+            {
+                "type": "text",
+                "text": f"--- page {pi} parsed text ---\n{page_text}",
+            }
+        )
+        content.append(
+            {
+                "type": "image_url",
+                "page": pi,
+                "note": f"<page {pi} image; not archived in legacy dump>",
+            }
+        )
+    return [{"role": "user", "content": content}]
+
+
+def _estimate_vlm_messages_tokens(
+    messages: List[Dict[str, Any]],
+    *,
+    chars_per_token: float = 4.0,
+    tokens_per_image: int = 1400,
+) -> int:
+    """Heuristic prompt-token estimate matching inference-pipeline defaults."""
+    total = 6  # message overhead
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += max(1, int(round(len(content) / max(chars_per_token, 0.1))))
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text" or (part.get("text") is not None and not ptype):
+                text = str(part.get("text") or "")
+                total += max(1, int(round(len(text) / max(chars_per_token, 0.1)))) if text else 0
+            elif ptype == "image_url":
+                total += max(0, int(tokens_per_image))
+    return total
+
+
+def _load_vlm_messages_payload(
+    run_dir: Path, rel: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    if not rel:
+        return None
+    data = _read_json(run_dir / str(rel))
+    if isinstance(data, dict) and isinstance(data.get("messages"), list):
+        return data
+    if isinstance(data, list):
+        return {"messages": data}
+    return None
+
+
+def _apply_vlm_messages_payload(target: Dict[str, Any], payload: Dict[str, Any], *, source: str) -> None:
+    target["vlm_messages"] = payload.get("messages")
+    target["vlm_messages_source"] = source
+    if target.get("prompt_est_tokens") is None and payload.get("prompt_est_tokens") is not None:
+        target["prompt_est_tokens"] = payload.get("prompt_est_tokens")
+    if target.get("input_tokens") is None and payload.get("input_tokens") is not None:
+        target["input_tokens"] = payload.get("input_tokens")
+    if target.get("output_tokens") is None and payload.get("output_tokens") is not None:
+        target["output_tokens"] = payload.get("output_tokens")
+    if target.get("page_images") is None and payload.get("page_images") is not None:
+        target["page_images"] = payload.get("page_images")
+
+
+def _synthesize_page_images(
+    *,
+    pages: Any,
+    messages: Any,
+    extra_files: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Build page_images status from messages/extra_files for legacy dumps."""
+    page_list: List[int] = []
+    for p in pages or []:
+        try:
+            pi = int(p)
+        except (TypeError, ValueError):
+            continue
+        if pi > 0 and pi not in page_list:
+            page_list.append(pi)
+    files = extra_files or {}
+    attached: Dict[int, Dict[str, Any]] = {}
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            try:
+                page = int(part.get("page"))
+            except (TypeError, ValueError):
+                continue
+            rel = part.get("file") or files.get(f"page_{page}")
+            err = part.get("error")
+            attached[page] = {
+                "page": page,
+                "ok": not err and bool(rel or part.get("ok", True)),
+                "attached_to_vlm": part.get("ok") is not False and not err,
+                "error": err,
+                "file": rel,
+            }
+    out: List[Dict[str, Any]] = []
+    for page in page_list:
+        if page in attached:
+            out.append(attached[page])
+            continue
+        rel = files.get(f"page_{page}")
+        if rel:
+            out.append(
+                {
+                    "page": page,
+                    "ok": True,
+                    "attached_to_vlm": True,
+                    "error": None,
+                    "file": rel,
+                }
+            )
+        else:
+            out.append(
+                {
+                    "page": page,
+                    "ok": False,
+                    "attached_to_vlm": False,
+                    "error": "page image not present in VLM messages (legacy dump or render failed)",
+                    "file": None,
+                }
+            )
+    return out
+
+
+def _ensure_page_images(target: Dict[str, Any], extra_files: Dict[str, str]) -> None:
+    if not isinstance(target, dict):
+        return
+    if target.get("page_images"):
+        return
+    pages = target.get("pages")
+    msgs = target.get("vlm_messages")
+    if pages is None and not msgs:
+        return
+    synthesized = _synthesize_page_images(
+        pages=pages, messages=msgs, extra_files=extra_files
+    )
+    if synthesized:
+        target["page_images"] = synthesized
+
+
+def _enrich_extract_kv_vlm_tool(run_dir: Path, tool_node: Dict[str, Any]) -> None:
+    """Attach VLM input messages from dumps/sidecars, or reconstruct for legacy runs."""
+    result = tool_node.get("result")
+    if not isinstance(result, dict):
+        result = {}
+        tool_node["result"] = result
+    extra = tool_node.get("extra_files") or {}
+    args = tool_node.get("arguments") if isinstance(tool_node.get("arguments"), dict) else {}
+    schema_items = _load_kv_schema_items_from_run(run_dir)
+
+    def _attach_reconstructed(target: Dict[str, Any], recon_args: Dict[str, Any]) -> None:
+        recon = _reconstruct_extract_vlm_messages(
+            run_dir, recon_args, schema_items=schema_items
+        )
+        if not recon:
+            return
+        target["vlm_messages"] = recon
+        target["vlm_messages_source"] = "reconstructed"
+        if target.get("prompt_est_tokens") is None:
+            target["prompt_est_tokens"] = _estimate_vlm_messages_tokens(recon)
+
+    splits = result.get("split_calls")
+    if isinstance(splits, list):
+        for i, sc in enumerate(splits):
+            if not isinstance(sc, dict):
+                continue
+            if sc.get("vlm_messages"):
+                sc.setdefault("vlm_messages_source", "trace")
+                if sc.get("prompt_est_tokens") is None:
+                    sc["prompt_est_tokens"] = _estimate_vlm_messages_tokens(
+                        sc["vlm_messages"]
+                    )
+                continue
+            rel = (
+                sc.get("vlm_messages_file")
+                or extra.get(f"vlm_messages_{i}")
+                or (extra.get("vlm_messages") if len(splits) == 1 else None)
+            )
+            payload = _load_vlm_messages_payload(run_dir, rel)
+            if payload and payload.get("messages"):
+                _apply_vlm_messages_payload(sc, payload, source="trace")
+                continue
+            _attach_reconstructed(
+                sc,
+                {
+                    "keys": sc.get("keys") or args.get("keys"),
+                    "pages": sc.get("pages") or args.get("pages"),
+                    "hints": args.get("hints"),
+                    "page_reasons": args.get("page_reasons"),
+                    "page_chunk_id": args.get("page_chunk_id"),
+                },
+            )
+
+    if not result.get("vlm_messages"):
+        rel = result.get("vlm_messages_file") or extra.get("vlm_messages")
+        payload = _load_vlm_messages_payload(run_dir, rel)
+        if payload and payload.get("messages"):
+            _apply_vlm_messages_payload(result, payload, source="trace")
+        elif isinstance(splits, list) and len(splits) == 1 and isinstance(splits[0], dict):
+            if splits[0].get("vlm_messages"):
+                result["vlm_messages"] = splits[0]["vlm_messages"]
+                result["vlm_messages_source"] = splits[0].get(
+                    "vlm_messages_source", "trace"
+                )
+                if result.get("prompt_est_tokens") is None:
+                    result["prompt_est_tokens"] = splits[0].get("prompt_est_tokens")
+        elif not isinstance(splits, list) or not splits:
+            _attach_reconstructed(result, args)
+
+    if result.get("prompt_est_tokens") is None:
+        if isinstance(splits, list) and splits:
+            total = 0
+            any_est = False
+            for sc in splits:
+                if isinstance(sc, dict) and sc.get("prompt_est_tokens") is not None:
+                    total += int(sc["prompt_est_tokens"])
+                    any_est = True
+            if any_est:
+                result["prompt_est_tokens"] = total
+        elif result.get("vlm_messages"):
+            result["prompt_est_tokens"] = _estimate_vlm_messages_tokens(
+                result["vlm_messages"]
+            )
+
+    if isinstance(splits, list):
+        for sc in splits:
+            if isinstance(sc, dict):
+                if sc.get("pages") is None:
+                    sc["pages"] = args.get("pages")
+                _ensure_page_images(sc, extra if isinstance(extra, dict) else {})
+    if result.get("pages") is None:
+        result["pages"] = args.get("pages")
+    _ensure_page_images(result, extra if isinstance(extra, dict) else {})
 
 
 def _parse_search_label(label: str) -> Tuple[str, int, int, int]:
@@ -1784,6 +2177,9 @@ def build_agent_tree(run_dir: Path) -> Dict[str, Any]:
                     args = dict(args)
                     args["key"] = args.get("keys")
                     tool_node["arguments"] = args
+
+            if tname == "extract_kv_vlm":
+                _enrich_extract_kv_vlm_tool(run_dir, tool_node)
 
             if tname == "search_pages" and isinstance(result, dict) and "accepted" in result:
                 accepted = result.get("accepted") or []

@@ -1905,22 +1905,23 @@ function renderMasterPrompts(prompts) {
   const sys = prompts.system;
   const user = prompts.user;
   if (!sys && !user) return "";
-  return `<details class="tree-node master-prompts">
-    <summary>
-      <span class="title">Master prompts</span>
-      <span class="tree-badge">system + user</span>
-    </summary>
-    <div class="tree-body">
-      ${sys ? `<div class="flow-item system" style="margin-bottom:8px">
-        <div class="label">System prompt</div>
-        <pre class="pretty" style="max-height:320px;margin:4px 0 0">${esc(sys)}</pre>
-      </div>` : ""}
-      ${user ? `<div class="flow-item user">
-        <div class="label">User prompt</div>
-        <pre class="pretty" style="max-height:200px;margin:4px 0 0">${esc(user)}</pre>
-      </div>` : ""}
-    </div>
-  </details>`;
+  const messages = [];
+  if (sys) messages.push({ role: "system", content: sys });
+  if (user) messages.push({ role: "user", content: user });
+  return renderLlmMessages(messages, {
+    title: "MasterAgent LLM messages",
+    className: "master-prompts",
+    open: false,
+    badges: [
+      `<span class="tree-badge">messages[0]=system${user ? ", messages[1]=user" : ""}</span>`,
+    ],
+    hint: "MasterAgent 실행 시 LLM에 전달되는 <b>messages</b> 원문입니다. extract_kv_vlm과 달리 텍스트-only이며 system 메시지가 있습니다.",
+    messageSubtitles: {
+      0: "Master System Prompt",
+      1: "Master User Prompt",
+    },
+    openRoles: [],
+  });
 }
 
 function renderSearchInitialState(initialState, prompts, opts = {}) {
@@ -1940,9 +1941,8 @@ function renderSearchInitialState(initialState, prompts, opts = {}) {
   const nKeys = keys.length;
   const outlineLines = outline ? outline.split("\n").length : 0;
 
-  // 1. User Prompt Internal Sequence Bar
   const userSeqBar = `
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;margin:8px 0 10px;padding:6px 10px;background:rgba(0,0,0,0.3);border-radius:6px;border:1px solid var(--line);line-height:1.4">
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;margin:0 0 10px;padding:6px 10px;background:rgba(0,0,0,0.3);border-radius:6px;border:1px solid var(--line);line-height:1.4">
       <span style="color:var(--muted);font-weight:600">User Prompt Section Sequence:</span>
       <span class="tree-badge ok" title="Search goal instructions">1. Task Instruction</span>
       <span style="color:var(--muted)">➔</span>
@@ -1954,51 +1954,38 @@ function renderSearchInitialState(initialState, prompts, opts = {}) {
       <span class="tree-badge ok" title="Tool rules & submit_pages requirements">${prior ? '5' : '4'}. Tool Rules & Submit Instructions</span>
     </div>`;
 
-  // 2. Raw LLM Messages (system first, then user)
-  const messagesHtml = `
-    <div style="display:flex;flex-direction:column;gap:10px;margin-top:4px">
-      <!-- Message 0: system -->
-      <details class="viz-section" style="margin:0">
-        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;user-select:none">
-          <span class="tree-badge" style="color:#b197fc;border-color:#5c3e9e;background:rgba(155,123,212,0.12)">Message [0] · role: "system"</span>
-          <span>SearchAgent System Prompt</span>
-          <span class="tree-badge">Instructions & Tool Rules</span>
-        </summary>
-        <div style="margin-top:8px">
-          <pre class="pretty" style="max-height:280px;margin:0;font-size:11px;line-height:1.45;white-space:pre-wrap">${esc(sys || "(system prompt not recorded in trace)")}</pre>
-        </div>
-      </details>
+  const messages = [];
+  messages.push({ role: "system", content: sys || "(system prompt not recorded in trace)" });
+  messages.push({ role: "user", content: user || "(user prompt not recorded in trace)" });
 
-      <!-- Message 1: user -->
-      <details class="viz-section" style="margin:0" open>
-        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;user-select:none">
-          <span class="tree-badge" style="color:#74c0fc;border-color:#2a6a9e;background:rgba(61,156,240,0.12)">Message [1] · role: "user"</span>
-          <span>SearchAgent Initial User Prompt</span>
-          <span class="tree-badge ok">${esc(nKeys)} key(s)</span>
-          ${outline ? `<span class="tree-badge">TOC outline</span>` : ""}
-        </summary>
-        <div style="margin-top:8px">
-          ${userSeqBar}
-          <pre class="pretty" style="max-height:420px;margin:0;font-size:11px;line-height:1.45;white-space:pre-wrap">${esc(user || "(user prompt not recorded in trace)")}</pre>
-        </div>
-      </details>
-    </div>`;
+  const badges = [
+    `<span class="tree-badge ok">messages[0]=system, messages[1]=user</span>`,
+  ];
+  if (nKeys) badges.push(`<span class="tree-badge ok">${esc(nKeys)} key(s)</span>`);
+  if (outline) badges.push(`<span class="tree-badge">outline (${esc(outlineLines)}p)</span>`);
+  if (prior) badges.push(`<span class="tree-badge warn">prior handoff</span>`);
 
-  return `<details class="tree-node search-prompts" open>
-    <summary>
-      <span class="title">SearchAgent LLM Initial Messages (messages payload)</span>
-      <span class="tree-badge ok">messages[0]=system, messages[1]=user</span>
-      ${nKeys ? `<span class="tree-badge ok">${esc(nKeys)} key(s)</span>` : ""}
-      ${outline ? `<span class="tree-badge">outline (${esc(outlineLines)}p)</span>` : ""}
-      ${prior ? `<span class="tree-badge warn">prior handoff</span>` : ""}
-    </summary>
-    <div class="tree-body">
-      <div class="hint" style="margin:0 0 6px;line-height:1.4">
-        SearchAgent 실행 시 LLM에 전달되는 <b>messages 배열 (role: system ➔ role: user)</b>의 실제 원문 및 주입 순서입니다.
-      </div>
-      ${messagesHtml}
-    </div>
-  </details>`;
+  return renderLlmMessages(messages, {
+    title: "SearchAgent LLM Initial Messages",
+    className: "search-prompts",
+    open: true,
+    badges,
+    hint: "SearchAgent 실행 시 LLM에 전달되는 <b>messages 배열 (role: system ➔ role: user)</b>의 실제 원문 및 주입 순서입니다.",
+    messageSubtitles: {
+      0: "SearchAgent System Prompt",
+      1: "SearchAgent Initial User Prompt",
+    },
+    messageBadges: {
+      0: [`<span class="tree-badge">Instructions & Tool Rules</span>`],
+      1: [
+        nKeys ? `<span class="tree-badge ok">${esc(nKeys)} key(s)</span>` : "",
+        outline ? `<span class="tree-badge">TOC outline</span>` : "",
+      ].filter(Boolean),
+    },
+    messageHeaderHtml: { 1: userSeqBar },
+    openRoles: ["user"],
+    maxTextHeight: { 0: 280, 1: 420 },
+  });
 }
 
 function renderSearchTurn(turn) {
@@ -2871,6 +2858,235 @@ function renderLoadKvSchema(tool) {
   `;
 }
 
+function llmRoleBadgeStyle(role) {
+  const r = String(role || "").toLowerCase();
+  if (r === "system") return "color:#b197fc;border-color:#5c3e9e;background:rgba(155,123,212,0.12)";
+  if (r === "user") return "color:#74c0fc;border-color:#2a6a9e;background:rgba(61,156,240,0.12)";
+  if (r === "assistant") return "color:#69db7c;border-color:#2f9e44;background:rgba(64,192,87,0.12)";
+  if (r === "tool") return "color:#ffa94d;border-color:#e8590c;background:rgba(253,126,20,0.12)";
+  return "";
+}
+
+function llmContentPartLabel(part, index) {
+  if (!part || typeof part !== "object") return `content[${index}]`;
+  if (part.type === "text" || (part.text != null && !part.type)) {
+    const t = String(part.text || "");
+    const m = t.match(/^---\s*page\s+(\d+)\s+parsed text\s*---/m);
+    if (m) return `content[${index}] · page ${m[1]} parsed text`;
+    if (/Extract values for the following keys/i.test(t) || /Keys:\s*\n/i.test(t)) {
+      return `content[${index}] · extraction prompt`;
+    }
+    return `content[${index}] · text`;
+  }
+  if (part.type === "image_url") {
+    const page = part.page != null ? `page ${part.page}` : "page ?";
+    if (part.ok === false || part.error) return `content[${index}] · ${page} image (missing)`;
+    return `content[${index}] · ${page} image`;
+  }
+  return `content[${index}] · ${part.type || "part"}`;
+}
+
+function renderMessageContent(content, opts = {}) {
+  const files = opts.extraFiles || {};
+  const maxH = opts.maxTextHeight != null ? opts.maxTextHeight : 360;
+  if (typeof content === "string") {
+    return `<pre class="pretty" style="max-height:${maxH}px;margin:0;white-space:pre-wrap;font-size:11px;line-height:1.45">${esc(content)}</pre>`;
+  }
+  if (!Array.isArray(content)) {
+    return `<pre class="pretty" style="max-height:200px;margin:0">${esc(pretty(content || {}, 4000))}</pre>`;
+  }
+  return content.map((part, i) => {
+    if (!part || typeof part !== "object") {
+      return `<pre class="pretty" style="margin-top:6px">${esc(String(part))}</pre>`;
+    }
+    const label = llmContentPartLabel(part, i);
+    if (part.type === "text" || (part.text != null && !part.type)) {
+      return `<div class="viz-section" style="margin-top:6px">
+        <h3 style="margin:0 0 4px;font-size:11px;color:var(--muted)">${esc(label)}</h3>
+        <pre class="pretty" style="max-height:${maxH}px;margin:0;white-space:pre-wrap;font-size:11px;line-height:1.45">${esc(part.text || "")}</pre>
+      </div>`;
+    }
+    if (part.type === "image_url") {
+      const rel = part.file || (part.page != null ? files[`page_${part.page}`] : null);
+      const missing = part.ok === false || Boolean(part.error) || !rel;
+      let body;
+      if (rel) {
+        body = `<a href="${runFileUrl(rel)}" target="_blank" title="Open archived page image">
+          <img src="${runFileUrl(rel)}" alt="page ${esc(part.page ?? "")}" style="max-width:min(100%,520px);max-height:320px;border:1px solid var(--line);border-radius:6px;display:block;background:#0d1117" />
+        </a>
+        <div class="tree-kv" style="margin-top:4px"><a href="${runFileUrl(rel)}" target="_blank">${esc(rel)}</a></div>`;
+      } else {
+        body = `<div class="tree-kv" style="color:var(--err)">${esc(part.error || part.note || "image not archived / not attached to VLM")}</div>`;
+      }
+      return `<div class="viz-section" style="margin-top:6px">
+        <h3 style="margin:0 0 4px;font-size:11px;color:${missing && !rel ? "var(--err)" : "var(--muted)"}">${esc(label)}${rel ? ` <span class="tree-badge ok">archived</span>` : ` <span class="tree-badge err">not in VLM input</span>`}</h3>
+        ${body}
+      </div>`;
+    }
+    return `<div class="viz-section" style="margin-top:6px">
+      <h3 style="margin:0 0 4px;font-size:11px;color:var(--muted)">${esc(label)}</h3>
+      <pre class="pretty" style="max-height:160px;margin:0">${esc(pretty(part, 2000))}</pre>
+    </div>`;
+  }).join("");
+}
+
+function renderLlmMessages(messages, opts = {}) {
+  const list = Array.isArray(messages) ? messages : [];
+  if (!list.length) return "";
+  const title = opts.title || "LLM messages";
+  const className = opts.className || "llm-messages";
+  const open = opts.open !== false;
+  const badges = (opts.badges || []).join("");
+  const hint = opts.hint || "";
+  const headerHtml = opts.headerHtml || "";
+  const footerHtml = opts.footerHtml || "";
+  const extraFiles = opts.extraFiles || {};
+  const openRoles = opts.openRoles || ["user"];
+  const openIndexes = opts.openIndexes || null;
+  const subtitles = opts.messageSubtitles || {};
+  const msgBadges = opts.messageBadges || {};
+  const msgHeaders = opts.messageHeaderHtml || {};
+  const maxTextHeightMap = opts.maxTextHeight || {};
+
+  const roleCounts = {};
+  list.forEach(m => {
+    const r = String((m && m.role) || "?");
+    roleCounts[r] = (roleCounts[r] || 0) + 1;
+  });
+  const roleSummary = Object.entries(roleCounts).map(([r, n]) => `${r}=${n}`).join(", ");
+
+  const msgHtml = list.map((m, mi) => {
+    const role = (m && m.role) || "?";
+    const isOpen = openIndexes
+      ? openIndexes.includes(mi)
+      : openRoles.includes(String(role).toLowerCase());
+    const subtitle = subtitles[mi] || `${esc(String(role))} message`;
+    const extraBadges = (msgBadges[mi] || []).join("");
+    const msgHeader = msgHeaders[mi] || "";
+    const maxH = maxTextHeightMap[mi] != null ? maxTextHeightMap[mi] : 360;
+    return `
+      <details class="viz-section" style="margin:0" ${isOpen ? "open" : ""}>
+        <summary style="cursor:pointer;font-size:12px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;user-select:none;flex-wrap:wrap">
+          <span class="tree-badge" style="${llmRoleBadgeStyle(role)}">Message [${mi}] · role: "${esc(role)}"</span>
+          <span>${subtitle}</span>
+          ${extraBadges}
+        </summary>
+        <div style="margin-top:8px">
+          ${msgHeader}
+          ${renderMessageContent(m && m.content, { extraFiles, maxTextHeight: maxH })}
+        </div>
+      </details>`;
+  }).join("");
+
+  return `<details class="tree-node ${esc(className)}" ${open ? "open" : ""} style="margin-top:8px">
+    <summary>
+      <span class="title">${title}</span>
+      <span class="tree-badge">${esc(list.length)} msg · ${esc(roleSummary)}</span>
+      ${badges}
+    </summary>
+    <div class="tree-body">
+      ${hint ? `<div class="hint" style="margin:0 0 6px;line-height:1.4">${hint}</div>` : ""}
+      ${headerHtml}
+      <div style="display:flex;flex-direction:column;gap:10px;margin-top:4px">
+        ${msgHtml}
+      </div>
+      ${footerHtml}
+    </div>
+  </details>`;
+}
+
+function renderPageImagesStatus(pageImages) {
+  if (!Array.isArray(pageImages) || !pageImages.length) return "";
+  const rows = pageImages.map(row => {
+    const ok = row && row.ok !== false && row.attached_to_vlm !== false && !row.error;
+    const page = row && row.page != null ? row.page : "?";
+    const file = row && row.file;
+    const err = row && (row.error || (!ok ? "not attached" : ""));
+    return `<tr>
+      <td>p.${esc(page)}</td>
+      <td>${ok ? `<span class="tree-badge ok">attached</span>` : `<span class="tree-badge err">missing</span>`}</td>
+      <td>${file ? `<a href="${runFileUrl(file)}" target="_blank">${esc(file)}</a>` : "—"}</td>
+      <td style="color:${err ? "var(--err)" : "var(--muted)"}">${esc(err || "")}</td>
+    </tr>`;
+  }).join("");
+  return `<div class="viz-section" style="margin-top:8px">
+    <h3 style="margin:0 0 4px;font-size:11px;color:var(--muted)">Page images sent to VLM</h3>
+    <table class="kv-table"><thead><tr><th>Page</th><th>Status</th><th>Archive</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+}
+
+function renderExtractVlmInputMessages(result, extraFiles) {
+  const splits = Array.isArray(result.split_calls) ? result.split_calls : [];
+  const calls = [];
+  if (splits.length) {
+    splits.forEach((sc, i) => {
+      if (!sc || typeof sc !== "object") return;
+      if (!sc.vlm_messages) return;
+      calls.push({
+        label: `extract_kv_vlm call ${i + 1}/${splits.length}`,
+        keys: sc.keys,
+        pages: sc.pages,
+        vlm_messages: sc.vlm_messages,
+        vlm_messages_source: sc.vlm_messages_source || result.vlm_messages_source,
+        vlm_messages_file: sc.vlm_messages_file,
+        prompt_est_tokens: sc.prompt_est_tokens,
+        input_tokens: sc.input_tokens,
+        output_tokens: sc.output_tokens,
+        page_images: sc.page_images || result.page_images,
+      });
+    });
+  } else if (result.vlm_messages) {
+    calls.push({
+      label: "extract_kv_vlm",
+      keys: result.keys,
+      pages: result.pages,
+      vlm_messages: result.vlm_messages,
+      vlm_messages_source: result.vlm_messages_source,
+      vlm_messages_file: result.vlm_messages_file,
+      prompt_est_tokens: result.prompt_est_tokens,
+      input_tokens: result.input_tokens,
+      output_tokens: result.output_tokens,
+      page_images: result.page_images,
+    });
+  }
+  if (!calls.length) return "";
+
+  return calls.map(call => {
+    const src = call.vlm_messages_source || "trace";
+    const badges = [
+      src === "reconstructed"
+        ? `<span class="tree-badge warn" title="Legacy run: rebuilt from schema + page text + tool args (approximate)">reconstructed</span>`
+        : `<span class="tree-badge ok">from trace</span>`,
+    ];
+    if (call.prompt_est_tokens != null) badges.push(`<span class="tree-badge">prompt≈${esc(call.prompt_est_tokens)}</span>`);
+    if (call.input_tokens != null) badges.push(`<span class="tree-badge">API in=${esc(call.input_tokens)}</span>`);
+    if (call.output_tokens != null) badges.push(`<span class="tree-badge">out=${esc(call.output_tokens)}</span>`);
+    if (call.keys) badges.push(`<span class="tree-badge">${esc(JSON.stringify(call.keys))}</span>`);
+    if (call.pages) badges.push(`<span class="tree-badge">pages ${esc(JSON.stringify(call.pages))}</span>`);
+
+    const footer = [
+      renderPageImagesStatus(call.page_images),
+      call.vlm_messages_file
+        ? `<div class="tree-kv" style="margin-top:6px"><a href="${runFileUrl(call.vlm_messages_file)}" target="_blank">open vlm_messages.json</a></div>`
+        : "",
+    ].join("");
+
+    return renderLlmMessages(call.vlm_messages, {
+      title: `${esc(call.label)} · input messages`,
+      className: "extract-vlm-messages",
+      open: true,
+      badges,
+      hint: `VLM에 전달된 <b>messages</b> 페이로드입니다. system 메시지는 없고 user multimodal content만 사용합니다.
+        content 파트: <b>extraction prompt</b> → <b>page N parsed text</b> → <b>page N image</b>(렌더 성공 시).
+        ${src === "reconstructed" ? " 이 런에는 원본 트레이스가 없어 schema·페이지 텍스트·tool args로 재구성했습니다." : ""}`,
+      extraFiles,
+      openRoles: ["user"],
+      messageSubtitles: { 0: "extract_kv_vlm user content" },
+      footerHtml: footer,
+    });
+  }).join("");
+}
+
 function renderExtractKvVlm(tool) {
   const args = tool.arguments || {};
   const result = tool.result || {};
@@ -2890,20 +3106,24 @@ function renderExtractKvVlm(tool) {
     </tr>`
   ).join("");
   const files = tool.extra_files || {};
-  const fileLinks = Object.entries(files).map(([label, rel]) =>
-    `<a href="${runFileUrl(rel)}" target="_blank">${esc(label)}</a>`
-  ).join(" · ");
+  const pageFileLinks = Object.entries(files)
+    .filter(([label]) => String(label).startsWith("page_"))
+    .map(([label, rel]) =>
+      `<a href="${runFileUrl(rel)}" target="_blank">${esc(label)}</a>`
+    ).join(" · ");
   const hintsHtml = hints && String(hints).trim() ? `
     <div class="viz-section" style="margin-top:6px">
       <h3 style="margin:0 0 4px">Hints</h3>
       <pre class="pretty" style="max-height:160px;margin:0">${esc(String(hints))}</pre>
     </div>` : "";
   const nReasons = Object.keys(pageReasons || {}).length;
+  const vlmInputHtml = renderExtractVlmInputMessages(result, files);
   return `
     <div class="tree-kv">
       pages=${esc(JSON.stringify(pages))} · keys=${esc(JSON.stringify(keys))}
       ${nReasons ? ` · page_reasons=${esc(nReasons)}` : ""}
       ${Object.keys(pageChunkIds || {}).length ? ` · page_chunk_id=${esc(Object.keys(pageChunkIds).length)}` : ""}
+      ${result.prompt_est_tokens != null ? ` · prompt≈${esc(result.prompt_est_tokens)}` : ""}
       ${result.input_tokens != null || result.output_tokens != null
         ? ` · VLM in=${esc(result.input_tokens ?? "—")} out=${esc(result.output_tokens ?? "—")}` : ""}
       ${covered === true ? `<span class="tree-badge ok">all_keys_covered</span>` : ""}
@@ -2911,12 +3131,13 @@ function renderExtractKvVlm(tool) {
     </div>
     ${renderPageReasonsTable(pageReasons, pageChunkIds)}
     ${hintsHtml}
+    ${vlmInputHtml}
     ${rows ? `<table class="kv-table" style="margin-top:8px">
       <thead><tr><th>Key</th><th>Value</th><th>Reason / Evidence</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>` : ""}
     ${!rows ? `<pre class="pretty" style="margin-top:6px">${esc(pretty(result.result || result || tool.result_preview || {}, 4000))}</pre>` : ""}
-    ${fileLinks ? `<div class="tree-kv" style="margin-top:6px">pages: ${fileLinks}</div>` : ""}
+    ${pageFileLinks ? `<div class="tree-kv" style="margin-top:6px">pages: ${pageFileLinks}</div>` : ""}
     ${tool.filename ? `<div class="tree-kv"><a href="#" data-tool-file="${esc(tool.filename)}">open tool dump</a></div>` : ""}
   `;
 }

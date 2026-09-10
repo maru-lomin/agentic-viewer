@@ -44,8 +44,11 @@ def _read_json(path: Path) -> Any:
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        return json.loads(text)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
 
 
