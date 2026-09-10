@@ -297,10 +297,23 @@ def load_or_compute_run_eval(
 
     report: Optional[Dict[str, Any]] = None
     if answer_sheet is not None:
+        # Prefer original upload basename over bundled ``00_source.pdf`` in meta.
+        doc_hint = infer_run_document(run_dir, result=pred)
+        override = (
+            doc_hint
+            if isinstance(doc_hint, str) and doc_hint in answer_sheet
+            else None
+        )
+        if override:
+            meta = dict(pred.get("meta") or {})
+            if not meta.get("source_filename"):
+                meta["source_filename"] = override
+                pred = {**pred, "meta": meta}
         try:
             report = build_report(
                 pred,
                 answer_sheet,
+                document=override,
                 pred_path=str(pred_path),
                 answer_sheet_path=str(ans_path),
             )

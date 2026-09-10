@@ -91,17 +91,43 @@ def _format_page_chunk_ids(chunk_ids: Any) -> str:
     return str(chunk_ids).strip()
 
 
+def _is_bundled_source_name(name: Optional[str]) -> bool:
+    """True for durable run-dir copy basename (not the upload identity)."""
+    if not name:
+        return False
+    return Path(str(name)).name == "00_source.pdf"
+
+
+def _document_name_candidates_from_meta(meta: Dict[str, Any]) -> List[str]:
+    """Ordered basenames for GT / UI identity; prefer source_filename over pdf_path."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+    for key in (
+        "source_filename",
+        "source_file",
+        "file_name",
+        "filename",
+        "pdf_name",
+        "pdf_path",
+        "file_path",
+    ):
+        val = meta.get(key)
+        if not val:
+            continue
+        name = Path(str(val)).name
+        if not name or _is_bundled_source_name(name) or name in seen:
+            continue
+        seen.add(name)
+        candidates.append(name)
+    return candidates
+
+
 def infer_document_name_from_pred(pred: Dict[str, Any]) -> Optional[str]:
     """Best-effort document filename from prediction metadata (no answer sheet)."""
     meta = pred.get("meta") or {}
-    candidates: List[str] = []
-    for key in ("source_file", "file_name", "filename", "pdf_name"):
-        val = meta.get(key)
-        if val:
-            candidates.append(Path(str(val)).name)
-    pdf_path = meta.get("pdf_path") or meta.get("file_path")
-    if pdf_path:
-        candidates.append(Path(str(pdf_path)).name)
+    if not isinstance(meta, dict):
+        return None
+    candidates = _document_name_candidates_from_meta(meta)
     return candidates[0] if candidates else None
 
 
@@ -113,10 +139,12 @@ def resolve_document_name(
     if override:
         return override
 
-    candidates: List[str] = []
-    inferred = infer_document_name_from_pred(pred)
-    if inferred:
-        candidates.append(inferred)
+    meta = pred.get("meta") or {}
+    candidates = (
+        _document_name_candidates_from_meta(meta)
+        if isinstance(meta, dict)
+        else []
+    )
 
     for name in candidates:
         if name in answer_sheet:

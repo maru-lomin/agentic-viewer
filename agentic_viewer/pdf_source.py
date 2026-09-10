@@ -254,10 +254,19 @@ def infer_run_document(
 ) -> Optional[str]:
     """Human-readable source document name for a run."""
     root = Path(run_dir).resolve()
+
+    def _usable(name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        base = Path(str(name)).name
+        if not base or base == "00_source.pdf":
+            return None
+        return base
+
     if isinstance(eval_report, dict):
-        doc = eval_report.get("document")
+        doc = _usable(eval_report.get("document"))
         if doc:
-            return str(doc)
+            return doc
 
     if result is None:
         result = _read_json(root / "04_result.json")
@@ -265,30 +274,32 @@ def infer_run_document(
         meta = result.get("meta") or {}
         if isinstance(meta, dict):
             for key in (
-                "source_file",
                 "source_filename",
+                "source_file",
                 "file_name",
                 "filename",
                 "pdf_name",
                 "pdf_path",
                 "file_path",
             ):
-                val = meta.get(key)
-                if val:
-                    return Path(str(val)).name
+                doc = _usable(meta.get(key))
+                if doc:
+                    return doc
 
     req = _read_json(root / "00_request.json") or {}
     if isinstance(req, dict):
         for key in ("source_filename", "pdf_path", "file_path"):
-            val = req.get(key)
-            if val:
-                return Path(str(val)).name
+            doc = _usable(req.get(key))
+            if doc:
+                return doc
 
     eval_file = root / "05_eval.json"
     if eval_file.is_file():
         eval_data = _read_json(eval_file)
-        if isinstance(eval_data, dict) and eval_data.get("document"):
-            return str(eval_data["document"])
+        if isinstance(eval_data, dict):
+            doc = _usable(eval_data.get("document"))
+            if doc:
+                return doc
 
     run_meta = _read_json(root / "meta.json") or {}
     if isinstance(run_meta, dict):
@@ -302,9 +313,9 @@ def infer_run_document(
             "file_path",
             "document",
         ):
-            val = run_meta.get(key)
-            if val:
-                return Path(str(val)).name
+            doc = _usable(run_meta.get(key))
+            if doc:
+                return doc
 
     bundled = root / "00_source.pdf"
     if bundled.is_file():
@@ -336,10 +347,15 @@ def pdf_info(run_dir: Path) -> Dict[str, Any]:
             "filename": None,
             "path": None,
         }
+    display = infer_run_document(
+        root,
+        eval_report=eval_report if isinstance(eval_report, dict) else None,
+        result=result if isinstance(result, dict) else None,
+    )
     return {
         "available": True,
         "bundled": bundled,
-        "filename": path.name,
+        "filename": display or path.name,
         "path": str(path),
         "url": f"/api/runs/{root.name}/pdf",
     }

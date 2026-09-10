@@ -50,11 +50,45 @@ class PdfSourceTests(unittest.TestCase):
             if not eval_path.is_file():
                 continue
             expected = json.loads(eval_path.read_text(encoding="utf-8")).get("document")
-            if not expected:
+            if not expected or expected == "00_source.pdf":
                 continue
             self.assertEqual(infer_run_document(run_dir), expected)
             return
         self.skipTest("no run with 05_eval.json document")
+
+    def test_infer_run_document_prefers_source_over_bundled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "00_request.json").write_text(
+                json.dumps(
+                    {
+                        "source_filename": "2025 - UWR Central Puerto Nuevo.pdf",
+                        "file_path": "/tmp/x/2025 - UWR Central Puerto Nuevo.pdf",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "04_result.json").write_text(
+                json.dumps(
+                    {
+                        "meta": {
+                            "pdf_path": str(run_dir / "00_source.pdf"),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "05_eval.json").write_text(
+                json.dumps({"document": "00_source.pdf", "has_gt": False}),
+                encoding="utf-8",
+            )
+            (run_dir / "00_source.pdf").write_bytes(b"%PDF-1.4")
+            self.assertEqual(
+                infer_run_document(run_dir),
+                "2025 - UWR Central Puerto Nuevo.pdf",
+            )
+            info = pdf_info(run_dir)
+            self.assertEqual(info["filename"], "2025 - UWR Central Puerto Nuevo.pdf")
 
     def test_infer_pdf_path_for_target_run(self) -> None:
         repo = Path(__file__).resolve().parents[2]
